@@ -245,7 +245,7 @@ print("🏆 優秀銘柄ランキング TOP10 (Ace_Start基準)")
 print("="*60)
 if not rankings["Ace_Start"].empty:
     top10 = rankings["Ace_Start"].sort_values("_sort", ascending=False).head(10)
-    display(top10[["会社名","シグナル回数","勝率","平均リターン"]])
+    print(top10[["会社名","シグナル回数","勝率","平均リターン"]].to_string())
 
 # --- 現在シグナル点灯中 ---
 print("\n" + "="*60)
