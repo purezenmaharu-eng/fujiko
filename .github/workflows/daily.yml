@@ -1,47 +1,47 @@
-5 Account budgets
-Account
-purezenmaharu-eng
-100%
-Product
-Codespaces
-Stop usage
-Yes
-$0 spent
-$0 budget
-Account
-purezenmaharu-eng
-100%
-Product
-Packages
-Stop usage
-Yes
-$0 spent
-$0 budget
-Account
-purezenmaharu-eng
-100%
-Product
-Actions
-Stop usage
-Yes
-$0 spent
-$0 budget
-Account
-purezenmaharu-eng
-100%
-Product
-Git LFS
-Stop usage
-Yes
-$0 spent
-$0 budget
-Account
-purezenmaharu-eng
-100%
-SKU
-All AI Credit SKUs
-Stop usage
-Yes
-$0 spent
-$0 budget
+name: Fujiko Daily Signal
 
+on:
+  schedule:
+    - cron: '0 7 * * 1-5'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pages: write
+  id-token: write
+
+jobs:
+  run-fujiko:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          pip install yfinance pandas numpy requests
+
+      - name: Run Fujiko script
+        run: |
+          python fujiko.py
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: .
+
+  deploy-pages:
+    needs: run-fujiko
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
