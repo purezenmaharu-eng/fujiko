@@ -1,28 +1,46 @@
-name: Fujiko Daily Signal
-
-on:
-  schedule:
-    # 毎日 日本時間 16:00 (UTC 07:00) に実行
-    - cron: '0 7 * * 1-5'
-  workflow_dispatch:
-    # 手動実行ボタンも使えるようにする
-
-jobs:
-  run-fujiko:
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
-
-      - name: Install dependencies
-        run: |
-          pip install yfinance pandas numpy requests
-
-      - name: Run Fujiko script
-        run: |
-          python fujiko.py
+5 Account budgets
+Account
+purezenmaharu-eng
+100%
+Product
+Codespaces
+Stop usage
+Yes
+$0 spent
+$0 budget
+Account
+purezenmaharu-eng
+100%
+Product
+Packages
+Stop usage
+Yes
+$0 spent
+$0 budget
+Account
+purezenmaharu-eng
+100%
+Product
+Actions
+Stop usage
+Yes
+$0 spent
+$0 budget
+Account
+purezenmaharu-eng
+100%
+Product
+Git LFS
+Stop usage
+Yes
+$0 spent
+$0 budget
+Account
+purezenmaharu-eng
+100%
+SKU
+All AI Credit SKUs
+Stop usage
+Yes
+$0 spent
+$0 budget
