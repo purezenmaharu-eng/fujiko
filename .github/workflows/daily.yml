@@ -27,8 +27,12 @@ jobs:
           pip install yfinance pandas numpy requests jquants-api-client
 
       - name: Run Fujiko script
+        env:
+          JQUANTS_API_KEY: ${{ secrets.JQUANTS_API_KEY }}
         run: |
           python fujiko.py
+        
+
 
       - name: Upload Pages artifact
         uses: actions/upload-pages-artifact@v3
