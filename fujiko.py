@@ -1,4 +1,25 @@
+import os
+import jquantsapi
+
 # ============================================================
+# J-Quants APIで全上場銘柄コードを取得
+# ============================================================
+def get_all_tickers(ticker_name_map):
+    try:
+        api_key = os.environ.get("JQUANTS_API_KEY", "")
+        if not api_key:
+            print("⚠️ JQUANTS_API_KEY未設定 → 131銘柄リストを使用")
+            return list(ticker_name_map.keys()), ticker_name_map
+        cli = jquantsapi.ClientV2(api_key=api_key)
+        df_list = cli.get_list()
+        tickers = [str(code)[:-1] + ".T" for code in df_list['Code'].astype(str)]
+        names   = df_list['CompanyName'].tolist()
+        name_map = dict(zip(tickers, names))
+        print(f"✅ J-Quants: {len(tickers)}銘柄取得成功")
+        return tickers, name_map
+    except Exception as e:
+        print(f"⚠️ J-Quants取得失敗({e}) → 131銘柄リストを使用")
+        return list(ticker_name_map.keys()), ticker_name_map# ============================================================
 # フジコ法 統合スクリーニング＋LINE通知 (1セル完結版)
 # Colabの新しいノートブックに このセルだけ貼り付けて実行
 # ============================================================
@@ -191,7 +212,7 @@ START = "2023-01-01"
 END   = "2026-06-14"
 BENCH = "1306.T"
 
-target_stocks = list(TICKER_NAME_MAP.keys())
+target_stocks, TICKER_NAME_MAP = get_all_tickers(TICKER_NAME_MAP)
 
 print("🚀 データダウンロード開始...")
 df_bench = yf.download(BENCH, start=START, end=END, auto_adjust=True, progress=False)
