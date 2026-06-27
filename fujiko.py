@@ -12,8 +12,12 @@ def get_all_tickers(ticker_name_map):
             return list(ticker_name_map.keys()), ticker_name_map
         cli = jquantsapi.ClientV2(api_key=api_key)
         df_list = cli.get_list()
+        # V2の列名に対応
+        name_col = 'CompanyName' if 'CompanyName' in df_list.columns else df_list.columns[1]
         tickers = [str(code)[:-1] + ".T" for code in df_list['Code'].astype(str)]
-        names   = df_list['CompanyName'].tolist()
+        names   = df_list[name_col].tolist()
+        print(f"列名確認: {df_list.columns.tolist()}")
+    
         name_map = dict(zip(tickers, names))
         print(f"✅ J-Quants: {len(tickers)}銘柄取得成功")
         return tickers, name_map
