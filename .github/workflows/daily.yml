@@ -24,7 +24,7 @@ jobs:
 
       - name: Install dependencies
         run: |
-          pip install yfinance pandas numpy requests jquants-api-client
+          pip install yfinance pandas numpy requests jquants-api-client gspread google-auth
 
       - name: Run Fujiko script
         env:
