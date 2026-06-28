@@ -343,7 +343,16 @@ send_line(msg)
 print("\n📄 HTMLページ生成中...")
 
 def signal_table_html(stocks, title, emoji):
-    rows = "".join(f"<li>{s}</li>" for s in stocks) if stocks else "<li class='none'>該当なし</li>"
+    def make_row(s):
+        name = s.replace("・", "")
+        # 銘柄コードを探して TradingView リンクを生成
+        ticker = next((t for t, n in TICKER_NAME_MAP.items() if n == name), None)
+        if ticker:
+            code = ticker.replace(".T", "")
+            url = f"https://www.tradingview.com/chart/?symbol=TSE%3A{code}"
+            return f'<li><a href="{url}" target="_blank">{s}</a></li>'
+        return f"<li>{s}</li>"
+    rows = "".join(make_row(s) for s in stocks) if stocks else "<li class='none'>該当なし</li>"
     return f"""
     <div class="card">
       <h2>{emoji} {title} ({len(stocks)}銘柄)</h2>
