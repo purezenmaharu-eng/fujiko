@@ -170,11 +170,11 @@ def calc_signals(combined_df, rsr_momentum_period=3):
         df["Ace"]          = base_7 & (df["RSR"] >= 70)
         df["King"]         = base_7 & (df["RSR"] >= 60) & (df["RSR"] < 70)
         df["Polygraph"] = (
-    (df["VolumeVCP"] > 0) &
-    (df["RSR"] >= 75) &
+    (df["VolumeVCP"] > 0.5) &
+    (df["RSR"] >= 80) &
     (df["RSR_Mom"] > 0) &
     (df["RSR_Mom"] > df["RSR_Mom"].shift(1)) &
-    (base_7)
+    (df["Ace"])
 )
         df["Ace_with_BEP"] = df["Ace"] & df["BEP_bullish"]
         for col in ["Ace", "King", "Polygraph", "Ace_with_BEP", "BEP_bullish"]:
