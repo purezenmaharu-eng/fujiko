@@ -428,3 +428,7 @@ with open("index.html", "w", encoding="utf-8") as f:
     f.write(html)
 
 print("✅ index.html 生成完了")
+# ============================================================
+# スプレッドシートに履歴を書き込む
+# ============================================================
+write_to_spreadsheet(today, ace_stocks, poly_stocks, bep_stocks)
