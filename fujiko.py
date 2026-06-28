@@ -1,42 +1,13 @@
 import os
 import json
-import jquantsapi
-import gspread
-from google.oauth2.service_account import Credentials
-
-# ============================================================
-# J-Quants APIで全上場銘柄コードを取得
-# ============================================================
-def get_all_tickers(ticker_name_map):
-    try:
-        api_key = os.environ.get("JQUANTS_API_KEY", "")
-        if not api_key:
-            print("⚠️ JQUANTS_API_KEY未設定 → 131銘柄リストを使用")
-            return list(ticker_name_map.keys()), ticker_name_map
-        cli = jquantsapi.ClientV2(api_key=api_key)
-        df_list = cli.get_list()
-        # V2の列名に対応
-        df_stocks = df_list[df_list['S33'] != '9999'].copy()
-        tickers = [str(code)[:-1] + ".T" for code in df_stocks['Code'].astype(str)]
-        names   = df_stocks['CoName'].tolist()
-        name_map = dict(zip(tickers, names))
-        print(f"✅ J-Quants: {len(tickers)}銘柄取得成功(ETF除外済)")
-    
-        name_map = dict(zip(tickers, names))
-        print(f"✅ J-Quants: {len(tickers)}銘柄取得成功")
-        return tickers, name_map
-    except Exception as e:
-        print(f"⚠️ J-Quants取得失敗({e}) → 131銘柄リストを使用")
-        return list(ticker_name_map.keys()), ticker_name_map# ============================================================
-# フジコ法 統合スクリーニング＋LINE通知 (1セル完結版)
-# Colabの新しいノートブックに このセルだけ貼り付けて実行
-# ============================================================
 import time
 import numpy as np
 import pandas as pd
 import yfinance as yf
 import requests
-import json
+import jquantsapi
+import gspread
+from google.oauth2.service_account import Credentials
 from datetime import date
 
 # ============================================================
@@ -96,7 +67,6 @@ def send_line(message):
         print(f"❌ LINE送信エラー: {e}")
 
 # ============================================================
-# 関数定義# ============================================================
 # スプレッドシートへの履歴書き込み
 # ============================================================
 def write_to_spreadsheet(today, ace_stocks, poly_stocks, bep_stocks):
@@ -106,7 +76,6 @@ def write_to_spreadsheet(today, ace_stocks, poly_stocks, bep_stocks):
         if not creds_json or not spreadsheet_id:
             print("⚠️ スプレッドシート設定未完了")
             return
-
         creds_dict = json.loads(creds_json)
         creds = Credentials.from_service_account_info(
             creds_dict,
@@ -115,24 +84,42 @@ def write_to_spreadsheet(today, ace_stocks, poly_stocks, bep_stocks):
         gc = gspread.authorize(creds)
         sh = gc.open_by_key(spreadsheet_id)
         ws = sh.sheet1
-
-        # ヘッダーがなければ追加
         if ws.row_count == 0 or ws.cell(1, 1).value != "日付":
             ws.append_row(["日付", "種別", "銘柄名"])
-
-        # データを書き込む
         for stock in ace_stocks:
             ws.append_row([today, "Ace", stock.replace("・", "")])
         for stock in poly_stocks:
             ws.append_row([today, "ポリグラフ", stock.replace("・", "")])
         for stock in bep_stocks:
             ws.append_row([today, "Ace×BEP", stock.replace("・", "")])
-
-        print(f"✅ スプレッドシート書き込み完了")
+        print("✅ スプレッドシート書き込み完了")
     except Exception as e:
         print(f"❌ スプレッドシート書き込み失敗: {e}")
-# ============================================================
 
+# ============================================================
+# J-Quants APIで全上場銘柄コードを取得
+# ============================================================
+def get_all_tickers(ticker_name_map):
+    try:
+        api_key = os.environ.get("JQUANTS_API_KEY", "")
+        if not api_key:
+            print("⚠️ JQUANTS_API_KEY未設定 → 131銘柄リストを使用")
+            return list(ticker_name_map.keys()), ticker_name_map
+        cli = jquantsapi.ClientV2(api_key=api_key)
+        df_list = cli.get_list()
+        df_stocks = df_list[df_list['S33'] != '9999'].copy()
+        tickers = [str(code)[:-1] + ".T" for code in df_stocks['Code'].astype(str)]
+        names = df_stocks['CoName'].tolist()
+        name_map = dict(zip(tickers, names))
+        print(f"✅ J-Quants: {len(tickers)}銘柄取得成功(ETF除外済)")
+        return tickers, name_map
+    except Exception as e:
+        print(f"⚠️ J-Quants取得失敗({e}) → 131銘柄リストを使用")
+        return list(ticker_name_map.keys()), ticker_name_map
+
+# ============================================================
+# 関数定義
+# ============================================================
 def detect_bullish_ep(df, lookback=10):
     prev_close  = df["Close"].shift(1)
     prev_open   = df["Open"].shift(1)
@@ -204,15 +191,15 @@ def calc_signals(combined_df, rsr_momentum_period=3):
             (df["Close"] >= df["Low52"] * 1.3) &
             (df["Close"] >= df["High52"] * 0.75)
         )
-        df["Ace"]          = base_7 & (df["RSR"] >= 70)
-        df["King"]         = base_7 & (df["RSR"] >= 60) & (df["RSR"] < 70)
+        df["Ace"]  = base_7 & (df["RSR"] >= 70)
+        df["King"] = base_7 & (df["RSR"] >= 60) & (df["RSR"] < 70)
         df["Polygraph"] = (
-    (df["VolumeVCP"] > 1.0) &
-    (df["RSR"] >= 85) &
-    (df["RSR_Mom"] > 0) &
-    (df["RSR_Mom"] > df["RSR_Mom"].shift(1)) &
-    (df["Ace"])
-)
+            (df["VolumeVCP"] > 1.0) &
+            (df["RSR"] >= 85) &
+            (df["RSR_Mom"] > 0) &
+            (df["RSR_Mom"] > df["RSR_Mom"].shift(1)) &
+            (df["Ace"])
+        )
         df["Ace_with_BEP"] = df["Ace"] & df["BEP_bullish"]
         for col in ["Ace", "King", "Polygraph", "Ace_with_BEP", "BEP_bullish"]:
             df[f"{col}_Start"] = (df[col] == True) & (df[col].shift(1) == False)
@@ -257,7 +244,7 @@ def backtest(combined_df, signal_col, ticker_name_map,
 # メイン実行
 # ============================================================
 START = "2023-01-01"
-END   = "2026-06-14"
+END   = "2026-06-28"
 BENCH = "1306.T"
 
 target_stocks, TICKER_NAME_MAP = get_all_tickers(TICKER_NAME_MAP)
@@ -281,9 +268,7 @@ for ticker in target_stocks:
         failed.append((ticker, str(e)))
 
 if failed:
-    print(f"\n⚠️ 取得失敗/データ不足 {len(failed)}件:")
-    for t, r in failed:
-        print(f"   - {t}: {r}")
+    print(f"\n⚠️ 取得失敗/データ不足 {len(failed)}件")
 
 print(f"\n✅ 有効銘柄: {len(all_results)}件")
 print("📊 RSR算出中(全銘柄横断パーセンタイルランク)...")
@@ -428,6 +413,7 @@ with open("index.html", "w", encoding="utf-8") as f:
     f.write(html)
 
 print("✅ index.html 生成完了")
+
 # ============================================================
 # スプレッドシートに履歴を書き込む
 # ============================================================
