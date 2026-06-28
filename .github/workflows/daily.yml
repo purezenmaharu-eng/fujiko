@@ -29,6 +29,8 @@ jobs:
       - name: Run Fujiko script
         env:
           JQUANTS_API_KEY: ${{ secrets.JQUANTS_API_KEY }}
+          GOOGLE_SHEETS_CREDENTIALS: ${{ secrets.GOOGLE_SHEETS_CREDENTIALS }}
+          SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
         run: |
           python fujiko.py
         
