@@ -1,5 +1,8 @@
 import os
+import json
 import jquantsapi
+import gspread
+from google.oauth2.service_account import Credentials
 
 # ============================================================
 # J-Quants APIで全上場銘柄コードを取得
