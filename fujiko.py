@@ -299,11 +299,11 @@ ace_stocks = [f"・{TICKER_NAME_MAP.get(t, t)}" for t, df in combined_df.groupby
 msg += f"\n🅰️ Ace点灯中({len(ace_stocks)}銘柄):\n"
 msg += "\n".join(ace_stocks) if ace_stocks else "  (該当なし)"
 
-poly_stocks = [f"・{TICKER_NAME_MAP.get(t, t)}" for t, df in combined_df.groupby("Ticker") if df["Polygraph_Start"].tail(3).any()]
+poly_stocks = [f"・{TICKER_NAME_MAP.get(t, t)}" for t, df in combined_df.groupby("Ticker") if df["Polygraph_Start"].tail(3).any()][:20]
 msg += f"\n\n🎯 ポリグラフ点灯中({len(poly_stocks)}銘柄):\n"
 msg += "\n".join(poly_stocks) if poly_stocks else "  (該当なし)"
 
-bep_stocks = [f"・{TICKER_NAME_MAP.get(t, t)}" for t, df in combined_df.groupby("Ticker") if df["Ace_with_BEP_Start"].tail(3).any()]
+bep_stocks = [f"・{TICKER_NAME_MAP.get(t, t)}" for t, df in combined_df.groupby("Ticker") if df["Ace_with_BEP_Start"].tail(3).any()][:10]
 msg += f"\n\n🅰️🐢 Ace×BEP同時({len(bep_stocks)}銘柄):\n"
 msg += "\n".join(bep_stocks) if bep_stocks else "  (該当なし)"
 
