@@ -13,10 +13,11 @@ def get_all_tickers(ticker_name_map):
         cli = jquantsapi.ClientV2(api_key=api_key)
         df_list = cli.get_list()
         # V2の列名に対応
-        name_col = 'CompanyName' if 'CompanyName' in df_list.columns else df_list.columns[1]
-        tickers = [str(code)[:-1] + ".T" for code in df_list['Code'].astype(str)]
-        names   = df_list[name_col].tolist()
-        print(f"列名確認: {df_list.columns.tolist()}")
+        df_stocks = df_list[df_list['S33'] != '9999'].copy()
+        tickers = [str(code)[:-1] + ".T" for code in df_stocks['Code'].astype(str)]
+        names   = df_stocks['CoName'].tolist()
+        name_map = dict(zip(tickers, names))
+        print(f"✅ J-Quants: {len(tickers)}銘柄取得成功(ETF除外済)")
     
         name_map = dict(zip(tickers, names))
         print(f"✅ J-Quants: {len(tickers)}銘柄取得成功")
