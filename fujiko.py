@@ -170,8 +170,8 @@ def calc_signals(combined_df, rsr_momentum_period=3):
         df["Ace"]          = base_7 & (df["RSR"] >= 70)
         df["King"]         = base_7 & (df["RSR"] >= 60) & (df["RSR"] < 70)
         df["Polygraph"] = (
-    (df["VolumeVCP"] > 0.5) &
-    (df["RSR"] >= 80) &
+    (df["VolumeVCP"] > 1.0) &
+    (df["RSR"] >= 85) &
     (df["RSR_Mom"] > 0) &
     (df["RSR_Mom"] > df["RSR_Mom"].shift(1)) &
     (df["Ace"])
