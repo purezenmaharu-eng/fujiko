@@ -96,7 +96,41 @@ def send_line(message):
         print(f"❌ LINE送信エラー: {e}")
 
 # ============================================================
-# 関数定義
+# 関数定義# ============================================================
+# スプレッドシートへの履歴書き込み
+# ============================================================
+def write_to_spreadsheet(today, ace_stocks, poly_stocks, bep_stocks):
+    try:
+        creds_json = os.environ.get("GOOGLE_SHEETS_CREDENTIALS", "")
+        spreadsheet_id = os.environ.get("SPREADSHEET_ID", "")
+        if not creds_json or not spreadsheet_id:
+            print("⚠️ スプレッドシート設定未完了")
+            return
+
+        creds_dict = json.loads(creds_json)
+        creds = Credentials.from_service_account_info(
+            creds_dict,
+            scopes=["https://www.googleapis.com/auth/spreadsheets"]
+        )
+        gc = gspread.authorize(creds)
+        sh = gc.open_by_key(spreadsheet_id)
+        ws = sh.sheet1
+
+        # ヘッダーがなければ追加
+        if ws.row_count == 0 or ws.cell(1, 1).value != "日付":
+            ws.append_row(["日付", "種別", "銘柄名"])
+
+        # データを書き込む
+        for stock in ace_stocks:
+            ws.append_row([today, "Ace", stock.replace("・", "")])
+        for stock in poly_stocks:
+            ws.append_row([today, "ポリグラフ", stock.replace("・", "")])
+        for stock in bep_stocks:
+            ws.append_row([today, "Ace×BEP", stock.replace("・", "")])
+
+        print(f"✅ スプレッドシート書き込み完了")
+    except Exception as e:
+        print(f"❌ スプレッドシート書き込み失敗: {e}")
 # ============================================================
 
 def detect_bullish_ep(df, lookback=10):
