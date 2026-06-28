@@ -295,7 +295,7 @@ today = date.today().strftime("%Y/%m/%d")
 msg = f"📊 {today} フジコシグナル\n"
 msg += "=" * 25 + "\n"
 
-ace_stocks = [f"・{TICKER_NAME_MAP.get(t, t)}" for t, df in combined_df.groupby("Ticker") if df["Ace_Start"].tail(3).any()]
+ace_stocks = [f"・{TICKER_NAME_MAP.get(t, t)}" for t, df in combined_df.groupby("Ticker") if df["Ace_Start"].tail(3).any()][:20]
 msg += f"\n🅰️ Ace点灯中({len(ace_stocks)}銘柄):\n"
 msg += "\n".join(ace_stocks) if ace_stocks else "  (該当なし)"
 
