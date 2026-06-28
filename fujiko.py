@@ -400,6 +400,8 @@ html = f"""<!DOCTYPE html>
   li {{ padding: 6px 0; border-bottom: 1px solid #2a2d3a; }}
   li:last-child {{ border-bottom: none; }}
   li.none {{ color: #666; }}
+  a {{ color: #7eb8f7; text-decoration: none; }}
+  a:hover {{ text-decoration: underline; }}
   table {{ width: 100%; border-collapse: collapse; font-size: 0.9em; }}
   th, td {{ text-align: left; padding: 6px 4px; border-bottom: 1px solid #2a2d3a; }}
   th {{ color: #888; font-weight: normal; }}
