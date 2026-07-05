@@ -65,7 +65,7 @@ def generate_gemini_comment(signal_stocks, signal_type):
         if not api_key or not signal_stocks:
             return ""
         genai.configure(api_key=api_key)
-        model = genai.GenerativeModel("gemini-1.5-flash")
+        model = genai.GenerativeModel("gemini-2.0-flash")
         stocks_text = "\n".join(signal_stocks[:5])  # 上位5銘柄のみ
         prompt = f"""
 以下は日本株のフジコ投資法で{signal_type}シグナルが出た銘柄です。
