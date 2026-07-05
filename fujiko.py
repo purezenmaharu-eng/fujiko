@@ -66,7 +66,7 @@ def generate_gemini_comment(signal_stocks, signal_type):
             return ""
         genai.configure(api_key=api_key)
         model = genai.GenerativeModel("gemini-2.0-flash")
-        stocks_text = "\n".join(signal_stocks[:5])  # 上位5銘柄のみ
+        stocks_text = "\n".join(signal_stocks[:5])
         prompt = f"""
 以下は日本株のフジコ投資法で{signal_type}シグナルが出た銘柄です。
 {stocks_text}
@@ -77,20 +77,20 @@ def generate_gemini_comment(signal_stocks, signal_type):
 ・投資する際の注意点
 日本語で簡潔に答えてください。
 """
-        response = model.generate_content(prompt)
-        return response.text
+        # リトライ処理(最大3回、60秒待機)
+        for attempt in range(3):
+            try:
+                response = model.generate_content(prompt)
+                return response.text
+            except Exception as e:
+                if "429" in str(e) and attempt < 2:
+                    print(f"⚠️ Geminiレート制限、60秒待機中...")
+                    time.sleep(60)
+                else:
+                    raise e
     except Exception as e:
         print(f"⚠️ Geminiコメント生成失敗: {e}")
         return ""
-def send_line(message):
-    try:
-        res = requests.post(GAS_URL, json={"message": message}, timeout=10)
-        if res.status_code == 200:
-            print("✅ LINE送信完了")
-        else:
-            print(f"❌ LINE送信失敗: {res.status_code}")
-    except Exception as e:
-        print(f"❌ LINE送信エラー: {e}")
 
 # ============================================================
 # スプレッドシートへの履歴書き込み
