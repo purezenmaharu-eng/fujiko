@@ -360,7 +360,10 @@ msg += "\n".join(poly_stocks) if poly_stocks else "  (該当なし)"
 bep_stocks = [f"・{TICKER_NAME_MAP.get(t, t)}" for t, df in combined_df.groupby("Ticker") if df["Ace_with_BEP_Start"].tail(3).any()][:10]
 msg += f"\n\n🅰️🐢 Ace×BEP同時({len(bep_stocks)}銘柄):\n"
 msg += "\n".join(bep_stocks) if bep_stocks else "  (該当なし)"
-
+# Geminiコメントを追加
+ai_comment = generate_gemini_comment(ace_stocks, "Ace")
+if ai_comment:
+    msg += f"\n\n🤖 AIコメント:\n{ai_comment}"
 send_line(msg)
 
 # ============================================================
