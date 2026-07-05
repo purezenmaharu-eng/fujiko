@@ -55,7 +55,33 @@ TICKER_NAME_MAP = {
 # LINE通知設定 (GAS経由)
 # ============================================================
 GAS_URL = "https://script.google.com/macros/s/AKfycbymWDgoF3XPJGjSFmoK6_Gyan2cN0CFE9q2P5IkAgyLbMRdbBXFCnPZzne6vgCnJSQZDQ/exec"
+# ============================================================
+# Gemini AIコメント生成
+# ============================================================
+def generate_gemini_comment(signal_stocks, signal_type):
+    try:
+        import google.generativeai as genai
+        api_key = os.environ.get("GEMINI_API_KEY", "")
+        if not api_key or not signal_stocks:
+            return ""
+        genai.configure(api_key=api_key)
+        model = genai.GenerativeModel("gemini-1.5-flash")
+        stocks_text = "\n".join(signal_stocks[:5])  # 上位5銘柄のみ
+        prompt = f"""
+以下は日本株のフジコ投資法で{signal_type}シグナルが出た銘柄です。
+{stocks_text}
 
+これらの銘柄について、投資家向けに簡潔なコメントを3行以内で生成してください。
+・市場全体の状況との関連
+・注目すべき共通点やセクター
+・投資する際の注意点
+日本語で簡潔に答えてください。
+"""
+        response = model.generate_content(prompt)
+        return response.text
+    except Exception as e:
+        print(f"⚠️ Geminiコメント生成失敗: {e}")
+        return ""
 def send_line(message):
     try:
         res = requests.post(GAS_URL, json={"message": message}, timeout=10)
