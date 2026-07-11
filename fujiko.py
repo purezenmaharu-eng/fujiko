@@ -151,6 +151,14 @@ def calculate_base_indicators(df_stock):
     df["Low52"]  = df["Low"].rolling(250).min()
     df["VolMA20"]   = df["Volume"].rolling(20).mean()
     df["VolumeVCP"] = (df["Volume"] - df["VolMA20"]) / df["VolMA20"]
+    # ATR(Average True Range, 14日)
+    prev_close = df["Close"].shift(1)
+    tr = pd.concat([
+        df["High"] - df["Low"],
+        (df["High"] - prev_close).abs(),
+        (df["Low"] - prev_close).abs(),
+    ], axis=1).max(axis=1)
+    df["ATR14"] = tr.rolling(14).mean()
     df = detect_bullish_ep(df)
     return df
 
@@ -207,22 +215,27 @@ def calc_signals(combined_df, rsr_momentum_period=3):
     return pd.concat(results)
 
 def backtest(combined_df, signal_col, ticker_name_map,
-             take_profit=20.0, stop_loss=-5.0, max_hold_days=60):
+             atr_stop_mult=2.0, atr_profit_mult=4.0, max_hold_days=60, txn_cost_pct=0.2):
     all_returns, ticker_stats = [], {}
     for ticker, df in combined_df.groupby("Ticker"):
         df = df.reset_index(drop=True)
         sig_idx = np.where(df[signal_col] == True)[0]
         ticker_returns = []
         for idx in sig_idx:
-            if idx + 1 >= len(df): continue
-            buy_p = df.iloc[idx]["Close"]
+            entry_idx = idx + 1  # シグナル点灯日の"翌営業日"にエントリー(ルックアヘッドバイアス回避)
+            if entry_idx >= len(df): continue
+            atr = df.iloc[idx]["ATR14"]  # シグナル点灯日時点で既知のATR(未来情報を使わない)
+            if pd.isna(atr) or atr <= 0: continue
+            buy_p = df.iloc[entry_idx]["Open"]  # 翌日の始値で購入
+            stop_loss_pct = -(atr_stop_mult * atr / buy_p) * 100
+            take_profit_pct = (atr_profit_mult * atr / buy_p) * 100
             exited = False
-            for i in range(idx + 1, min(idx + 1 + max_hold_days, len(df))):
-                pnl = (df.iloc[i]["Close"] - buy_p) / buy_p * 100
-                if pnl <= stop_loss or pnl >= take_profit:
+            for i in range(entry_idx, min(entry_idx + max_hold_days, len(df))):
+                pnl = (df.iloc[i]["Close"] - buy_p) / buy_p * 100 - txn_cost_pct  # 往復取引コスト控除
+                if pnl <= stop_loss_pct or pnl >= take_profit_pct:
                     all_returns.append(pnl); ticker_returns.append(pnl); exited = True; break
             if not exited:
-                pnl = (df.iloc[min(idx + max_hold_days, len(df)-1)]["Close"] - buy_p) / buy_p * 100
+                pnl = (df.iloc[min(entry_idx + max_hold_days - 1, len(df)-1)]["Close"] - buy_p) / buy_p * 100 - txn_cost_pct
                 all_returns.append(pnl); ticker_returns.append(pnl)
         if ticker_returns:
             rets = np.array(ticker_returns)
