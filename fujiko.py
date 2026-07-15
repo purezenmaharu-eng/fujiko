@@ -355,8 +355,16 @@ send_line(msg)
 # ============================================================
 print("\n📄 HTMLページ生成中...")
 
+def tradingview_url(ticker):
+    code = ticker.replace(".T", "")
+    return f"https://www.tradingview.com/chart/?symbol=TSE%3A{code}"
+
 def signal_table_html(stocks, title, emoji):
-    rows = "".join(f"<li>{s}</li>" for s in stocks) if stocks else "<li class='none'>該当なし</li>"
+    # stocks: [(name, ticker), ...]
+    rows = "".join(
+        f'<li><a href="{tradingview_url(t)}" target="_blank" rel="noopener">{n}</a></li>'
+        for n, t in stocks
+    ) if stocks else "<li class='none'>該当なし</li>"
     return f"""
     <div class="card">
       <h2>{emoji} {title} ({len(stocks)}銘柄)</h2>
@@ -364,10 +372,10 @@ def signal_table_html(stocks, title, emoji):
     </div>
     """
 
-ace_list  = [TICKER_NAME_MAP.get(t, t) for t, df in combined_df.groupby("Ticker") if df["Ace_Start"].tail(3).any()]
-king_list = [TICKER_NAME_MAP.get(t, t) for t, df in combined_df.groupby("Ticker") if df["King_Start"].tail(3).any()]
-poly_list = [TICKER_NAME_MAP.get(t, t) for t, df in combined_df.groupby("Ticker") if df["Polygraph_Start"].tail(3).any()]
-bep_list  = [TICKER_NAME_MAP.get(t, t) for t, df in combined_df.groupby("Ticker") if df["Ace_with_BEP_Start"].tail(3).any()]
+ace_list  = [(TICKER_NAME_MAP.get(t, t), t) for t, df in combined_df.groupby("Ticker") if df["Ace_Start"].tail(3).any()]
+king_list = [(TICKER_NAME_MAP.get(t, t), t) for t, df in combined_df.groupby("Ticker") if df["King_Start"].tail(3).any()]
+poly_list = [(TICKER_NAME_MAP.get(t, t), t) for t, df in combined_df.groupby("Ticker") if df["Polygraph_Start"].tail(3).any()]
+bep_list  = [(TICKER_NAME_MAP.get(t, t), t) for t, df in combined_df.groupby("Ticker") if df["Ace_with_BEP_Start"].tail(3).any()]
 
 top10_html = ""
 if not rankings["Ace_Start"].empty:
@@ -404,6 +412,8 @@ html = f"""<!DOCTYPE html>
   li {{ padding: 6px 0; border-bottom: 1px solid #2a2d3a; }}
   li:last-child {{ border-bottom: none; }}
   li.none {{ color: #666; }}
+  li a {{ color: #e8e8e8; text-decoration: none; display: block; }}
+  li a:hover {{ color: #4da6ff; text-decoration: underline; }}
   table {{ width: 100%; border-collapse: collapse; font-size: 0.9em; }}
   th, td {{ text-align: left; padding: 6px 4px; border-bottom: 1px solid #2a2d3a; }}
   th {{ color: #888; font-weight: normal; }}
