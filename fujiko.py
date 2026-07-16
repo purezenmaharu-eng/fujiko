@@ -381,8 +381,9 @@ top10_html = ""
 if not rankings["Ace_Start"].empty:
     top10 = rankings["Ace_Start"].sort_values("_sort", ascending=False).head(10)
     rows = "".join(
-        f"<tr><td>{r['会社名']}</td><td>{r['シグナル回数']}</td><td>{r['勝率']}</td><td>{r['平均リターン']}</td></tr>"
-        for _, r in top10.iterrows()
+        f'<tr><td><a href="{tradingview_url(ticker)}" target="_blank" rel="noopener">{r["会社名"]}</a></td>'
+        f'<td>{r["シグナル回数"]}</td><td>{r["勝率"]}</td><td>{r["平均リターン"]}</td></tr>'
+        for ticker, r in top10.iterrows()
     )
     top10_html = f"""
     <div class="card">
@@ -417,6 +418,8 @@ html = f"""<!DOCTYPE html>
   table {{ width: 100%; border-collapse: collapse; font-size: 0.9em; }}
   th, td {{ text-align: left; padding: 6px 4px; border-bottom: 1px solid #2a2d3a; }}
   th {{ color: #888; font-weight: normal; }}
+  td a {{ color: #e8e8e8; text-decoration: none; }}
+  td a:hover {{ color: #4da6ff; text-decoration: underline; }}
 </style>
 </head>
 <body>
