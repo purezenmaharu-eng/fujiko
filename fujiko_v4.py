@@ -11,26 +11,6 @@ from google.oauth2.service_account import Credentials
 from datetime import date
 
 # ============================================================
-# fujiko_v4.py
-# ------------------------------------------------------------
-# fujiko.py からの変更点(バックテスト部分のみ改善。シグナル
-# ロジック・J-Quants連携・LINE通知・HTML生成などはそのまま維持):
-#
-#   [v4-1] ルックアヘッドバイアスの修正
-#          シグナル点灯日の終値ではなく、"翌営業日の始値" で
-#          エントリーする方式に変更(→ backtest() 関数内)
-#
-#   [v4-2] ATR14(14日ATR)に基づく動的ストップロス・利確ラインの実装
-#          シグナル点灯日時点で既知の ATR14 を使い、
-#          ストップロス幅・利確幅をエントリー価格に対する
-#          %に変換して判定(→ backtest() 関数内)
-#
-#   [v4-3] 往復取引コスト(手数料+スリッページ想定)の控除
-#          損益(pnl)計算のたびに txn_cost_pct を差し引く
-#          (→ backtest() 関数内)
-# ============================================================
-
-# ============================================================
 # 131銘柄リスト
 # ============================================================
 TICKER_NAME_MAP = {
@@ -74,11 +54,16 @@ TICKER_NAME_MAP = {
 # ============================================================
 # LINE通知設定 (GAS経由)
 # ============================================================
-GAS_URL = "https://script.google.com/macros/s/AKfycbymWDgoF3XPJGjSFmoK6_Gyan2cN0CFE9q2P5IkAgyLbMRdbBXFCnPZzne6vgCnJSQZDQ/exec"
+# 公開リポジトリにURLを直書きしないよう、GitHub Secrets経由で読み込む
+GAS_URL = os.environ.get("GAS_URL", "")
+GAS_TOKEN = os.environ.get("GAS_TOKEN", "")  # GAS側で照合する合言葉(なりすまし防止)
 
 def send_line(message):
+    if not GAS_URL:
+        print("⚠️ GAS_URL未設定 → LINE通知スキップ")
+        return
     try:
-        res = requests.post(GAS_URL, json={"message": message}, timeout=10)
+        res = requests.post(GAS_URL, json={"message": message, "token": GAS_TOKEN}, timeout=10)
         if res.status_code == 200:
             print("✅ LINE送信完了")
         else:
@@ -89,7 +74,7 @@ def send_line(message):
 # ============================================================
 # スプレッドシートへの履歴書き込み
 # ============================================================
-def write_to_spreadsheet(today, ace_stocks, poly_stocks, bep_stocks):
+def write_to_spreadsheet(today, ace_stocks, king_stocks, poly_stocks, bep_stocks):
     try:
         creds_json = os.environ.get("GOOGLE_SHEETS_CREDENTIALS", "")
         spreadsheet_id = os.environ.get("SPREADSHEET_ID", "")
@@ -108,10 +93,21 @@ def write_to_spreadsheet(today, ace_stocks, poly_stocks, bep_stocks):
             ws.append_row(["日付", "種別", "銘柄名"])
         for stock in ace_stocks:
             ws.append_row([today, "Ace", stock.replace("・", "")])
+        for stock in king_stocks:
+            ws.append_row([today, "King", stock.replace("・", "")])
         for stock in poly_stocks:
             ws.append_row([today, "ポリグラフ", stock.replace("・", "")])
         for stock in bep_stocks:
             ws.append_row([today, "Ace×BEP", stock.replace("・", "")])
+
+        # --- 日別サマリー(点灯銘柄数の推移を後から追える記録) ---
+        try:
+            ws_summary = sh.worksheet("サマリー")
+        except gspread.exceptions.WorksheetNotFound:
+            ws_summary = sh.add_worksheet(title="サマリー", rows=1000, cols=10)
+            ws_summary.append_row(["日付", "Ace銘柄数", "King銘柄数", "ポリグラフ銘柄数", "Ace×BEP銘柄数"])
+        ws_summary.append_row([today, len(ace_stocks), len(king_stocks), len(poly_stocks), len(bep_stocks)])
+
         print("✅ スプレッドシート書き込み完了")
     except Exception as e:
         print(f"❌ スプレッドシート書き込み失敗: {e}")
@@ -138,7 +134,7 @@ def get_all_tickers(ticker_name_map):
         return list(ticker_name_map.keys()), ticker_name_map
 
 # ============================================================
-# 関数定義(シグナルロジックは fujiko.py から変更なし)
+# 関数定義
 # ============================================================
 def detect_bullish_ep(df, lookback=10):
     prev_close  = df["Close"].shift(1)
@@ -192,8 +188,6 @@ def calculate_base_indicators(df_stock):
     df["VolMA20"]   = df["Volume"].rolling(20).mean()
     df["VolumeVCP"] = (df["Volume"] - df["VolMA20"]) / df["VolMA20"]
     # ATR(Average True Range, 14日)
-    # [v4-2] このATR14を backtest() の動的ストップロス・利確ラインの
-    #        算出に使用する(シグナル点灯日時点で確定している値のみ使用)
     prev_close = df["Close"].shift(1)
     tr = pd.concat([
         df["High"] - df["Low"],
@@ -260,11 +254,11 @@ def calc_signals(combined_df, rsr_momentum_period=3):
             (df["Close"] > df["MA150"]) & (df["Close"] > df["MA200"]) &
             (df["MA150"] > df["MA200"]) & df["MA200_is_rising"] &
             df["MA50_is_rising"] & (df["Close"] > df["MA50"]) &
-            (df["Close"] >= df["Low52"] * 1.3) &
-            (df["Close"] >= df["High52"] * 0.75)
+            (df["Close"] >= df["Low52"] * 1.4) &   # 52週安値からの上昇率をより厳しく(旧1.3)
+            (df["Close"] >= df["High52"] * 0.85)   # 52週高値により近い銘柄だけに(旧0.75)
         )
-        df["Ace"]  = base_7 & (df["RSR"] >= 70)
-        df["King"] = base_7 & (df["RSR"] >= 60) & (df["RSR"] < 70)
+        df["Ace"]  = base_7 & (df["RSR"] >= 80)                     # 相対力を上位20%以内に(旧70)
+        df["King"] = base_7 & (df["RSR"] >= 65) & (df["RSR"] < 80)  # Aceの一歩手前(旧60〜70)
         df["Polygraph"] = (
             (df["VolumeVCP"] > 1.0) &
             (df["RSR"] >= 85) &
@@ -278,65 +272,28 @@ def calc_signals(combined_df, rsr_momentum_period=3):
         results.append(df)
     return pd.concat(results)
 
-# ============================================================
-# バックテスト(v4で改善した部分)
-# ============================================================
 def backtest(combined_df, signal_col, ticker_name_map,
-             atr_stop_mult=2.0, atr_profit_mult=4.0, max_hold_days=60,
-             txn_cost_pct=0.2):
-    """
-    引数:
-        atr_stop_mult   : ストップロス幅 = atr_stop_mult   × ATR14
-        atr_profit_mult : 利確幅         = atr_profit_mult × ATR14
-        max_hold_days   : 最大保有営業日数(到達しなければ最終日Closeで手仕舞い)
-        txn_cost_pct    : 往復取引コスト(手数料+スリッページ等、% )。
-                          [v4-3] 1トレードごとの損益(pnl)から一律控除する。
-    """
+             atr_stop_mult=2.0, atr_profit_mult=4.0, max_hold_days=60, txn_cost_pct=0.2):
     all_returns, ticker_stats = [], {}
     for ticker, df in combined_df.groupby("Ticker"):
         df = df.reset_index(drop=True)
         sig_idx = np.where(df[signal_col] == True)[0]
         ticker_returns = []
         for idx in sig_idx:
-            # ------------------------------------------------------
-            # [v4-1] ルックアヘッドバイアス修正:
-            # シグナル点灯"当日"の終値ではなく、シグナル点灯日の
-            # "翌営業日"の始値(Open)でエントリーする。
-            # (点灯日当日の終値は、その日の取引が終わるまで
-            #  確定しないため、当日終値での約定は実際には不可能)
-            # ------------------------------------------------------
-            entry_idx = idx + 1
-            if entry_idx >= len(df):
-                continue
-
-            # ------------------------------------------------------
-            # [v4-2] ATR14に基づく動的ストップロス・利確ラインの実装:
-            # シグナル点灯日(idx)の時点で既に確定しているATR14を用いる
-            # (エントリー後に確定するATRは使わない = 未来情報を使わない)。
-            # 値幅(価格)ベースのATRを、エントリー価格に対する%へ変換し、
-            # 銘柄のボラティリティに応じて損切り・利確幅を動的に決める。
-            # ------------------------------------------------------
-            atr = df.iloc[idx]["ATR14"]
-            if pd.isna(atr) or atr <= 0:
-                continue
-
-            buy_p = df.iloc[entry_idx]["Open"]  # 翌営業日の始値で購入
-            stop_loss_pct   = -(atr_stop_mult   * atr / buy_p) * 100
-            take_profit_pct =  (atr_profit_mult * atr / buy_p) * 100
-
+            entry_idx = idx + 1  # シグナル点灯日の"翌営業日"にエントリー(ルックアヘッドバイアス回避)
+            if entry_idx >= len(df): continue
+            atr = df.iloc[idx]["ATR14"]  # シグナル点灯日時点で既知のATR(未来情報を使わない)
+            if pd.isna(atr) or atr <= 0: continue
+            buy_p = df.iloc[entry_idx]["Open"]  # 翌日の始値で購入
+            stop_loss_pct = -(atr_stop_mult * atr / buy_p) * 100
+            take_profit_pct = (atr_profit_mult * atr / buy_p) * 100
             exited = False
             for i in range(entry_idx, min(entry_idx + max_hold_days, len(df))):
-                # ------------------------------------------------------
-                # [v4-3] 往復取引コスト控除:
-                # 売買手数料・スリッページ等を想定し、txn_cost_pct(%)を
-                # 損益から一律差し引く(往復分として1回のみ控除)。
-                # ------------------------------------------------------
-                pnl = (df.iloc[i]["Close"] - buy_p) / buy_p * 100 - txn_cost_pct
+                pnl = (df.iloc[i]["Close"] - buy_p) / buy_p * 100 - txn_cost_pct  # 往復取引コスト控除
                 if pnl <= stop_loss_pct or pnl >= take_profit_pct:
                     all_returns.append(pnl); ticker_returns.append(pnl); exited = True; break
             if not exited:
-                last_i = min(entry_idx + max_hold_days - 1, len(df) - 1)
-                pnl = (df.iloc[last_i]["Close"] - buy_p) / buy_p * 100 - txn_cost_pct
+                pnl = (df.iloc[min(entry_idx + max_hold_days - 1, len(df)-1)]["Close"] - buy_p) / buy_p * 100 - txn_cost_pct
                 all_returns.append(pnl); ticker_returns.append(pnl)
         if ticker_returns:
             rets = np.array(ticker_returns)
@@ -440,6 +397,10 @@ msg += "=" * 25 + "\n"
 ace_stocks = [f"・{TICKER_NAME_MAP.get(t, t)} {get_trend(df)}" for t, df in combined_df.groupby("Ticker") if df["Ace_Start"].tail(3).any()][:20]
 msg += f"\n🅰️ Ace点灯中({len(ace_stocks)}銘柄):\n"
 msg += "\n".join(ace_stocks) if ace_stocks else "  (該当なし)"
+
+king_stocks = [f"・{TICKER_NAME_MAP.get(t, t)} {get_trend(df)}" for t, df in combined_df.groupby("Ticker") if df["King_Start"].tail(3).any()][:20]
+msg += f"\n\n👑 King点灯中({len(king_stocks)}銘柄):\n"
+msg += "\n".join(king_stocks) if king_stocks else "  (該当なし)"
 
 poly_stocks = [f"・{TICKER_NAME_MAP.get(t, t)} {get_trend(df)}" for t, df in combined_df.groupby("Ticker") if df["Polygraph_Start"].tail(3).any()][:20]
 msg += f"\n\n🎯 ポリグラフ点灯中({len(poly_stocks)}銘柄):\n"
@@ -545,4 +506,4 @@ print("✅ index.html 生成完了")
 # ============================================================
 # スプレッドシートに履歴を書き込む
 # ============================================================
-write_to_spreadsheet(today, ace_stocks, poly_stocks, bep_stocks)
+write_to_spreadsheet(today, ace_stocks, king_stocks, poly_stocks, bep_stocks)
