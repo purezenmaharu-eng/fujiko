@@ -243,11 +243,11 @@ def calc_signals(combined_df, rsr_momentum_period=3):
             (df["Close"] > df["MA150"]) & (df["Close"] > df["MA200"]) &
             (df["MA150"] > df["MA200"]) & df["MA200_is_rising"] &
             df["MA50_is_rising"] & (df["Close"] > df["MA50"]) &
-            (df["Close"] >= df["Low52"] * 1.3) &
-            (df["Close"] >= df["High52"] * 0.75)
+            (df["Close"] >= df["Low52"] * 1.4) &   # 52週安値からの上昇率をより厳しく(旧1.3)
+            (df["Close"] >= df["High52"] * 0.85)   # 52週高値により近い銘柄だけに(旧0.75)
         )
-        df["Ace"]  = base_7 & (df["RSR"] >= 70)
-        df["King"] = base_7 & (df["RSR"] >= 60) & (df["RSR"] < 70)
+        df["Ace"]  = base_7 & (df["RSR"] >= 80)                     # 相対力を上位20%以内に(旧70)
+        df["King"] = base_7 & (df["RSR"] >= 65) & (df["RSR"] < 80)  # Aceの一歩手前(旧60〜70)
         df["Polygraph"] = (
             (df["VolumeVCP"] > 1.0) &
             (df["RSR"] >= 85) &
