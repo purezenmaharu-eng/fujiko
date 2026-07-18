@@ -24,11 +24,23 @@ jobs:
 
       - name: Install dependencies
         run: |
-          pip install yfinance pandas numpy requests jquants-api-client gspread google-auth google-generativeai
+          pip install yfinance pandas numpy requests jquants-api-client gspread google-auth google-generativeai lxml
 
-      - name: Run Fujiko script
+      - name: Run Fujiko script (JP market)
         env:
+          MARKET: JP
           JQUANTS_API_KEY: ${{ secrets.JQUANTS_API_KEY }}
+          GOOGLE_SHEETS_CREDENTIALS: ${{ secrets.GOOGLE_SHEETS_CREDENTIALS }}
+          SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          GAS_URL: ${{ secrets.GAS_URL }}
+          GAS_TOKEN: ${{ secrets.GAS_TOKEN }}
+        run: |
+          python fujiko.py
+
+      - name: Run Fujiko script (US market)
+        env:
+          MARKET: US
           GOOGLE_SHEETS_CREDENTIALS: ${{ secrets.GOOGLE_SHEETS_CREDENTIALS }}
           SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
