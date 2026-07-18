@@ -74,7 +74,7 @@ def send_line(message):
 # ============================================================
 # スプレッドシートへの履歴書き込み
 # ============================================================
-def write_to_spreadsheet(today, ace_stocks, poly_stocks, bep_stocks):
+def write_to_spreadsheet(today, ace_stocks, king_stocks, poly_stocks, bep_stocks):
     try:
         creds_json = os.environ.get("GOOGLE_SHEETS_CREDENTIALS", "")
         spreadsheet_id = os.environ.get("SPREADSHEET_ID", "")
@@ -93,10 +93,21 @@ def write_to_spreadsheet(today, ace_stocks, poly_stocks, bep_stocks):
             ws.append_row(["日付", "種別", "銘柄名"])
         for stock in ace_stocks:
             ws.append_row([today, "Ace", stock.replace("・", "")])
+        for stock in king_stocks:
+            ws.append_row([today, "King", stock.replace("・", "")])
         for stock in poly_stocks:
             ws.append_row([today, "ポリグラフ", stock.replace("・", "")])
         for stock in bep_stocks:
             ws.append_row([today, "Ace×BEP", stock.replace("・", "")])
+
+        # --- 日別サマリー(点灯銘柄数の推移を後から追える記録) ---
+        try:
+            ws_summary = sh.worksheet("サマリー")
+        except gspread.exceptions.WorksheetNotFound:
+            ws_summary = sh.add_worksheet(title="サマリー", rows=1000, cols=10)
+            ws_summary.append_row(["日付", "Ace銘柄数", "King銘柄数", "ポリグラフ銘柄数", "Ace×BEP銘柄数"])
+        ws_summary.append_row([today, len(ace_stocks), len(king_stocks), len(poly_stocks), len(bep_stocks)])
+
         print("✅ スプレッドシート書き込み完了")
     except Exception as e:
         print(f"❌ スプレッドシート書き込み失敗: {e}")
@@ -387,6 +398,10 @@ ace_stocks = [f"・{TICKER_NAME_MAP.get(t, t)} {get_trend(df)}" for t, df in com
 msg += f"\n🅰️ Ace点灯中({len(ace_stocks)}銘柄):\n"
 msg += "\n".join(ace_stocks) if ace_stocks else "  (該当なし)"
 
+king_stocks = [f"・{TICKER_NAME_MAP.get(t, t)} {get_trend(df)}" for t, df in combined_df.groupby("Ticker") if df["King_Start"].tail(3).any()][:20]
+msg += f"\n\n👑 King点灯中({len(king_stocks)}銘柄):\n"
+msg += "\n".join(king_stocks) if king_stocks else "  (該当なし)"
+
 poly_stocks = [f"・{TICKER_NAME_MAP.get(t, t)} {get_trend(df)}" for t, df in combined_df.groupby("Ticker") if df["Polygraph_Start"].tail(3).any()][:20]
 msg += f"\n\n🎯 ポリグラフ点灯中({len(poly_stocks)}銘柄):\n"
 msg += "\n".join(poly_stocks) if poly_stocks else "  (該当なし)"
@@ -491,4 +506,4 @@ print("✅ index.html 生成完了")
 # ============================================================
 # スプレッドシートに履歴を書き込む
 # ============================================================
-write_to_spreadsheet(today, ace_stocks, poly_stocks, bep_stocks)
+write_to_spreadsheet(today, ace_stocks, king_stocks, poly_stocks, bep_stocks)
