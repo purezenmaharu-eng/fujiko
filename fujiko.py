@@ -1,6 +1,7 @@
 import os
 import json
 import time
+import io
 import numpy as np
 import pandas as pd
 import yfinance as yf
@@ -71,7 +72,10 @@ US_FALLBACK_MAP = {
 def get_us_tickers():
     """S&P500構成銘柄をWikipediaから取得(失敗時は主要30銘柄で代替)"""
     try:
-        tables = pd.read_html("https://en.wikipedia.org/wiki/List_of_S%26P_500_companies")
+        headers = {"User-Agent": "Mozilla/5.0 (compatible; FujikoBot/1.0; +https://github.com/purezenmaharu-eng/fujiko)"}
+        resp = requests.get("https://en.wikipedia.org/wiki/List_of_S%26P_500_companies", headers=headers, timeout=15)
+        resp.raise_for_status()
+        tables = pd.read_html(io.StringIO(resp.text))
         df = tables[0]
         tickers = df["Symbol"].str.replace(".", "-", regex=False).tolist()
         names = df["Security"].tolist()
