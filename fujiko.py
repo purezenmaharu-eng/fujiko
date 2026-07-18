@@ -138,6 +138,26 @@ def detect_bullish_ep(df, lookback=10):
     ).fillna(False)
     return df
 
+def calculate_rsi(close, period=14):
+    """RSI(14) を Wilder方式の指数平滑で計算"""
+    delta = close.diff()
+    gain = delta.clip(lower=0)
+    loss = -delta.clip(upper=0)
+    avg_gain = gain.ewm(alpha=1 / period, adjust=False).mean()
+    avg_loss = loss.ewm(alpha=1 / period, adjust=False).mean()
+    rs = avg_gain / avg_loss.replace(0, np.nan)
+    rsi = 100 - (100 / (1 + rs))
+    return rsi.fillna(50)
+
+def calculate_macd(close, fast=12, slow=26, signal=9):
+    """MACD(12,26,9): MACDライン・シグナルライン・ヒストグラムを返す"""
+    ema_fast = close.ewm(span=fast, adjust=False).mean()
+    ema_slow = close.ewm(span=slow, adjust=False).mean()
+    macd_line = ema_fast - ema_slow
+    signal_line = macd_line.ewm(span=signal, adjust=False).mean()
+    hist = macd_line - signal_line
+    return macd_line, signal_line, hist
+
 def calculate_base_indicators(df_stock):
     df = df_stock.copy()
     if isinstance(df.columns, pd.MultiIndex):
@@ -159,8 +179,30 @@ def calculate_base_indicators(df_stock):
         (df["Low"] - prev_close).abs(),
     ], axis=1).max(axis=1)
     df["ATR14"] = tr.rolling(14).mean()
+
+    # --- RSI(14) ---
+    df["RSI14"] = calculate_rsi(df["Close"], period=14)
+
+    # --- MACD(12,26,9) ---
+    df["MACD"], df["MACD_Signal"], df["MACD_Hist"] = calculate_macd(df["Close"])
+
+    # --- トレンド判定(RSIとMACDの組み合わせ) ---
+    # 📈上昇: MACD > シグナル かつ RSI > 50
+    # 📉下降: MACD < シグナル かつ RSI < 50
+    # ➡️中立: それ以外(どちらかが逆行しているケース)
+    df["Trend"] = "➡️中立"
+    df.loc[(df["MACD"] > df["MACD_Signal"]) & (df["RSI14"] > 50), "Trend"] = "📈上昇"
+    df.loc[(df["MACD"] < df["MACD_Signal"]) & (df["RSI14"] < 50), "Trend"] = "📉下降"
+
     df = detect_bullish_ep(df)
     return df
+
+def get_trend(df):
+    """銘柄の直近トレンド判定(📈上昇/📉下降/➡️中立)を取得"""
+    if df is None or df.empty or "Trend" not in df.columns:
+        return "➡️中立"
+    val = df["Trend"].iloc[-1]
+    return val if pd.notna(val) else "➡️中立"
 
 def calc_cross_sectional_rsr(combined_df, bench_close, perf_period=63):
     combined_df = combined_df.copy()
@@ -323,7 +365,7 @@ for col, label in signal_labels.items():
     found = False
     for ticker, df in combined_df.groupby("Ticker"):
         if df[col].tail(3).any():
-            print(f"  ・{TICKER_NAME_MAP.get(ticker, ticker)} ({ticker})")
+            print(f"  ・{TICKER_NAME_MAP.get(ticker, ticker)} ({ticker}) {get_trend(df)}")
             found = True
     if not found:
         print("  (該当なし)")
@@ -336,15 +378,15 @@ today = date.today().strftime("%Y/%m/%d")
 msg = f"📊 {today} フジコシグナル\n"
 msg += "=" * 25 + "\n"
 
-ace_stocks = [f"・{TICKER_NAME_MAP.get(t, t)}" for t, df in combined_df.groupby("Ticker") if df["Ace_Start"].tail(3).any()][:20]
+ace_stocks = [f"・{TICKER_NAME_MAP.get(t, t)} {get_trend(df)}" for t, df in combined_df.groupby("Ticker") if df["Ace_Start"].tail(3).any()][:20]
 msg += f"\n🅰️ Ace点灯中({len(ace_stocks)}銘柄):\n"
 msg += "\n".join(ace_stocks) if ace_stocks else "  (該当なし)"
 
-poly_stocks = [f"・{TICKER_NAME_MAP.get(t, t)}" for t, df in combined_df.groupby("Ticker") if df["Polygraph_Start"].tail(3).any()][:20]
+poly_stocks = [f"・{TICKER_NAME_MAP.get(t, t)} {get_trend(df)}" for t, df in combined_df.groupby("Ticker") if df["Polygraph_Start"].tail(3).any()][:20]
 msg += f"\n\n🎯 ポリグラフ点灯中({len(poly_stocks)}銘柄):\n"
 msg += "\n".join(poly_stocks) if poly_stocks else "  (該当なし)"
 
-bep_stocks = [f"・{TICKER_NAME_MAP.get(t, t)}" for t, df in combined_df.groupby("Ticker") if df["Ace_with_BEP_Start"].tail(3).any()][:10]
+bep_stocks = [f"・{TICKER_NAME_MAP.get(t, t)} {get_trend(df)}" for t, df in combined_df.groupby("Ticker") if df["Ace_with_BEP_Start"].tail(3).any()][:10]
 msg += f"\n\n🅰️🐢 Ace×BEP同時({len(bep_stocks)}銘柄):\n"
 msg += "\n".join(bep_stocks) if bep_stocks else "  (該当なし)"
 
@@ -360,7 +402,7 @@ def tradingview_url(ticker):
     return f"https://www.tradingview.com/chart/?symbol=TSE%3A{code}"
 
 def signal_table_html(stocks, title, emoji):
-    # stocks: [(name, ticker), ...]
+    # stocks: [(name, ticker), ...]  name には既にトレンド絵文字が含まれる
     rows = "".join(
         f'<li><a href="{tradingview_url(t)}" target="_blank" rel="noopener">{n}</a></li>'
         for n, t in stocks
@@ -372,24 +414,25 @@ def signal_table_html(stocks, title, emoji):
     </div>
     """
 
-ace_list  = [(TICKER_NAME_MAP.get(t, t), t) for t, df in combined_df.groupby("Ticker") if df["Ace_Start"].tail(3).any()]
-king_list = [(TICKER_NAME_MAP.get(t, t), t) for t, df in combined_df.groupby("Ticker") if df["King_Start"].tail(3).any()]
-poly_list = [(TICKER_NAME_MAP.get(t, t), t) for t, df in combined_df.groupby("Ticker") if df["Polygraph_Start"].tail(3).any()]
-bep_list  = [(TICKER_NAME_MAP.get(t, t), t) for t, df in combined_df.groupby("Ticker") if df["Ace_with_BEP_Start"].tail(3).any()]
+ace_list  = [(f"{TICKER_NAME_MAP.get(t, t)} {get_trend(df)}", t) for t, df in combined_df.groupby("Ticker") if df["Ace_Start"].tail(3).any()]
+king_list = [(f"{TICKER_NAME_MAP.get(t, t)} {get_trend(df)}", t) for t, df in combined_df.groupby("Ticker") if df["King_Start"].tail(3).any()]
+poly_list = [(f"{TICKER_NAME_MAP.get(t, t)} {get_trend(df)}", t) for t, df in combined_df.groupby("Ticker") if df["Polygraph_Start"].tail(3).any()]
+bep_list  = [(f"{TICKER_NAME_MAP.get(t, t)} {get_trend(df)}", t) for t, df in combined_df.groupby("Ticker") if df["Ace_with_BEP_Start"].tail(3).any()]
 
 top10_html = ""
 if not rankings["Ace_Start"].empty:
     top10 = rankings["Ace_Start"].sort_values("_sort", ascending=False).head(10)
     rows = "".join(
         f'<tr><td><a href="{tradingview_url(ticker)}" target="_blank" rel="noopener">{r["会社名"]}</a></td>'
-        f'<td>{r["シグナル回数"]}</td><td>{r["勝率"]}</td><td>{r["平均リターン"]}</td></tr>'
+        f'<td>{r["シグナル回数"]}</td><td>{r["勝率"]}</td><td>{r["平均リターン"]}</td>'
+        f'<td>{get_trend(combined_df[combined_df["Ticker"] == ticker])}</td></tr>'
         for ticker, r in top10.iterrows()
     )
     top10_html = f"""
     <div class="card">
       <h2>🏆 優秀銘柄ランキング TOP10</h2>
       <table>
-        <tr><th>会社名</th><th>シグナル回数</th><th>勝率</th><th>平均リターン</th></tr>
+        <tr><th>会社名</th><th>シグナル回数</th><th>勝率</th><th>平均リターン</th><th>トレンド</th></tr>
         {rows}
       </table>
     </div>
