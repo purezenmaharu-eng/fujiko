@@ -54,11 +54,16 @@ TICKER_NAME_MAP = {
 # ============================================================
 # LINE通知設定 (GAS経由)
 # ============================================================
-GAS_URL = "https://script.google.com/macros/s/AKfycbymWDgoF3XPJGjSFmoK6_Gyan2cN0CFE9q2P5IkAgyLbMRdbBXFCnPZzne6vgCnJSQZDQ/exec"
+# 公開リポジトリにURLを直書きしないよう、GitHub Secrets経由で読み込む
+GAS_URL = os.environ.get("GAS_URL", "")
+GAS_TOKEN = os.environ.get("GAS_TOKEN", "")  # GAS側で照合する合言葉(なりすまし防止)
 
 def send_line(message):
+    if not GAS_URL:
+        print("⚠️ GAS_URL未設定 → LINE通知スキップ")
+        return
     try:
-        res = requests.post(GAS_URL, json={"message": message}, timeout=10)
+        res = requests.post(GAS_URL, json={"message": message, "token": GAS_TOKEN}, timeout=10)
         if res.status_code == 200:
             print("✅ LINE送信完了")
         else:
