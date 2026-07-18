@@ -315,7 +315,7 @@ def backtest(combined_df, signal_col, ticker_name_map,
 # メイン実行
 # ============================================================
 START = "2023-01-01"
-END   = "2026-06-28"
+END   = (date.today() + pd.Timedelta(days=1)).strftime("%Y-%m-%d")  # 実行日の翌日を指定し、常に最新データまで取得
 BENCH = "1306.T"
 
 target_stocks, TICKER_NAME_MAP = get_all_tickers(TICKER_NAME_MAP)
