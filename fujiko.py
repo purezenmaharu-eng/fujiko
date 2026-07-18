@@ -52,6 +52,45 @@ TICKER_NAME_MAP = {
 }
 
 # ============================================================
+# 市場設定(日本株/米国株の切り替え)
+# ============================================================
+MARKET = os.environ.get("MARKET", "JP").upper()  # "JP" または "US"
+
+# 米国株フォールバック用(S&P500取得失敗時の主要銘柄リスト)
+US_FALLBACK_MAP = {
+    "AAPL": "Apple", "MSFT": "Microsoft", "GOOGL": "Alphabet", "AMZN": "Amazon",
+    "NVDA": "NVIDIA", "META": "Meta Platforms", "TSLA": "Tesla", "BRK-B": "Berkshire Hathaway",
+    "AVGO": "Broadcom", "JPM": "JPMorgan Chase", "LLY": "Eli Lilly", "V": "Visa",
+    "UNH": "UnitedHealth", "XOM": "Exxon Mobil", "MA": "Mastercard", "COST": "Costco",
+    "HD": "Home Depot", "PG": "Procter & Gamble", "JNJ": "Johnson & Johnson", "NFLX": "Netflix",
+    "ABBV": "AbbVie", "BAC": "Bank of America", "CRM": "Salesforce", "ORCL": "Oracle",
+    "KO": "Coca-Cola", "MRK": "Merck", "AMD": "Advanced Micro Devices", "PEP": "PepsiCo",
+    "ADBE": "Adobe", "WMT": "Walmart",
+}
+
+def get_us_tickers():
+    """S&P500構成銘柄をWikipediaから取得(失敗時は主要30銘柄で代替)"""
+    try:
+        tables = pd.read_html("https://en.wikipedia.org/wiki/List_of_S%26P_500_companies")
+        df = tables[0]
+        tickers = df["Symbol"].str.replace(".", "-", regex=False).tolist()
+        names = df["Security"].tolist()
+        name_map = dict(zip(tickers, names))
+        print(f"✅ S&P500: {len(tickers)}銘柄取得成功")
+        return tickers, name_map
+    except Exception as e:
+        print(f"⚠️ S&P500リスト取得失敗({e}) → 主要30銘柄を使用")
+        return list(US_FALLBACK_MAP.keys()), US_FALLBACK_MAP
+
+def chart_url(ticker):
+    """銘柄チャートへのリンク(TradingViewに統一)"""
+    if MARKET == "US":
+        # 取引所(NASDAQ/NYSE等)が銘柄ごとに異なるため、自動解決される/symbols/形式を使用
+        return f"https://www.tradingview.com/symbols/{ticker}/"
+    code = ticker.replace(".T", "")
+    return f"https://www.tradingview.com/chart/?symbol=TSE%3A{code}"
+
+# ============================================================
 # LINE通知設定 (GAS経由)
 # ============================================================
 # 公開リポジトリにURLを直書きしないよう、GitHub Secrets経由で読み込む
@@ -92,21 +131,21 @@ def write_to_spreadsheet(today, ace_stocks, king_stocks, poly_stocks, bep_stocks
         if ws.row_count == 0 or ws.cell(1, 1).value != "日付":
             ws.append_row(["日付", "種別", "銘柄名"])
         for stock in ace_stocks:
-            ws.append_row([today, "Ace", stock.replace("・", "")])
+            ws.append_row([today, "Ace", stock.replace("・", ""), MARKET])
         for stock in king_stocks:
-            ws.append_row([today, "King", stock.replace("・", "")])
+            ws.append_row([today, "King", stock.replace("・", ""), MARKET])
         for stock in poly_stocks:
-            ws.append_row([today, "ポリグラフ", stock.replace("・", "")])
+            ws.append_row([today, "ポリグラフ", stock.replace("・", ""), MARKET])
         for stock in bep_stocks:
-            ws.append_row([today, "Ace×BEP", stock.replace("・", "")])
+            ws.append_row([today, "Ace×BEP", stock.replace("・", ""), MARKET])
 
         # --- 日別サマリー(点灯銘柄数の推移を後から追える記録) ---
         try:
             ws_summary = sh.worksheet("サマリー")
         except gspread.exceptions.WorksheetNotFound:
             ws_summary = sh.add_worksheet(title="サマリー", rows=1000, cols=10)
-            ws_summary.append_row(["日付", "Ace銘柄数", "King銘柄数", "ポリグラフ銘柄数", "Ace×BEP銘柄数"])
-        ws_summary.append_row([today, len(ace_stocks), len(king_stocks), len(poly_stocks), len(bep_stocks)])
+            ws_summary.append_row(["日付", "Ace銘柄数", "King銘柄数", "ポリグラフ銘柄数", "Ace×BEP銘柄数", "市場"])
+        ws_summary.append_row([today, len(ace_stocks), len(king_stocks), len(poly_stocks), len(bep_stocks), MARKET])
 
         print("✅ スプレッドシート書き込み完了")
     except Exception as e:
@@ -316,9 +355,12 @@ def backtest(combined_df, signal_col, ticker_name_map,
 # ============================================================
 START = "2023-01-01"
 END   = (date.today() + pd.Timedelta(days=1)).strftime("%Y-%m-%d")  # 実行日の翌日を指定し、常に最新データまで取得
-BENCH = "1306.T"
+BENCH = "^GSPC" if MARKET == "US" else "1306.T"  # 米国株はS&P500、日本株はTOPIX連動ETF
 
-target_stocks, TICKER_NAME_MAP = get_all_tickers(TICKER_NAME_MAP)
+if MARKET == "US":
+    target_stocks, TICKER_NAME_MAP = get_us_tickers()
+else:
+    target_stocks, TICKER_NAME_MAP = get_all_tickers(TICKER_NAME_MAP)
 
 print("🚀 データダウンロード開始...")
 df_bench = yf.download(BENCH, start=START, end=END, auto_adjust=True, progress=False)
@@ -391,7 +433,8 @@ for col, label in signal_labels.items():
 # ============================================================
 print("\n📱 LINE通知送信中...")
 today = date.today().strftime("%Y/%m/%d")
-msg = f"📊 {today} フジコシグナル\n"
+MARKET_LABEL = "🇺🇸 米国株" if MARKET == "US" else "🇯🇵 日本株"
+msg = f"📊 {today} フジコシグナル({MARKET_LABEL})\n"
 msg += "=" * 25 + "\n"
 
 ace_stocks = [f"・{TICKER_NAME_MAP.get(t, t)} {get_trend(df)}" for t, df in combined_df.groupby("Ticker") if df["Ace_Start"].tail(3).any()][:20]
@@ -417,14 +460,10 @@ send_line(msg)
 # ============================================================
 print("\n📄 HTMLページ生成中...")
 
-def tradingview_url(ticker):
-    code = ticker.replace(".T", "")
-    return f"https://www.tradingview.com/chart/?symbol=TSE%3A{code}"
-
 def signal_table_html(stocks, title, emoji):
     # stocks: [(name, ticker), ...]  name には既にトレンド絵文字が含まれる
     rows = "".join(
-        f'<li><a href="{tradingview_url(t)}" target="_blank" rel="noopener">{n}</a></li>'
+        f'<li><a href="{chart_url(t)}" target="_blank" rel="noopener">{n}</a></li>'
         for n, t in stocks
     ) if stocks else "<li class='none'>該当なし</li>"
     return f"""
@@ -443,7 +482,7 @@ top10_html = ""
 if not rankings["Ace_Start"].empty:
     top10 = rankings["Ace_Start"].sort_values("_sort", ascending=False).head(10)
     rows = "".join(
-        f'<tr><td><a href="{tradingview_url(ticker)}" target="_blank" rel="noopener">{r["会社名"]}</a></td>'
+        f'<tr><td><a href="{chart_url(ticker)}" target="_blank" rel="noopener">{r["会社名"]}</a></td>'
         f'<td>{r["シグナル回数"]}</td><td>{r["勝率"]}</td><td>{r["平均リターン"]}</td>'
         f'<td>{get_trend(combined_df[combined_df["Ticker"] == ticker])}</td></tr>'
         for ticker, r in top10.iterrows()
@@ -463,7 +502,7 @@ html = f"""<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>フジコシグナル {today}</title>
+<title>フジコシグナル {MARKET_LABEL} {today}</title>
 <style>
   body {{ font-family: -apple-system, BlinkMacSystemFont, "Hiragino Sans", sans-serif;
           background: #0f1117; color: #e8e8e8; margin: 0; padding: 16px; }}
@@ -486,7 +525,7 @@ html = f"""<!DOCTYPE html>
 </style>
 </head>
 <body>
-  <h1>📊 フジコシグナル</h1>
+  <h1>📊 フジコシグナル({MARKET_LABEL})</h1>
   <div class="updated">最終更新: {today}</div>
 
   {signal_table_html(ace_list, "Ace点灯中", "🅰️")}
@@ -498,10 +537,11 @@ html = f"""<!DOCTYPE html>
 </body>
 </html>"""
 
-with open("index.html", "w", encoding="utf-8") as f:
+output_filename = "index_us.html" if MARKET == "US" else "index.html"
+with open(output_filename, "w", encoding="utf-8") as f:
     f.write(html)
 
-print("✅ index.html 生成完了")
+print(f"✅ {output_filename} 生成完了")
 
 # ============================================================
 # スプレッドシートに履歴を書き込む
