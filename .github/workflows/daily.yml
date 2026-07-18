@@ -28,15 +28,14 @@ jobs:
 
       - name: Run Fujiko script
         env:
-          env:
           JQUANTS_API_KEY: ${{ secrets.JQUANTS_API_KEY }}
           GOOGLE_SHEETS_CREDENTIALS: ${{ secrets.GOOGLE_SHEETS_CREDENTIALS }}
           SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          GAS_URL: ${{ secrets.GAS_URL }}
+          GAS_TOKEN: ${{ secrets.GAS_TOKEN }}
         run: |
           python fujiko.py
-        
-
 
       - name: Upload Pages artifact
         uses: actions/upload-pages-artifact@v3
