@@ -168,7 +168,7 @@ def write_to_spreadsheet(today, ace_stocks, king_stocks, poly_stocks, bep_stocks
         except gspread.exceptions.WorksheetNotFound:
             ws_summary = sh.add_worksheet(title="サマリー", rows=1000, cols=10)
             _sheets_call_with_retry(ws_summary.append_row, ["日付", "Ace銘柄数", "King銘柄数", "ポリグラフ銘柄数", "Ace×BEP銘柄数", "市場"])
-        _sheets_call_with_retry(ws_summary.append_row, [today, len(ace_stocks), len(king_stocks), len(poly_stocks), len(bep_stocks), MARKET])
+        _sheets_call_with_retry(ws_summary.append_row, [today, len(ace_pairs), len(king_pairs), len(poly_pairs), len(bep_pairs), MARKET])
 
         print("✅ スプレッドシート書き込み完了")
     except Exception as e:
@@ -492,21 +492,29 @@ king_stocks_all = [(f"・{TICKER_NAME_MAP.get(t, t)} {get_trend(df)}", t) for t,
 poly_stocks_all = [(f"・{TICKER_NAME_MAP.get(t, t)} {get_trend(df)}", t) for t, df in combined_df.groupby("Ticker") if df["Polygraph_Start"].tail(3).any()]
 bep_stocks_all  = [(f"・{TICKER_NAME_MAP.get(t, t)} {get_trend(df)}", t) for t, df in combined_df.groupby("Ticker") if df["Ace_with_BEP_Start"].tail(3).any()]
 
-# --- LINE通知用(文字数制限があるため上位20件のみ、ヘッダーには正しい総数を表示、各行に市場区分タグ付与) ---
-ace_stocks  = [f"{s} [{get_market_label(t)}]" for s, t in ace_stocks_all[:20]]
-msg += f"\n🅰️ Ace点灯中({len(ace_stocks_all)}銘柄、上位{len(ace_stocks)}件表示):\n"
+# --- LINE通知用(文字数制限があるため上位20件のみ、ヘッダーには正しい総数を表示) ---
+# トレンド絵文字を先頭に置いて見やすく(市場タグはヘッダーで分かるため省略)
+def _line_format(t, df):
+    return f"{get_trend(df)} {TICKER_NAME_MAP.get(t, t)} [{get_market_label(t)}]"
+
+ace_pairs  = [(t, df) for t, df in combined_df.groupby("Ticker") if df["Ace_Start"].tail(3).any()]
+ace_stocks = [_line_format(t, df) for t, df in ace_pairs[:20]]
+msg += f"\n🅰️ Ace点灯中({len(ace_pairs)}銘柄、上位{len(ace_stocks)}件表示)\n"
 msg += "\n".join(ace_stocks) if ace_stocks else "  (該当なし)"
 
-king_stocks = [f"{s} [{get_market_label(t)}]" for s, t in king_stocks_all[:20]]
-msg += f"\n\n👑 King点灯中({len(king_stocks_all)}銘柄、上位{len(king_stocks)}件表示):\n"
+king_pairs  = [(t, df) for t, df in combined_df.groupby("Ticker") if df["King_Start"].tail(3).any()]
+king_stocks = [_line_format(t, df) for t, df in king_pairs[:20]]
+msg += f"\n\n👑 King点灯中({len(king_pairs)}銘柄、上位{len(king_stocks)}件表示)\n"
 msg += "\n".join(king_stocks) if king_stocks else "  (該当なし)"
 
-poly_stocks = [f"{s} [{get_market_label(t)}]" for s, t in poly_stocks_all[:20]]
-msg += f"\n\n🎯 ポリグラフ点灯中({len(poly_stocks_all)}銘柄、上位{len(poly_stocks)}件表示):\n"
+poly_pairs  = [(t, df) for t, df in combined_df.groupby("Ticker") if df["Polygraph_Start"].tail(3).any()]
+poly_stocks = [_line_format(t, df) for t, df in poly_pairs[:20]]
+msg += f"\n\n🎯 ポリグラフ点灯中({len(poly_pairs)}銘柄、上位{len(poly_stocks)}件表示)\n"
 msg += "\n".join(poly_stocks) if poly_stocks else "  (該当なし)"
 
-bep_stocks = [f"{s} [{get_market_label(t)}]" for s, t in bep_stocks_all[:10]]
-msg += f"\n\n🅰️🐢 Ace×BEP同時({len(bep_stocks_all)}銘柄、上位{len(bep_stocks)}件表示):\n"
+bep_pairs  = [(t, df) for t, df in combined_df.groupby("Ticker") if df["Ace_with_BEP_Start"].tail(3).any()]
+bep_stocks = [_line_format(t, df) for t, df in bep_pairs[:10]]
+msg += f"\n\n🅰️🐢 Ace×BEP同時({len(bep_pairs)}銘柄、上位{len(bep_stocks)}件表示)\n"
 msg += "\n".join(bep_stocks) if bep_stocks else "  (該当なし)"
 
 send_line(msg)
