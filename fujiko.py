@@ -441,20 +441,27 @@ MARKET_LABEL = "🇺🇸 米国株" if MARKET == "US" else "🇯🇵 日本株"
 msg = f"📊 {today} フジコシグナル({MARKET_LABEL})\n"
 msg += "=" * 25 + "\n"
 
-ace_stocks = [f"・{TICKER_NAME_MAP.get(t, t)} {get_trend(df)}" for t, df in combined_df.groupby("Ticker") if df["Ace_Start"].tail(3).any()][:20]
-msg += f"\n🅰️ Ace点灯中({len(ace_stocks)}銘柄):\n"
+# --- 全件リスト(Web・スプレッドシート用) ---
+ace_stocks_all  = [f"・{TICKER_NAME_MAP.get(t, t)} {get_trend(df)}" for t, df in combined_df.groupby("Ticker") if df["Ace_Start"].tail(3).any()]
+king_stocks_all = [f"・{TICKER_NAME_MAP.get(t, t)} {get_trend(df)}" for t, df in combined_df.groupby("Ticker") if df["King_Start"].tail(3).any()]
+poly_stocks_all = [f"・{TICKER_NAME_MAP.get(t, t)} {get_trend(df)}" for t, df in combined_df.groupby("Ticker") if df["Polygraph_Start"].tail(3).any()]
+bep_stocks_all  = [f"・{TICKER_NAME_MAP.get(t, t)} {get_trend(df)}" for t, df in combined_df.groupby("Ticker") if df["Ace_with_BEP_Start"].tail(3).any()]
+
+# --- LINE通知用(文字数制限があるため上位20件のみ、ヘッダーには正しい総数を表示) ---
+ace_stocks  = ace_stocks_all[:20]
+msg += f"\n🅰️ Ace点灯中({len(ace_stocks_all)}銘柄、上位{len(ace_stocks)}件表示):\n"
 msg += "\n".join(ace_stocks) if ace_stocks else "  (該当なし)"
 
-king_stocks = [f"・{TICKER_NAME_MAP.get(t, t)} {get_trend(df)}" for t, df in combined_df.groupby("Ticker") if df["King_Start"].tail(3).any()][:20]
-msg += f"\n\n👑 King点灯中({len(king_stocks)}銘柄):\n"
+king_stocks = king_stocks_all[:20]
+msg += f"\n\n👑 King点灯中({len(king_stocks_all)}銘柄、上位{len(king_stocks)}件表示):\n"
 msg += "\n".join(king_stocks) if king_stocks else "  (該当なし)"
 
-poly_stocks = [f"・{TICKER_NAME_MAP.get(t, t)} {get_trend(df)}" for t, df in combined_df.groupby("Ticker") if df["Polygraph_Start"].tail(3).any()][:20]
-msg += f"\n\n🎯 ポリグラフ点灯中({len(poly_stocks)}銘柄):\n"
+poly_stocks = poly_stocks_all[:20]
+msg += f"\n\n🎯 ポリグラフ点灯中({len(poly_stocks_all)}銘柄、上位{len(poly_stocks)}件表示):\n"
 msg += "\n".join(poly_stocks) if poly_stocks else "  (該当なし)"
 
-bep_stocks = [f"・{TICKER_NAME_MAP.get(t, t)} {get_trend(df)}" for t, df in combined_df.groupby("Ticker") if df["Ace_with_BEP_Start"].tail(3).any()][:10]
-msg += f"\n\n🅰️🐢 Ace×BEP同時({len(bep_stocks)}銘柄):\n"
+bep_stocks = bep_stocks_all[:10]
+msg += f"\n\n🅰️🐢 Ace×BEP同時({len(bep_stocks_all)}銘柄、上位{len(bep_stocks)}件表示):\n"
 msg += "\n".join(bep_stocks) if bep_stocks else "  (該当なし)"
 
 send_line(msg)
@@ -550,4 +557,4 @@ print(f"✅ {output_filename} 生成完了")
 # ============================================================
 # スプレッドシートに履歴を書き込む
 # ============================================================
-write_to_spreadsheet(today, ace_stocks, king_stocks, poly_stocks, bep_stocks)
+write_to_spreadsheet(today, ace_stocks_all, king_stocks_all, poly_stocks_all, bep_stocks_all)
