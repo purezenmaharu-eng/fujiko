@@ -134,14 +134,19 @@ def write_to_spreadsheet(today, ace_stocks, king_stocks, poly_stocks, bep_stocks
         ws = sh.sheet1
         if ws.row_count == 0 or ws.cell(1, 1).value != "日付":
             ws.append_row(["日付", "種別", "銘柄名", "市場"])
+
+        # 1銘柄ずつAPI呼び出しすると書き込みクォータを超過するため、全行まとめて1回で送信
+        rows_to_write = []
         for stock, ticker in ace_stocks:
-            ws.append_row([today, "Ace", stock.replace("・", ""), get_market_label(ticker)])
+            rows_to_write.append([today, "Ace", stock.replace("・", ""), get_market_label(ticker)])
         for stock, ticker in king_stocks:
-            ws.append_row([today, "King", stock.replace("・", ""), get_market_label(ticker)])
+            rows_to_write.append([today, "King", stock.replace("・", ""), get_market_label(ticker)])
         for stock, ticker in poly_stocks:
-            ws.append_row([today, "ポリグラフ", stock.replace("・", ""), get_market_label(ticker)])
+            rows_to_write.append([today, "ポリグラフ", stock.replace("・", ""), get_market_label(ticker)])
         for stock, ticker in bep_stocks:
-            ws.append_row([today, "Ace×BEP", stock.replace("・", ""), get_market_label(ticker)])
+            rows_to_write.append([today, "Ace×BEP", stock.replace("・", ""), get_market_label(ticker)])
+        if rows_to_write:
+            ws.append_rows(rows_to_write, value_input_option="RAW")
 
         # --- 日別サマリー(点灯銘柄数の推移を後から追える記録) ---
         try:
