@@ -177,11 +177,12 @@ def get_all_tickers(ticker_name_map):
         cli = jquantsapi.ClientV2(api_key=api_key)
         df_list = cli.get_list()
         df_stocks = df_list[df_list['S33'] != '9999'].copy()
+        print(f"🔍 J-Quants列名一覧(市場区分列の特定用): {list(df_stocks.columns)}")
         tickers = [str(code)[:-1] + ".T" for code in df_stocks['Code'].astype(str)]
         names = df_stocks['CoName'].tolist()
         name_map = dict(zip(tickers, names))
         # 市場区分(列名がAPIバージョンによって揺れる可能性があるため候補を順に試す)
-        for col in ["MarketCodeName", "MarketCode", "Market", "MarketName"]:
+        for col in ["MarketCodeName", "MarketCode", "Market", "MarketName", "Mkt", "MktName", "S19", "S19Name"]:
             if col in df_stocks.columns:
                 MARKET_SEGMENT_MAP = dict(zip(tickers, df_stocks[col].astype(str).tolist()))
                 break
