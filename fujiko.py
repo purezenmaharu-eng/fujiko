@@ -133,15 +133,15 @@ def write_to_spreadsheet(today, ace_stocks, king_stocks, poly_stocks, bep_stocks
         sh = gc.open_by_key(spreadsheet_id)
         ws = sh.sheet1
         if ws.row_count == 0 or ws.cell(1, 1).value != "日付":
-            ws.append_row(["日付", "種別", "銘柄名"])
-        for stock in ace_stocks:
-            ws.append_row([today, "Ace", stock.replace("・", ""), MARKET])
-        for stock in king_stocks:
-            ws.append_row([today, "King", stock.replace("・", ""), MARKET])
-        for stock in poly_stocks:
-            ws.append_row([today, "ポリグラフ", stock.replace("・", ""), MARKET])
-        for stock in bep_stocks:
-            ws.append_row([today, "Ace×BEP", stock.replace("・", ""), MARKET])
+            ws.append_row(["日付", "種別", "銘柄名", "市場"])
+        for stock, ticker in ace_stocks:
+            ws.append_row([today, "Ace", stock.replace("・", ""), get_market_label(ticker)])
+        for stock, ticker in king_stocks:
+            ws.append_row([today, "King", stock.replace("・", ""), get_market_label(ticker)])
+        for stock, ticker in poly_stocks:
+            ws.append_row([today, "ポリグラフ", stock.replace("・", ""), get_market_label(ticker)])
+        for stock, ticker in bep_stocks:
+            ws.append_row([today, "Ace×BEP", stock.replace("・", ""), get_market_label(ticker)])
 
         # --- 日別サマリー(点灯銘柄数の推移を後から追える記録) ---
         try:
@@ -158,7 +158,17 @@ def write_to_spreadsheet(today, ace_stocks, king_stocks, poly_stocks, bep_stocks
 # ============================================================
 # J-Quants APIで全上場銘柄コードを取得
 # ============================================================
+# 銘柄コードごとの市場区分(プライム/スタンダード/グロース等)。JP銘柄のみ使用
+MARKET_SEGMENT_MAP = {}
+
+def get_market_label(ticker):
+    """出力用の市場ラベル。米国株は'US'、日本株は東証区分(プライム/スタンダード/グロース)、取得できない場合は'JP'"""
+    if MARKET == "US":
+        return "US"
+    return MARKET_SEGMENT_MAP.get(ticker, "JP")
+
 def get_all_tickers(ticker_name_map):
+    global MARKET_SEGMENT_MAP
     try:
         api_key = os.environ.get("JQUANTS_API_KEY", "")
         if not api_key:
@@ -170,6 +180,11 @@ def get_all_tickers(ticker_name_map):
         tickers = [str(code)[:-1] + ".T" for code in df_stocks['Code'].astype(str)]
         names = df_stocks['CoName'].tolist()
         name_map = dict(zip(tickers, names))
+        # 市場区分(列名がAPIバージョンによって揺れる可能性があるため候補を順に試す)
+        for col in ["MarketCodeName", "MarketCode", "Market", "MarketName"]:
+            if col in df_stocks.columns:
+                MARKET_SEGMENT_MAP = dict(zip(tickers, df_stocks[col].astype(str).tolist()))
+                break
         print(f"✅ J-Quants: {len(tickers)}銘柄取得成功(ETF除外済)")
         return tickers, name_map
     except Exception as e:
@@ -442,25 +457,25 @@ msg = f"📊 {today} フジコシグナル({MARKET_LABEL})\n"
 msg += "=" * 25 + "\n"
 
 # --- 全件リスト(Web・スプレッドシート用) ---
-ace_stocks_all  = [f"・{TICKER_NAME_MAP.get(t, t)} {get_trend(df)}" for t, df in combined_df.groupby("Ticker") if df["Ace_Start"].tail(3).any()]
-king_stocks_all = [f"・{TICKER_NAME_MAP.get(t, t)} {get_trend(df)}" for t, df in combined_df.groupby("Ticker") if df["King_Start"].tail(3).any()]
-poly_stocks_all = [f"・{TICKER_NAME_MAP.get(t, t)} {get_trend(df)}" for t, df in combined_df.groupby("Ticker") if df["Polygraph_Start"].tail(3).any()]
-bep_stocks_all  = [f"・{TICKER_NAME_MAP.get(t, t)} {get_trend(df)}" for t, df in combined_df.groupby("Ticker") if df["Ace_with_BEP_Start"].tail(3).any()]
+ace_stocks_all  = [(f"・{TICKER_NAME_MAP.get(t, t)} {get_trend(df)}", t) for t, df in combined_df.groupby("Ticker") if df["Ace_Start"].tail(3).any()]
+king_stocks_all = [(f"・{TICKER_NAME_MAP.get(t, t)} {get_trend(df)}", t) for t, df in combined_df.groupby("Ticker") if df["King_Start"].tail(3).any()]
+poly_stocks_all = [(f"・{TICKER_NAME_MAP.get(t, t)} {get_trend(df)}", t) for t, df in combined_df.groupby("Ticker") if df["Polygraph_Start"].tail(3).any()]
+bep_stocks_all  = [(f"・{TICKER_NAME_MAP.get(t, t)} {get_trend(df)}", t) for t, df in combined_df.groupby("Ticker") if df["Ace_with_BEP_Start"].tail(3).any()]
 
-# --- LINE通知用(文字数制限があるため上位20件のみ、ヘッダーには正しい総数を表示) ---
-ace_stocks  = ace_stocks_all[:20]
+# --- LINE通知用(文字数制限があるため上位20件のみ、ヘッダーには正しい総数を表示、各行に市場区分タグ付与) ---
+ace_stocks  = [f"{s} [{get_market_label(t)}]" for s, t in ace_stocks_all[:20]]
 msg += f"\n🅰️ Ace点灯中({len(ace_stocks_all)}銘柄、上位{len(ace_stocks)}件表示):\n"
 msg += "\n".join(ace_stocks) if ace_stocks else "  (該当なし)"
 
-king_stocks = king_stocks_all[:20]
+king_stocks = [f"{s} [{get_market_label(t)}]" for s, t in king_stocks_all[:20]]
 msg += f"\n\n👑 King点灯中({len(king_stocks_all)}銘柄、上位{len(king_stocks)}件表示):\n"
 msg += "\n".join(king_stocks) if king_stocks else "  (該当なし)"
 
-poly_stocks = poly_stocks_all[:20]
+poly_stocks = [f"{s} [{get_market_label(t)}]" for s, t in poly_stocks_all[:20]]
 msg += f"\n\n🎯 ポリグラフ点灯中({len(poly_stocks_all)}銘柄、上位{len(poly_stocks)}件表示):\n"
 msg += "\n".join(poly_stocks) if poly_stocks else "  (該当なし)"
 
-bep_stocks = bep_stocks_all[:10]
+bep_stocks = [f"{s} [{get_market_label(t)}]" for s, t in bep_stocks_all[:10]]
 msg += f"\n\n🅰️🐢 Ace×BEP同時({len(bep_stocks_all)}銘柄、上位{len(bep_stocks)}件表示):\n"
 msg += "\n".join(bep_stocks) if bep_stocks else "  (該当なし)"
 
@@ -484,10 +499,10 @@ def signal_table_html(stocks, title, emoji):
     </div>
     """
 
-ace_list  = [(f"{TICKER_NAME_MAP.get(t, t)} {get_trend(df)}", t) for t, df in combined_df.groupby("Ticker") if df["Ace_Start"].tail(3).any()]
-king_list = [(f"{TICKER_NAME_MAP.get(t, t)} {get_trend(df)}", t) for t, df in combined_df.groupby("Ticker") if df["King_Start"].tail(3).any()]
-poly_list = [(f"{TICKER_NAME_MAP.get(t, t)} {get_trend(df)}", t) for t, df in combined_df.groupby("Ticker") if df["Polygraph_Start"].tail(3).any()]
-bep_list  = [(f"{TICKER_NAME_MAP.get(t, t)} {get_trend(df)}", t) for t, df in combined_df.groupby("Ticker") if df["Ace_with_BEP_Start"].tail(3).any()]
+ace_list  = [(f"{TICKER_NAME_MAP.get(t, t)} {get_trend(df)} [{get_market_label(t)}]", t) for t, df in combined_df.groupby("Ticker") if df["Ace_Start"].tail(3).any()]
+king_list = [(f"{TICKER_NAME_MAP.get(t, t)} {get_trend(df)} [{get_market_label(t)}]", t) for t, df in combined_df.groupby("Ticker") if df["King_Start"].tail(3).any()]
+poly_list = [(f"{TICKER_NAME_MAP.get(t, t)} {get_trend(df)} [{get_market_label(t)}]", t) for t, df in combined_df.groupby("Ticker") if df["Polygraph_Start"].tail(3).any()]
+bep_list  = [(f"{TICKER_NAME_MAP.get(t, t)} {get_trend(df)} [{get_market_label(t)}]", t) for t, df in combined_df.groupby("Ticker") if df["Ace_with_BEP_Start"].tail(3).any()]
 
 top10_html = ""
 if not rankings["Ace_Start"].empty:
@@ -495,14 +510,14 @@ if not rankings["Ace_Start"].empty:
     rows = "".join(
         f'<tr><td><a href="{chart_url(ticker)}" target="_blank" rel="noopener">{r["会社名"]}</a></td>'
         f'<td>{r["シグナル回数"]}</td><td>{r["勝率"]}</td><td>{r["平均リターン"]}</td>'
-        f'<td>{get_trend(combined_df[combined_df["Ticker"] == ticker])}</td></tr>'
+        f'<td>{get_trend(combined_df[combined_df["Ticker"] == ticker])}</td><td>{get_market_label(ticker)}</td></tr>'
         for ticker, r in top10.iterrows()
     )
     top10_html = f"""
     <div class="card">
       <h2>🏆 優秀銘柄ランキング TOP10</h2>
       <table>
-        <tr><th>会社名</th><th>シグナル回数</th><th>勝率</th><th>平均リターン</th><th>トレンド</th></tr>
+        <tr><th>会社名</th><th>シグナル回数</th><th>勝率</th><th>平均リターン</th><th>トレンド</th><th>市場</th></tr>
         {rows}
       </table>
     </div>
