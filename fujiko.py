@@ -201,9 +201,19 @@ def get_all_tickers(ticker_name_map):
         names = df_stocks['CoName'].tolist()
         name_map = dict(zip(tickers, names))
         # 市場区分(列名がAPIバージョンによって揺れる可能性があるため候補を順に試す)
+        # 東証の市場区分コード→名称の対応(取得した列がコード数字だった場合の変換用)
+        TSE_MARKET_CODE_NAMES = {
+            "111": "プライム", "112": "スタンダード", "113": "グロース",
+            "0111": "プライム", "0112": "スタンダード", "0113": "グロース",
+            "0105": "その他", "0106": "その他", "0107": "その他",
+            "0109": "その他", "0110": "その他",
+        }
         for col in ["MarketCodeName", "MarketCode", "Market", "MarketName", "Mkt", "MktName", "S19", "S19Name"]:
             if col in df_stocks.columns:
-                MARKET_SEGMENT_MAP = dict(zip(tickers, df_stocks[col].astype(str).tolist()))
+                raw_values = df_stocks[col].astype(str).tolist()
+                # 値が数字コードなら名称に変換、既に名称ならそのまま使う
+                converted = [TSE_MARKET_CODE_NAMES.get(v, v) for v in raw_values]
+                MARKET_SEGMENT_MAP = dict(zip(tickers, converted))
                 break
         print(f"✅ J-Quants: {len(tickers)}銘柄取得成功(ETF除外済)")
         return tickers, name_map
