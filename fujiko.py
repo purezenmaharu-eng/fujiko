@@ -117,6 +117,20 @@ def send_line(message):
 # ============================================================
 # スプレッドシートへの履歴書き込み
 # ============================================================
+def _sheets_call_with_retry(func, *args, max_retries=4, **kwargs):
+    """Google Sheets APIのクォータ超過(429)時に待機して自動リトライする"""
+    for attempt in range(max_retries):
+        try:
+            return func(*args, **kwargs)
+        except gspread.exceptions.APIError as e:
+            is_quota_error = "429" in str(e) or "Quota exceeded" in str(e)
+            if is_quota_error and attempt < max_retries - 1:
+                wait = 20 * (attempt + 1)
+                print(f"⚠️ Sheets APIクォータ超過、{wait}秒待ってリトライします...({attempt + 1}/{max_retries})")
+                time.sleep(wait)
+            else:
+                raise
+
 def write_to_spreadsheet(today, ace_stocks, king_stocks, poly_stocks, bep_stocks):
     try:
         creds_json = os.environ.get("GOOGLE_SHEETS_CREDENTIALS", "")
@@ -133,7 +147,7 @@ def write_to_spreadsheet(today, ace_stocks, king_stocks, poly_stocks, bep_stocks
         sh = gc.open_by_key(spreadsheet_id)
         ws = sh.sheet1
         if ws.row_count == 0 or ws.cell(1, 1).value != "日付":
-            ws.append_row(["日付", "種別", "銘柄名", "市場"])
+            _sheets_call_with_retry(ws.append_row, ["日付", "種別", "銘柄名", "市場"])
 
         # 1銘柄ずつAPI呼び出しすると書き込みクォータを超過するため、全行まとめて1回で送信
         rows_to_write = []
@@ -146,15 +160,15 @@ def write_to_spreadsheet(today, ace_stocks, king_stocks, poly_stocks, bep_stocks
         for stock, ticker in bep_stocks:
             rows_to_write.append([today, "Ace×BEP", stock.replace("・", ""), get_market_label(ticker)])
         if rows_to_write:
-            ws.append_rows(rows_to_write, value_input_option="RAW")
+            _sheets_call_with_retry(ws.append_rows, rows_to_write, value_input_option="RAW")
 
         # --- 日別サマリー(点灯銘柄数の推移を後から追える記録) ---
         try:
             ws_summary = sh.worksheet("サマリー")
         except gspread.exceptions.WorksheetNotFound:
             ws_summary = sh.add_worksheet(title="サマリー", rows=1000, cols=10)
-            ws_summary.append_row(["日付", "Ace銘柄数", "King銘柄数", "ポリグラフ銘柄数", "Ace×BEP銘柄数", "市場"])
-        ws_summary.append_row([today, len(ace_stocks), len(king_stocks), len(poly_stocks), len(bep_stocks), MARKET])
+            _sheets_call_with_retry(ws_summary.append_row, ["日付", "Ace銘柄数", "King銘柄数", "ポリグラフ銘柄数", "Ace×BEP銘柄数", "市場"])
+        _sheets_call_with_retry(ws_summary.append_row, [today, len(ace_stocks), len(king_stocks), len(poly_stocks), len(bep_stocks), MARKET])
 
         print("✅ スプレッドシート書き込み完了")
     except Exception as e:
