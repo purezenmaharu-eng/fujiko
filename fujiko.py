@@ -21,6 +21,23 @@ RADIKABUNAVI_API_KEY = os.environ.get("RADIKABUNAVI_API_KEY", "")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 GEMINI_MODEL = "gemini-2.0-flash"
 
+def _post_with_429_retry(url, label, max_retries=5, **kwargs):
+    """429(レート制限)時にRetry-Afterヘッダー(なければ指数バックオフ)で待ってからリトライする"""
+    resp = None
+    for attempt in range(max_retries):
+        resp = requests.post(url, **kwargs)
+        if resp.status_code == 429:
+            retry_after = resp.headers.get("Retry-After")
+            try:
+                wait = float(retry_after) if retry_after else min(60, 5 * (2 ** attempt))
+            except ValueError:
+                wait = min(60, 5 * (2 ** attempt))
+            print(f"⚠️ {label}: 429 Too Many Requests → {wait:.0f}秒待機してリトライ({attempt + 1}/{max_retries})")
+            time.sleep(wait)
+            continue
+        return resp
+    return resp  # 最後まで429だった場合はそのまま返す(呼び出し元でエラーログに残る)
+
 # ============================================================
 # 131銘柄リスト
 # ============================================================
@@ -145,7 +162,10 @@ def _radikabunavi_request(method, params=None, request_id=1):
     payload = {"jsonrpc": "2.0", "id": request_id, "method": method}
     if params is not None:
         payload["params"] = params
-    resp = requests.post(RADIKABUNAVI_MCP_URL, json=payload, headers=headers, timeout=30)
+    resp = _post_with_429_retry(
+        RADIKABUNAVI_MCP_URL, "ラジ株ナビ",
+        json=payload, headers=headers, timeout=30,
+    )
     resp.raise_for_status()
     if "Mcp-Session-Id" in resp.headers:
         _radikabunavi_session_id = resp.headers["Mcp-Session-Id"]
@@ -236,7 +256,10 @@ def generate_gemini_commentary(name, ticker, fin_data, forecast_data):
             f"業績予想(JSON): {json.dumps(forecast_data, ensure_ascii=False)[:1500]}\n"
         )
         url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}"
-        resp = requests.post(url, json={"contents": [{"parts": [{"text": prompt}]}]}, timeout=30)
+        resp = _post_with_429_retry(
+            url, "Gemini",
+            json={"contents": [{"parts": [{"text": prompt}]}]}, timeout=30,
+        )
         resp.raise_for_status()
         data = resp.json()
         text = data["candidates"][0]["content"]["parts"][0]["text"].strip()
@@ -261,7 +284,7 @@ def build_fundamental_commentaries(tickers, ticker_name_map):
         comment = generate_gemini_commentary(name, ticker, fin, forecast)
         if comment:
             commentaries[ticker] = comment
-        time.sleep(0.5)  # API連続呼び出しの負荷を抑える
+        time.sleep(4)  # Gemini無料枠のレート制限(RPM)を考慮した間隔
     print(f"✅ 解説生成完了({len(commentaries)}/{len(tickers)}銘柄)")
     return commentaries
 
