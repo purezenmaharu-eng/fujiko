@@ -12,6 +12,16 @@ from google.oauth2.service_account import Credentials
 from datetime import date
 
 # ============================================================
+# ラジ株ナビMCP設定 (EDINETベース財務データ・業績予想)
+# ============================================================
+RADIKABUNAVI_MCP_URL = "https://radikabunavi.com/mcp"
+RADIKABUNAVI_API_KEY = os.environ.get("RADIKABUNAVI_API_KEY", "")
+
+# Gemini設定 (ファンダメンタルズ解説コメント生成)
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
+GEMINI_MODEL = "gemini-2.0-flash"
+
+# ============================================================
 # 131銘柄リスト
 # ============================================================
 TICKER_NAME_MAP = {
@@ -115,6 +125,147 @@ def send_line(message):
         print(f"❌ LINE送信エラー: {e}")
 
 # ============================================================
+# ラジ株ナビMCP経由でEDINET財務データ・業績予想を取得
+# ============================================================
+# MCP(Model Context Protocol) Streamable HTTPトランスポートでJSON-RPCリクエストを送る。
+# セッションIDはサーバーが発行するMcp-Session-Idヘッダーを使い回す。
+_radikabunavi_session_id = None
+_radikabunavi_disabled = False  # 認証エラー等で使用不可と判定したら以降スキップ
+
+def _radikabunavi_request(method, params=None, request_id=1):
+    global _radikabunavi_session_id
+    headers = {
+        "Content-Type": "application/json",
+        "Accept": "application/json, text/event-stream",
+    }
+    if RADIKABUNAVI_API_KEY:
+        headers["Authorization"] = f"Bearer {RADIKABUNAVI_API_KEY}"
+    if _radikabunavi_session_id:
+        headers["Mcp-Session-Id"] = _radikabunavi_session_id
+    payload = {"jsonrpc": "2.0", "id": request_id, "method": method}
+    if params is not None:
+        payload["params"] = params
+    resp = requests.post(RADIKABUNAVI_MCP_URL, json=payload, headers=headers, timeout=30)
+    resp.raise_for_status()
+    if "Mcp-Session-Id" in resp.headers:
+        _radikabunavi_session_id = resp.headers["Mcp-Session-Id"]
+    content_type = resp.headers.get("Content-Type", "")
+    if "text/event-stream" in content_type:
+        # SSE形式("data: {...}"行)の場合はdata行のJSONを取り出す
+        for line in resp.text.splitlines():
+            if line.startswith("data:"):
+                return json.loads(line[len("data:"):].strip())
+        raise RuntimeError("ラジ株ナビ: SSEレスポンスにdataが見つかりません")
+    if not resp.text.strip():
+        return {}
+    return resp.json()
+
+def _radikabunavi_ensure_session():
+    global _radikabunavi_session_id
+    if _radikabunavi_session_id:
+        return
+    _radikabunavi_request("initialize", {
+        "protocolVersion": "2025-03-26",
+        "capabilities": {},
+        "clientInfo": {"name": "fujiko-bot", "version": "1.0"},
+    }, request_id=1)
+    try:
+        _radikabunavi_request("notifications/initialized", {}, request_id=2)
+    except Exception:
+        pass  # 通知はレスポンス不要な場合があるため失敗しても無視
+
+def radikabunavi_call_tool(tool_name, arguments):
+    """ラジ株ナビMCPのツールを呼び出し、結果(dict)を返す。失敗時はNone"""
+    global _radikabunavi_disabled
+    if not RADIKABUNAVI_API_KEY or _radikabunavi_disabled:
+        return None
+    try:
+        _radikabunavi_ensure_session()
+        result = _radikabunavi_request("tools/call", {
+            "name": tool_name,
+            "arguments": arguments,
+        }, request_id=3)
+        if "error" in result:
+            print(f"⚠️ ラジ株ナビAPIエラー({tool_name}, {arguments}): {result['error']}")
+            return None
+        content = result.get("result", {}).get("content", [])
+        for block in content:
+            if block.get("type") == "text":
+                try:
+                    return json.loads(block["text"])
+                except json.JSONDecodeError:
+                    return {"raw_text": block["text"]}
+        return None
+    except requests.exceptions.HTTPError as e:
+        # 401/403等の認証エラーは以降呼び出しても無駄なので停止する
+        if e.response is not None and e.response.status_code in (401, 403):
+            print(f"❌ ラジ株ナビ認証エラー({e.response.status_code}) → 以降のEDINET取得をスキップします")
+            _radikabunavi_disabled = True
+        else:
+            print(f"⚠️ ラジ株ナビ呼び出し失敗({tool_name}, {arguments}): {e}")
+        return None
+    except Exception as e:
+        print(f"⚠️ ラジ株ナビ呼び出し失敗({tool_name}, {arguments}): {e}")
+        return None
+
+def get_fundamental_data(ticker):
+    """EDINET財務データ(推移+会社予想)と決算短信ベースの業績予想を取得"""
+    code = ticker.replace(".T", "")
+    fin = radikabunavi_call_tool("get_edinet_financial_data", {
+        "code": code,
+        "metrics": ["netSales", "operatingIncome", "netIncome", "salesGrowth", "operatingMargin"],
+    })
+    forecast = radikabunavi_call_tool("get_earnings_forecast", {"code": code})
+    return fin, forecast
+
+def generate_gemini_commentary(name, ticker, fin_data, forecast_data):
+    """決算・業績データをもとに、Geminiで短い解説コメントを生成する"""
+    if not GEMINI_API_KEY:
+        return ""
+    if not fin_data and not forecast_data:
+        return ""
+    try:
+        prompt = (
+            f"以下は日本株「{name}」({ticker})の決算・業績データです。\n"
+            "これをもとに、日本語で40〜60字程度の一言コメントを作成してください。\n"
+            "条件:\n"
+            "- 売上高・利益の直近の伸び率と、通期予想との比較(増収増益/減収減益、サプライズの有無)を踏まえること\n"
+            "- 「買い」「売り」など断定的な投資判断は書かず、事実ベースの短評にすること\n"
+            "- 絵文字や記号装飾は使わず、文章のみで出力すること\n\n"
+            f"財務データ(JSON): {json.dumps(fin_data, ensure_ascii=False)[:2000]}\n"
+            f"業績予想(JSON): {json.dumps(forecast_data, ensure_ascii=False)[:1500]}\n"
+        )
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}"
+        resp = requests.post(url, json={"contents": [{"parts": [{"text": prompt}]}]}, timeout=30)
+        resp.raise_for_status()
+        data = resp.json()
+        text = data["candidates"][0]["content"]["parts"][0]["text"].strip()
+        return text.replace("\n", " ")
+    except Exception as e:
+        print(f"⚠️ Gemini解説生成失敗({name}): {e}")
+        return ""
+
+def build_fundamental_commentaries(tickers, ticker_name_map):
+    """点灯銘柄それぞれについてEDINETデータを取得しGemini解説を生成する。ticker→コメント文字列の辞書を返す"""
+    commentaries = {}
+    if not RADIKABUNAVI_API_KEY:
+        print("⚠️ RADIKABUNAVI_API_KEY未設定 → ファンダメンタルズ解説をスキップ")
+        return commentaries
+    if not GEMINI_API_KEY:
+        print("⚠️ GEMINI_API_KEY未設定 → ファンダメンタルズ解説をスキップ")
+        return commentaries
+    print(f"📚 ファンダメンタルズ解説生成中({len(tickers)}銘柄)...")
+    for ticker in tickers:
+        name = ticker_name_map.get(ticker, ticker)
+        fin, forecast = get_fundamental_data(ticker)
+        comment = generate_gemini_commentary(name, ticker, fin, forecast)
+        if comment:
+            commentaries[ticker] = comment
+        time.sleep(0.5)  # API連続呼び出しの負荷を抑える
+    print(f"✅ 解説生成完了({len(commentaries)}/{len(tickers)}銘柄)")
+    return commentaries
+
+# ============================================================
 # スプレッドシートへの履歴書き込み
 # ============================================================
 def _sheets_call_with_retry(func, *args, max_retries=4, **kwargs):
@@ -131,7 +282,8 @@ def _sheets_call_with_retry(func, *args, max_retries=4, **kwargs):
             else:
                 raise
 
-def write_to_spreadsheet(today, ace_stocks, king_stocks, poly_stocks, bep_stocks):
+def write_to_spreadsheet(today, ace_stocks, king_stocks, poly_stocks, bep_stocks, commentaries=None):
+    commentaries = commentaries or {}
     try:
         creds_json = os.environ.get("GOOGLE_SHEETS_CREDENTIALS", "")
         spreadsheet_id = os.environ.get("SPREADSHEET_ID", "")
@@ -147,18 +299,18 @@ def write_to_spreadsheet(today, ace_stocks, king_stocks, poly_stocks, bep_stocks
         sh = gc.open_by_key(spreadsheet_id)
         ws = sh.sheet1
         if ws.row_count == 0 or ws.cell(1, 1).value != "日付":
-            _sheets_call_with_retry(ws.append_row, ["日付", "種別", "銘柄名", "市場"])
+            _sheets_call_with_retry(ws.append_row, ["日付", "種別", "銘柄名", "市場", "解説"])
 
         # 1銘柄ずつAPI呼び出しすると書き込みクォータを超過するため、全行まとめて1回で送信
         rows_to_write = []
         for stock, ticker in ace_stocks:
-            rows_to_write.append([today, "Ace", stock.replace("・", ""), get_market_label(ticker)])
+            rows_to_write.append([today, "Ace", stock.replace("・", ""), get_market_label(ticker), commentaries.get(ticker, "")])
         for stock, ticker in king_stocks:
-            rows_to_write.append([today, "King", stock.replace("・", ""), get_market_label(ticker)])
+            rows_to_write.append([today, "King", stock.replace("・", ""), get_market_label(ticker), commentaries.get(ticker, "")])
         for stock, ticker in poly_stocks:
-            rows_to_write.append([today, "ポリグラフ", stock.replace("・", ""), get_market_label(ticker)])
+            rows_to_write.append([today, "ポリグラフ", stock.replace("・", ""), get_market_label(ticker), commentaries.get(ticker, "")])
         for stock, ticker in bep_stocks:
-            rows_to_write.append([today, "Ace×BEP", stock.replace("・", ""), get_market_label(ticker)])
+            rows_to_write.append([today, "Ace×BEP", stock.replace("・", ""), get_market_label(ticker), commentaries.get(ticker, "")])
         if rows_to_write:
             _sheets_call_with_retry(ws.append_rows, rows_to_write, value_input_option="RAW")
 
@@ -492,10 +644,28 @@ king_stocks_all = [(f"・{TICKER_NAME_MAP.get(t, t)} {get_trend(df)}", t) for t,
 poly_stocks_all = [(f"・{TICKER_NAME_MAP.get(t, t)} {get_trend(df)}", t) for t, df in combined_df.groupby("Ticker") if df["Polygraph_Start"].tail(3).any()]
 bep_stocks_all  = [(f"・{TICKER_NAME_MAP.get(t, t)} {get_trend(df)}", t) for t, df in combined_df.groupby("Ticker") if df["Ace_with_BEP_Start"].tail(3).any()]
 
+# ============================================================
+# ファンダメンタルズ解説(EDINET財務データ + Gemini)
+# ============================================================
+# Ace/King/ポリグラフ/BEPで点灯中の全銘柄を対象に、重複を除いてまとめて取得する
+_all_signaled_tickers = sorted(set(
+    [t for _, t in ace_stocks_all] +
+    [t for _, t in king_stocks_all] +
+    [t for _, t in poly_stocks_all] +
+    [t for _, t in bep_stocks_all]
+))
+fundamental_commentaries = build_fundamental_commentaries(_all_signaled_tickers, TICKER_NAME_MAP)
+
 # --- LINE通知用(文字数制限があるため上位20件のみ、ヘッダーには正しい総数を表示) ---
 # トレンド絵文字を先頭に置いて見やすく(市場タグはヘッダーで分かるため省略)
+# 解説は文字数制限のため先頭20字程度に切り詰めて括弧内に付与
 def _line_format(t, df):
-    return f"{get_trend(df)} {TICKER_NAME_MAP.get(t, t)} [{get_market_label(t)}]"
+    base = f"{get_trend(df)} {TICKER_NAME_MAP.get(t, t)} [{get_market_label(t)}]"
+    comment = fundamental_commentaries.get(t, "")
+    if comment:
+        short_comment = comment[:20] + ("…" if len(comment) > 20 else "")
+        base += f"\n   {short_comment}"
+    return base
 
 ace_pairs  = [(t, df) for t, df in combined_df.groupby("Ticker") if df["Ace_Start"].tail(3).any()]
 ace_stocks = [_line_format(t, df) for t, df in ace_pairs[:20]]
@@ -524,12 +694,14 @@ send_line(msg)
 # ============================================================
 print("\n📄 HTMLページ生成中...")
 
-def signal_table_html(stocks, title, emoji):
+def signal_table_html(stocks, title, emoji, commentaries=None):
     # stocks: [(name, ticker), ...]  name には既にトレンド絵文字が含まれる
-    rows = "".join(
-        f'<li><a href="{chart_url(t)}" target="_blank" rel="noopener">{n}</a></li>'
-        for n, t in stocks
-    ) if stocks else "<li class='none'>該当なし</li>"
+    commentaries = commentaries or {}
+    def _row(n, t):
+        comment = commentaries.get(t, "")
+        comment_html = f'<div class="commentary">{comment}</div>' if comment else ""
+        return f'<li><a href="{chart_url(t)}" target="_blank" rel="noopener">{n}</a>{comment_html}</li>'
+    rows = "".join(_row(n, t) for n, t in stocks) if stocks else "<li class='none'>該当なし</li>"
     return f"""
     <div class="card">
       <h2>{emoji} {title} ({len(stocks)}銘柄)</h2>
@@ -581,6 +753,7 @@ html = f"""<!DOCTYPE html>
   li.none {{ color: #666; }}
   li a {{ color: #e8e8e8; text-decoration: none; display: block; }}
   li a:hover {{ color: #4da6ff; text-decoration: underline; }}
+  li .commentary {{ color: #9aa0ac; font-size: 0.82em; margin-top: 2px; line-height: 1.4; }}
   table {{ width: 100%; border-collapse: collapse; font-size: 0.9em; }}
   th, td {{ text-align: left; padding: 6px 4px; border-bottom: 1px solid #2a2d3a; }}
   th {{ color: #888; font-weight: normal; }}
@@ -592,10 +765,10 @@ html = f"""<!DOCTYPE html>
   <h1>📊 フジコシグナル({MARKET_LABEL})</h1>
   <div class="updated">最終更新: {today}</div>
 
-  {signal_table_html(ace_list, "Ace点灯中", "🅰️")}
-  {signal_table_html(king_list, "King点灯中", "👑")}
-  {signal_table_html(poly_list, "ポリグラフ点灯中", "🎯")}
-  {signal_table_html(bep_list, "Ace×BEP同時", "🅰️🐢")}
+  {signal_table_html(ace_list, "Ace点灯中", "🅰️", fundamental_commentaries)}
+  {signal_table_html(king_list, "King点灯中", "👑", fundamental_commentaries)}
+  {signal_table_html(poly_list, "ポリグラフ点灯中", "🎯", fundamental_commentaries)}
+  {signal_table_html(bep_list, "Ace×BEP同時", "🅰️🐢", fundamental_commentaries)}
   {top10_html}
 
 </body>
@@ -610,4 +783,4 @@ print(f"✅ {output_filename} 生成完了")
 # ============================================================
 # スプレッドシートに履歴を書き込む
 # ============================================================
-write_to_spreadsheet(today, ace_stocks_all, king_stocks_all, poly_stocks_all, bep_stocks_all)
+write_to_spreadsheet(today, ace_stocks_all, king_stocks_all, poly_stocks_all, bep_stocks_all, fundamental_commentaries)
