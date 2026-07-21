@@ -21,22 +21,24 @@ RADIKABUNAVI_API_KEY = os.environ.get("RADIKABUNAVI_API_KEY", "")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 GEMINI_MODEL = "gemini-2.0-flash"
 
-def _post_with_429_retry(url, label, max_retries=5, **kwargs):
-    """429(レート制限)時にRetry-Afterヘッダー(なければ指数バックオフ)で待ってからリトライする"""
+def _post_with_429_retry(url, label, max_retries=3, **kwargs):
+    """429(レート制限)時に短時間だけリトライする。それでも解消しない場合は
+    一時的な詰まりではなく日次/月次クォータ超過とみなし、呼び出し元で判断できるよう
+    最後のレスポンスをそのまま返す(呼び出し元がdisabledフラグを立てる)"""
     resp = None
     for attempt in range(max_retries):
         resp = requests.post(url, **kwargs)
         if resp.status_code == 429:
             retry_after = resp.headers.get("Retry-After")
             try:
-                wait = float(retry_after) if retry_after else min(60, 5 * (2 ** attempt))
+                wait = float(retry_after) if retry_after else 3 * (2 ** attempt)
             except ValueError:
-                wait = min(60, 5 * (2 ** attempt))
+                wait = 3 * (2 ** attempt)
             print(f"⚠️ {label}: 429 Too Many Requests → {wait:.0f}秒待機してリトライ({attempt + 1}/{max_retries})")
             time.sleep(wait)
             continue
         return resp
-    return resp  # 最後まで429だった場合はそのまま返す(呼び出し元でエラーログに残る)
+    return resp  # 最後まで429だった場合はそのまま返す(呼び出し元でクォータ超過と判断)
 
 # ============================================================
 # 131銘柄リスト
@@ -217,9 +219,13 @@ def radikabunavi_call_tool(tool_name, arguments):
                     return {"raw_text": block["text"]}
         return None
     except requests.exceptions.HTTPError as e:
-        # 401/403等の認証エラーは以降呼び出しても無駄なので停止する
-        if e.response is not None and e.response.status_code in (401, 403):
-            print(f"❌ ラジ株ナビ認証エラー({e.response.status_code}) → 以降のEDINET取得をスキップします")
+        # 401/403(認証エラー)や429(クォータ超過)は以降呼び出しても無駄なので停止する
+        status = e.response.status_code if e.response is not None else None
+        if status in (401, 403):
+            print(f"❌ ラジ株ナビ認証エラー({status}) → 以降のEDINET取得をスキップします")
+            _radikabunavi_disabled = True
+        elif status == 429:
+            print("❌ ラジ株ナビ: 429が解消しないため日次/月次クォータ超過と判断 → 以降のEDINET取得をスキップします")
             _radikabunavi_disabled = True
         else:
             print(f"⚠️ ラジ株ナビ呼び出し失敗({tool_name}, {arguments}): {e}")
@@ -238,9 +244,12 @@ def get_fundamental_data(ticker):
     forecast = radikabunavi_call_tool("get_earnings_forecast", {"code": code})
     return fin, forecast
 
+_gemini_disabled = False  # 429が解消しない場合、以降のGemini呼び出しをスキップ
+
 def generate_gemini_commentary(name, ticker, fin_data, forecast_data):
     """決算・業績データをもとに、Geminiで短い解説コメントを生成する"""
-    if not GEMINI_API_KEY:
+    global _gemini_disabled
+    if not GEMINI_API_KEY or _gemini_disabled:
         return ""
     if not fin_data and not forecast_data:
         return ""
@@ -260,6 +269,10 @@ def generate_gemini_commentary(name, ticker, fin_data, forecast_data):
             url, "Gemini",
             json={"contents": [{"parts": [{"text": prompt}]}]}, timeout=30,
         )
+        if resp.status_code == 429:
+            print("❌ Gemini: 429が解消しないためクォータ超過と判断 → 以降の解説生成をスキップします")
+            _gemini_disabled = True
+            return ""
         resp.raise_for_status()
         data = resp.json()
         text = data["candidates"][0]["content"]["parts"][0]["text"].strip()
@@ -279,6 +292,12 @@ def build_fundamental_commentaries(tickers, ticker_name_map):
         return commentaries
     print(f"📚 ファンダメンタルズ解説生成中({len(tickers)}銘柄)...")
     for ticker in tickers:
+        if _radikabunavi_disabled:
+            print("⏹️ ラジ株ナビが利用不可のため、残りの解説生成を打ち切ります(財務データなしではGemini解説も生成不可)")
+            break
+        if _gemini_disabled:
+            print("⏹️ Geminiが利用不可のため、残りの解説生成を打ち切ります")
+            break
         name = ticker_name_map.get(ticker, ticker)
         fin, forecast = get_fundamental_data(ticker)
         comment = generate_gemini_commentary(name, ticker, fin, forecast)
