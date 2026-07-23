@@ -21,6 +21,25 @@ RADIKABUNAVI_API_KEY = os.environ.get("RADIKABUNAVI_API_KEY", "")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 GEMINI_MODEL = "gemini-2.0-flash"
 
+def _post_with_429_retry(url, label, max_retries=3, **kwargs):
+    """429(レート制限)時に短時間だけリトライする。それでも解消しない場合は
+    一時的な詰まりではなく日次/月次クォータ超過とみなし、呼び出し元で判断できるよう
+    最後のレスポンスをそのまま返す(呼び出し元がdisabledフラグを立てる)"""
+    resp = None
+    for attempt in range(max_retries):
+        resp = requests.post(url, **kwargs)
+        if resp.status_code == 429:
+            retry_after = resp.headers.get("Retry-After")
+            try:
+                wait = float(retry_after) if retry_after else 3 * (2 ** attempt)
+            except ValueError:
+                wait = 3 * (2 ** attempt)
+            print(f"⚠️ {label}: 429 Too Many Requests → {wait:.0f}秒待機してリトライ({attempt + 1}/{max_retries})")
+            time.sleep(wait)
+            continue
+        return resp
+    return resp  # 最後まで429だった場合はそのまま返す(呼び出し元でクォータ超過と判断)
+
 # ============================================================
 # 131銘柄リスト
 # ============================================================
@@ -99,7 +118,6 @@ def get_us_tickers():
 def chart_url(ticker):
     """銘柄チャートへのリンク(TradingViewに統一)"""
     if MARKET == "US":
-        # 取引所(NASDAQ/NYSE等)が銘柄ごとに異なるため、自動解決される/symbols/形式を使用
         return f"https://www.tradingview.com/symbols/{ticker}/"
     code = ticker.replace(".T", "")
     return f"https://www.tradingview.com/chart/?symbol=TSE%3A{code}"
@@ -107,9 +125,8 @@ def chart_url(ticker):
 # ============================================================
 # LINE通知設定 (GAS経由)
 # ============================================================
-# 公開リポジトリにURLを直書きしないよう、GitHub Secrets経由で読み込む
 GAS_URL = os.environ.get("GAS_URL", "")
-GAS_TOKEN = os.environ.get("GAS_TOKEN", "")  # GAS側で照合する合言葉(なりすまし防止)
+GAS_TOKEN = os.environ.get("GAS_TOKEN", "")
 
 def send_line(message):
     if not GAS_URL:
@@ -127,8 +144,6 @@ def send_line(message):
 # ============================================================
 # ラジ株ナビMCP経由でEDINET財務データ・業績予想を取得
 # ============================================================
-# MCP(Model Context Protocol) Streamable HTTPトランスポートでJSON-RPCリクエストを送る。
-# セッションIDはサーバーが発行するMcp-Session-Idヘッダーを使い回す。
 _radikabunavi_session_id = None
 _radikabunavi_disabled = False  # 認証エラー等で使用不可と判定したら以降スキップ
 
@@ -145,13 +160,15 @@ def _radikabunavi_request(method, params=None, request_id=1):
     payload = {"jsonrpc": "2.0", "id": request_id, "method": method}
     if params is not None:
         payload["params"] = params
-    resp = requests.post(RADIKABUNAVI_MCP_URL, json=payload, headers=headers, timeout=30)
+    resp = _post_with_429_retry(
+        RADIKABUNAVI_MCP_URL, "ラジ株ナビ",
+        json=payload, headers=headers, timeout=30,
+    )
     resp.raise_for_status()
     if "Mcp-Session-Id" in resp.headers:
         _radikabunavi_session_id = resp.headers["Mcp-Session-Id"]
     content_type = resp.headers.get("Content-Type", "")
     if "text/event-stream" in content_type:
-        # SSE形式("data: {...}"行)の場合はdata行のJSONを取り出す
         for line in resp.text.splitlines():
             if line.startswith("data:"):
                 return json.loads(line[len("data:"):].strip())
@@ -172,7 +189,7 @@ def _radikabunavi_ensure_session():
     try:
         _radikabunavi_request("notifications/initialized", {}, request_id=2)
     except Exception:
-        pass  # 通知はレスポンス不要な場合があるため失敗しても無視
+        pass
 
 def radikabunavi_call_tool(tool_name, arguments):
     """ラジ株ナビMCPのツールを呼び出し、結果(dict)を返す。失敗時はNone"""
@@ -197,9 +214,12 @@ def radikabunavi_call_tool(tool_name, arguments):
                     return {"raw_text": block["text"]}
         return None
     except requests.exceptions.HTTPError as e:
-        # 401/403等の認証エラーは以降呼び出しても無駄なので停止する
-        if e.response is not None and e.response.status_code in (401, 403):
-            print(f"❌ ラジ株ナビ認証エラー({e.response.status_code}) → 以降のEDINET取得をスキップします")
+        status = e.response.status_code if e.response is not None else None
+        if status in (401, 403):
+            print(f"❌ ラジ株ナビ認証エラー({status}) → 以降のEDINET取得をスキップします")
+            _radikabunavi_disabled = True
+        elif status == 429:
+            print("❌ ラジ株ナビ: 429が解消しないため日次/月次クォータ超過と判断 → 以降のEDINET取得をスキップします")
             _radikabunavi_disabled = True
         else:
             print(f"⚠️ ラジ株ナビ呼び出し失敗({tool_name}, {arguments}): {e}")
@@ -218,9 +238,12 @@ def get_fundamental_data(ticker):
     forecast = radikabunavi_call_tool("get_earnings_forecast", {"code": code})
     return fin, forecast
 
+_gemini_disabled = False  # 429が解消しない場合、以降のGemini呼び出しをスキップ
+
 def generate_gemini_commentary(name, ticker, fin_data, forecast_data):
     """決算・業績データをもとに、Geminiで短い解説コメントを生成する"""
-    if not GEMINI_API_KEY:
+    global _gemini_disabled
+    if not GEMINI_API_KEY or _gemini_disabled:
         return ""
     if not fin_data and not forecast_data:
         return ""
@@ -236,7 +259,14 @@ def generate_gemini_commentary(name, ticker, fin_data, forecast_data):
             f"業績予想(JSON): {json.dumps(forecast_data, ensure_ascii=False)[:1500]}\n"
         )
         url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}"
-        resp = requests.post(url, json={"contents": [{"parts": [{"text": prompt}]}]}, timeout=30)
+        resp = _post_with_429_retry(
+            url, "Gemini",
+            json={"contents": [{"parts": [{"text": prompt}]}]}, timeout=30,
+        )
+        if resp.status_code == 429:
+            print("❌ Gemini: 429が解消しないためクォータ超過と判断 → 以降の解説生成をスキップします")
+            _gemini_disabled = True
+            return ""
         resp.raise_for_status()
         data = resp.json()
         text = data["candidates"][0]["content"]["parts"][0]["text"].strip()
@@ -256,12 +286,18 @@ def build_fundamental_commentaries(tickers, ticker_name_map):
         return commentaries
     print(f"📚 ファンダメンタルズ解説生成中({len(tickers)}銘柄)...")
     for ticker in tickers:
+        if _radikabunavi_disabled:
+            print("⏹️ ラジ株ナビが利用不可のため、残りの解説生成を打ち切ります(財務データなしではGemini解説も生成不可)")
+            break
+        if _gemini_disabled:
+            print("⏹️ Geminiが利用不可のため、残りの解説生成を打ち切ります")
+            break
         name = ticker_name_map.get(ticker, ticker)
         fin, forecast = get_fundamental_data(ticker)
         comment = generate_gemini_commentary(name, ticker, fin, forecast)
         if comment:
             commentaries[ticker] = comment
-        time.sleep(0.5)  # API連続呼び出しの負荷を抑える
+        time.sleep(4)
     print(f"✅ 解説生成完了({len(commentaries)}/{len(tickers)}銘柄)")
     return commentaries
 
@@ -301,7 +337,6 @@ def write_to_spreadsheet(today, ace_stocks, king_stocks, poly_stocks, bep_stocks
         if ws.row_count == 0 or ws.cell(1, 1).value != "日付":
             _sheets_call_with_retry(ws.append_row, ["日付", "種別", "銘柄名", "市場", "解説"])
 
-        # 1銘柄ずつAPI呼び出しすると書き込みクォータを超過するため、全行まとめて1回で送信
         rows_to_write = []
         for stock, ticker in ace_stocks:
             rows_to_write.append([today, "Ace", stock.replace("・", ""), get_market_label(ticker), commentaries.get(ticker, "")])
@@ -314,7 +349,6 @@ def write_to_spreadsheet(today, ace_stocks, king_stocks, poly_stocks, bep_stocks
         if rows_to_write:
             _sheets_call_with_retry(ws.append_rows, rows_to_write, value_input_option="RAW")
 
-        # --- 日別サマリー(点灯銘柄数の推移を後から追える記録) ---
         try:
             ws_summary = sh.worksheet("サマリー")
         except gspread.exceptions.WorksheetNotFound:
@@ -329,11 +363,9 @@ def write_to_spreadsheet(today, ace_stocks, king_stocks, poly_stocks, bep_stocks
 # ============================================================
 # J-Quants APIで全上場銘柄コードを取得
 # ============================================================
-# 銘柄コードごとの市場区分(プライム/スタンダード/グロース等)。JP銘柄のみ使用
 MARKET_SEGMENT_MAP = {}
 
 def get_market_label(ticker):
-    """出力用の市場ラベル。米国株は'US'、日本株は東証区分(プライム/スタンダード/グロース)、取得できない場合は'JP'"""
     if MARKET == "US":
         return "US"
     return MARKET_SEGMENT_MAP.get(ticker, "JP")
@@ -352,8 +384,6 @@ def get_all_tickers(ticker_name_map):
         tickers = [str(code)[:-1] + ".T" for code in df_stocks['Code'].astype(str)]
         names = df_stocks['CoName'].tolist()
         name_map = dict(zip(tickers, names))
-        # 市場区分(列名がAPIバージョンによって揺れる可能性があるため候補を順に試す)
-        # 東証の市場区分コード→名称の対応(取得した列がコード数字だった場合の変換用)
         TSE_MARKET_CODE_NAMES = {
             "111": "プライム", "112": "スタンダード", "113": "グロース",
             "0111": "プライム", "0112": "スタンダード", "0113": "グロース",
@@ -363,7 +393,6 @@ def get_all_tickers(ticker_name_map):
         for col in ["MarketCodeName", "MarketCode", "Market", "MarketName", "Mkt", "MktName", "S19", "S19Name"]:
             if col in df_stocks.columns:
                 raw_values = df_stocks[col].astype(str).tolist()
-                # 値が数字コードなら名称に変換、既に名称ならそのまま使う
                 converted = [TSE_MARKET_CODE_NAMES.get(v, v) for v in raw_values]
                 MARKET_SEGMENT_MAP = dict(zip(tickers, converted))
                 break
@@ -395,7 +424,6 @@ def detect_bullish_ep(df, lookback=10):
     return df
 
 def calculate_rsi(close, period=14):
-    """RSI(14) を Wilder方式の指数平滑で計算"""
     delta = close.diff()
     gain = delta.clip(lower=0)
     loss = -delta.clip(upper=0)
@@ -406,7 +434,6 @@ def calculate_rsi(close, period=14):
     return rsi.fillna(50)
 
 def calculate_macd(close, fast=12, slow=26, signal=9):
-    """MACD(12,26,9): MACDライン・シグナルライン・ヒストグラムを返す"""
     ema_fast = close.ewm(span=fast, adjust=False).mean()
     ema_slow = close.ewm(span=slow, adjust=False).mean()
     macd_line = ema_fast - ema_slow
@@ -427,7 +454,6 @@ def calculate_base_indicators(df_stock):
     df["Low52"]  = df["Low"].rolling(250).min()
     df["VolMA20"]   = df["Volume"].rolling(20).mean()
     df["VolumeVCP"] = (df["Volume"] - df["VolMA20"]) / df["VolMA20"]
-    # ATR(Average True Range, 14日)
     prev_close = df["Close"].shift(1)
     tr = pd.concat([
         df["High"] - df["Low"],
@@ -436,16 +462,9 @@ def calculate_base_indicators(df_stock):
     ], axis=1).max(axis=1)
     df["ATR14"] = tr.rolling(14).mean()
 
-    # --- RSI(14) ---
     df["RSI14"] = calculate_rsi(df["Close"], period=14)
-
-    # --- MACD(12,26,9) ---
     df["MACD"], df["MACD_Signal"], df["MACD_Hist"] = calculate_macd(df["Close"])
 
-    # --- トレンド判定(RSIとMACDの組み合わせ) ---
-    # 📈上昇: MACD > シグナル かつ RSI > 50
-    # 📉下降: MACD < シグナル かつ RSI < 50
-    # ➡️中立: それ以外(どちらかが逆行しているケース)
     df["Trend"] = "➡️中立"
     df.loc[(df["MACD"] > df["MACD_Signal"]) & (df["RSI14"] > 50), "Trend"] = "📈上昇"
     df.loc[(df["MACD"] < df["MACD_Signal"]) & (df["RSI14"] < 50), "Trend"] = "📉下降"
@@ -454,7 +473,6 @@ def calculate_base_indicators(df_stock):
     return df
 
 def get_trend(df):
-    """銘柄の直近トレンド判定(📈上昇/📉下降/➡️中立)を取得"""
     if df is None or df.empty or "Trend" not in df.columns:
         return "➡️中立"
     val = df["Trend"].iloc[-1]
@@ -494,11 +512,11 @@ def calc_signals(combined_df, rsr_momentum_period=3):
             (df["Close"] > df["MA150"]) & (df["Close"] > df["MA200"]) &
             (df["MA150"] > df["MA200"]) & df["MA200_is_rising"] &
             df["MA50_is_rising"] & (df["Close"] > df["MA50"]) &
-            (df["Close"] >= df["Low52"] * 1.4) &   # 52週安値からの上昇率をより厳しく(旧1.3)
-            (df["Close"] >= df["High52"] * 0.85)   # 52週高値により近い銘柄だけに(旧0.75)
+            (df["Close"] >= df["Low52"] * 1.4) &
+            (df["Close"] >= df["High52"] * 0.85)
         )
-        df["Ace"]  = base_7 & (df["RSR"] >= 80)                     # 相対力を上位20%以内に(旧70)
-        df["King"] = base_7 & (df["RSR"] >= 65) & (df["RSR"] < 80)  # Aceの一歩手前(旧60〜70)
+        df["Ace"]  = base_7 & (df["RSR"] >= 80)
+        df["King"] = base_7 & (df["RSR"] >= 65) & (df["RSR"] < 80)
         df["Polygraph"] = (
             (df["VolumeVCP"] > 1.0) &
             (df["RSR"] >= 85) &
@@ -520,16 +538,16 @@ def backtest(combined_df, signal_col, ticker_name_map,
         sig_idx = np.where(df[signal_col] == True)[0]
         ticker_returns = []
         for idx in sig_idx:
-            entry_idx = idx + 1  # シグナル点灯日の"翌営業日"にエントリー(ルックアヘッドバイアス回避)
+            entry_idx = idx + 1
             if entry_idx >= len(df): continue
-            atr = df.iloc[idx]["ATR14"]  # シグナル点灯日時点で既知のATR(未来情報を使わない)
+            atr = df.iloc[idx]["ATR14"]
             if pd.isna(atr) or atr <= 0: continue
-            buy_p = df.iloc[entry_idx]["Open"]  # 翌日の始値で購入
+            buy_p = df.iloc[entry_idx]["Open"]
             stop_loss_pct = -(atr_stop_mult * atr / buy_p) * 100
             take_profit_pct = (atr_profit_mult * atr / buy_p) * 100
             exited = False
             for i in range(entry_idx, min(entry_idx + max_hold_days, len(df))):
-                pnl = (df.iloc[i]["Close"] - buy_p) / buy_p * 100 - txn_cost_pct  # 往復取引コスト控除
+                pnl = (df.iloc[i]["Close"] - buy_p) / buy_p * 100 - txn_cost_pct
                 if pnl <= stop_loss_pct or pnl >= take_profit_pct:
                     all_returns.append(pnl); ticker_returns.append(pnl); exited = True; break
             if not exited:
@@ -555,8 +573,8 @@ def backtest(combined_df, signal_col, ticker_name_map,
 # メイン実行
 # ============================================================
 START = "2023-01-01"
-END   = (date.today() + pd.Timedelta(days=1)).strftime("%Y-%m-%d")  # 実行日の翌日を指定し、常に最新データまで取得
-BENCH = "^GSPC" if MARKET == "US" else "1306.T"  # 米国株はS&P500、日本株はTOPIX連動ETF
+END   = (date.today() + pd.Timedelta(days=1)).strftime("%Y-%m-%d")
+BENCH = "^GSPC" if MARKET == "US" else "1306.T"
 
 if MARKET == "US":
     target_stocks, TICKER_NAME_MAP = get_us_tickers()
@@ -647,7 +665,6 @@ bep_stocks_all  = [(f"・{TICKER_NAME_MAP.get(t, t)} {get_trend(df)}", t) for t,
 # ============================================================
 # ファンダメンタルズ解説(EDINET財務データ + Gemini)
 # ============================================================
-# Ace/King/ポリグラフ/BEPで点灯中の全銘柄を対象に、重複を除いてまとめて取得する
 _all_signaled_tickers = sorted(set(
     [t for _, t in ace_stocks_all] +
     [t for _, t in king_stocks_all] +
@@ -657,8 +674,6 @@ _all_signaled_tickers = sorted(set(
 fundamental_commentaries = build_fundamental_commentaries(_all_signaled_tickers, TICKER_NAME_MAP)
 
 # --- LINE通知用(文字数制限があるため上位20件のみ、ヘッダーには正しい総数を表示) ---
-# トレンド絵文字を先頭に置いて見やすく(市場タグはヘッダーで分かるため省略)
-# 解説は文字数制限のため先頭20字程度に切り詰めて括弧内に付与
 def _line_format(t, df):
     base = f"{get_trend(df)} {TICKER_NAME_MAP.get(t, t)} [{get_market_label(t)}]"
     comment = fundamental_commentaries.get(t, "")
@@ -695,7 +710,6 @@ send_line(msg)
 print("\n📄 HTMLページ生成中...")
 
 def signal_table_html(stocks, title, emoji, commentaries=None):
-    # stocks: [(name, ticker), ...]  name には既にトレンド絵文字が含まれる
     commentaries = commentaries or {}
     def _row(n, t):
         comment = commentaries.get(t, "")
