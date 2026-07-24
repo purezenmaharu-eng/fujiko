@@ -19,7 +19,7 @@ RADIKABUNAVI_API_KEY = os.environ.get("RADIKABUNAVI_API_KEY", "")
 
 # Gemini設定 (ファンダメンタルズ解説コメント生成)
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
-GEMINI_MODEL = "gemini-2.0-flash"
+GEMINI_MODEL = "gemini-3.1-flash-lite"
 
 def _post_with_429_retry(url, label, max_retries=3, **kwargs):
     """429(レート制限)時に短時間だけリトライする。それでも解消しない場合は
@@ -297,10 +297,10 @@ def build_fundamental_commentaries(tickers, ticker_name_map):
         comment = generate_gemini_commentary(name, ticker, fin, forecast)
         if comment:
             commentaries[ticker] = comment
-        time.sleep(4)
+  
+        time.sleep(4.5)
     print(f"✅ 解説生成完了({len(commentaries)}/{len(tickers)}銘柄)")
     return commentaries
-
 # ============================================================
 # スプレッドシートへの履歴書き込み
 # ============================================================
