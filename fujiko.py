@@ -1,4 +1,4 @@
-import os
+﻿import os
 import json
 import time
 import io
@@ -665,12 +665,24 @@ bep_stocks_all  = [(f"・{TICKER_NAME_MAP.get(t, t)} {get_trend(df)}", t) for t,
 # ============================================================
 # ファンダメンタルズ解説(EDINET財務データ + Gemini)
 # ============================================================
-_all_signaled_tickers = sorted(set(
-    [t for _, t in ace_stocks_all] +
-    [t for _, t in king_stocks_all] +
-    [t for _, t in poly_stocks_all] +
-    [t for _, t in bep_stocks_all]
-))
+# 優先度順(厳選度が高いシグナルを優先): ポリグラフ → Ace×BEP → Ace → King
+# ラジ株ナビ無料プランは1日150リクエスト、1銘柄につき2リクエスト消費するため上限75銘柄
+RADIKABUNAVI_DAILY_LIMIT = 150
+CALLS_PER_TICKER = 2
+MAX_FUNDAMENTAL_TICKERS = RADIKABUNAVI_DAILY_LIMIT // CALLS_PER_TICKER
+
+_priority_ordered_tickers = []
+_seen_tickers = set()
+for _stocks in (poly_stocks_all, bep_stocks_all, ace_stocks_all, king_stocks_all):
+    for _, _t in _stocks:
+        if _t not in _seen_tickers:
+            _seen_tickers.add(_t)
+            _priority_ordered_tickers.append(_t)
+
+_all_signaled_tickers = _priority_ordered_tickers
+if len(_all_signaled_tickers) > MAX_FUNDAMENTAL_TICKERS:
+    print(f"priority list exceeds free-tier limit, trimming to top {MAX_FUNDAMENTAL_TICKERS}")
+    _all_signaled_tickers = _all_signaled_tickers[:MAX_FUNDAMENTAL_TICKERS]
 fundamental_commentaries = build_fundamental_commentaries(_all_signaled_tickers, TICKER_NAME_MAP)
 
 # --- LINE通知用(文字数制限があるため上位20件のみ、ヘッダーには正しい総数を表示) ---
