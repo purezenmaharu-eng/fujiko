@@ -326,9 +326,24 @@ def write_to_spreadsheet(today, ace_stocks, king_stocks, poly_stocks, bep_stocks
         )
         gc = gspread.authorize(creds)
         sh = gc.open_by_key(spreadsheet_id)
-        ws = sh.sheet1
-        if ws.row_count == 0 or ws.cell(1, 1).value != "日付":
+        # --- 日付ごとに新しいシートを作成(見やすさ対策) ---
+        sheet_name = today.replace("/", "-")  # 例: "2026/07/25" → "2026-07-25"
+        try:
+            ws = sh.worksheet(sheet_name)
+            is_new_sheet = False
+        except gspread.exceptions.WorksheetNotFound:
+            ws = sh.add_worksheet(title=sheet_name, rows=500, cols=5)
+            is_new_sheet = True
+
+        if is_new_sheet or ws.row_count == 0 or ws.cell(1, 1).value != "日付":
             _sheets_call_with_retry(ws.append_row, ["日付", "種別", "銘柄名", "市場", "解説"])
+            # 見出し行を固定し、フィルタと列幅を自動設定
+            try:
+                ws.freeze(rows=1)
+                ws.set_basic_filter()
+                ws.columns_auto_resize(0, 4)
+            except Exception as e:
+                print(f"⚠️ シート書式設定に失敗(処理は継続): {e}")
 
         rows_to_write = []
         for stock, ticker in ace_stocks:
