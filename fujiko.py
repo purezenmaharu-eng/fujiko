@@ -369,6 +369,155 @@ def write_to_spreadsheet(today, ace_stocks, king_stocks, poly_stocks, bep_stocks
         print(f"❌ スプレッドシート書き込み失敗: {e}")
 
 # ============================================================
+# シグナル的中率トラッキング(「追跡」シート)
+# ============================================================
+TRACKING_HEADERS = [
+    "銘柄名", "ティッカー", "種別", "市場", "点灯日", "点灯日終値",
+    "ステータス", "判定日", "判定時終値", "騰落率%", "的中",
+]
+TRACKING_SIGNAL_COLUMNS = {
+    "Ace_Start": "Ace",
+    "King_Start": "King",
+    "Polygraph_Start": "ポリグラフ",
+    "Ace_with_BEP_Start": "Ace×BEP",
+}
+TRACKING_HOLD_DAYS = 10
+TRACKING_HIT_THRESHOLD_PCT = 2.0
+
+def _tracking_register_new_signals(ws, combined_df, ticker_name_map, existing_keys):
+    """当日点灯したシグナルを「追跡」シートに新規登録する"""
+    new_rows = []
+    for ticker, df in combined_df.groupby("Ticker"):
+        if df.empty:
+            continue
+        last_row = df.iloc[-1]
+        lit_date_str = df.index[-1].strftime("%Y/%m/%d")
+        close_price = last_row.get("Close")
+        if pd.isna(close_price):
+            continue
+        for col, label in TRACKING_SIGNAL_COLUMNS.items():
+            if col not in df.columns or not bool(last_row.get(col, False)):
+                continue
+            key = (ticker, label, lit_date_str)
+            if key in existing_keys:
+                continue
+            new_rows.append([
+                ticker_name_map.get(ticker, ticker),
+                ticker,
+                label,
+                get_market_label(ticker),
+                lit_date_str,
+                round(float(close_price), 2),
+                "追跡中", "", "", "", "",
+            ])
+            existing_keys.add(key)
+    if new_rows:
+        _sheets_call_with_retry(ws.append_rows, new_rows, value_input_option="RAW")
+    return len(new_rows)
+
+def _tracking_resolve_pending_signals(ws, combined_df, records):
+    """10営業日経過した「追跡中」行の的中判定を確定する"""
+    cells_to_update = []
+    resolved_count = 0
+    hit_count = 0
+    for i, rec in enumerate(records):
+        if rec.get("ステータス") != "追跡中":
+            continue
+        row_num = i + 2  # ヘッダー行の次から
+        ticker = rec.get("ティッカー")
+        lit_date_str = rec.get("点灯日")
+        lit_close = rec.get("点灯日終値")
+        if not ticker or not lit_date_str or lit_close in ("", None):
+            continue
+        try:
+            lit_close = float(lit_close)
+        except (TypeError, ValueError):
+            continue
+
+        ticker_df = combined_df[combined_df["Ticker"] == ticker].sort_index()
+        if ticker_df.empty:
+            continue
+        try:
+            lit_date = pd.to_datetime(lit_date_str, format="%Y/%m/%d")
+            pos = ticker_df.index.get_loc(lit_date)
+        except KeyError:
+            continue
+        if isinstance(pos, (slice, np.ndarray)):
+            continue  # 重複日付など異常系はスキップ
+
+        target_pos = pos + TRACKING_HOLD_DAYS
+        if target_pos >= len(ticker_df):
+            continue  # まだ規定営業日数を経過していない
+
+        judge_row = ticker_df.iloc[target_pos]
+        judge_close = judge_row["Close"]
+        if pd.isna(judge_close):
+            continue
+        judge_date_str = ticker_df.index[target_pos].strftime("%Y/%m/%d")
+        pct_change = (judge_close - lit_close) / lit_close * 100
+        is_hit = pct_change >= TRACKING_HIT_THRESHOLD_PCT
+
+        resolved_count += 1
+        if is_hit:
+            hit_count += 1
+
+        values = ["完了", judge_date_str, round(float(judge_close), 2),
+                  round(float(pct_change), 2), "的中" if is_hit else "不的中"]
+        for col_offset, value in enumerate(values):
+            cells_to_update.append(gspread.Cell(row=row_num, col=7 + col_offset, value=value))
+
+    if cells_to_update:
+        _sheets_call_with_retry(ws.update_cells, cells_to_update, value_input_option="RAW")
+    return resolved_count, hit_count
+
+def run_signal_tracking(combined_df, ticker_name_map):
+    """当日点灯シグナルの「追跡」シートへの新規登録と、10営業日経過分の的中判定確定を行う。
+    戻り値: (新規登録件数, 判定確定件数, 的中件数)。スプレッドシート設定が無い場合はNone"""
+    creds_json = os.environ.get("GOOGLE_SHEETS_CREDENTIALS", "")
+    spreadsheet_id = os.environ.get("SPREADSHEET_ID", "")
+    if not creds_json or not spreadsheet_id:
+        print("⚠️ スプレッドシート設定未完了 → シグナル的中率トラッキングをスキップ")
+        return None
+    try:
+        creds_dict = json.loads(creds_json)
+        creds = Credentials.from_service_account_info(
+            creds_dict,
+            scopes=["https://www.googleapis.com/auth/spreadsheets"]
+        )
+        gc = gspread.authorize(creds)
+        sh = gc.open_by_key(spreadsheet_id)
+
+        try:
+            ws = sh.worksheet("追跡")
+            is_new_sheet = False
+        except gspread.exceptions.WorksheetNotFound:
+            ws = sh.add_worksheet(title="追跡", rows=2000, cols=len(TRACKING_HEADERS))
+            is_new_sheet = True
+
+        if is_new_sheet or ws.row_count == 0 or ws.cell(1, 1).value != "銘柄名":
+            _sheets_call_with_retry(ws.append_row, TRACKING_HEADERS)
+            try:
+                ws.freeze(rows=1)
+                ws.set_basic_filter()
+                ws.columns_auto_resize(0, len(TRACKING_HEADERS) - 1)
+            except Exception as e:
+                print(f"⚠️ 追跡シート書式設定に失敗(処理は継続): {e}")
+
+        existing_records = _sheets_call_with_retry(ws.get_all_records)
+        existing_keys = {(r["ティッカー"], r["種別"], r["点灯日"]) for r in existing_records}
+
+        new_count = _tracking_register_new_signals(ws, combined_df, ticker_name_map, existing_keys)
+
+        records = _sheets_call_with_retry(ws.get_all_records) if new_count else existing_records
+        resolved_count, hit_count = _tracking_resolve_pending_signals(ws, combined_df, records)
+
+        print(f"✅ シグナル的中率トラッキング: 新規登録{new_count}件 / 判定確定{resolved_count}件 / 的中{hit_count}件")
+        return new_count, resolved_count, hit_count
+    except Exception as e:
+        print(f"❌ シグナル的中率トラッキング失敗: {e}")
+        return None
+
+# ============================================================
 # J-Quants APIで全上場銘柄コードを取得
 # ============================================================
 MARKET_SEGMENT_MAP = {}
@@ -670,6 +819,10 @@ king_stocks_all = [(f"・{TICKER_NAME_MAP.get(t, t)} {get_trend(df)}", t) for t,
 poly_stocks_all = [(f"・{TICKER_NAME_MAP.get(t, t)} {get_trend(df)}", t) for t, df in combined_df.groupby("Ticker") if df["Polygraph_Start"].tail(3).any()]
 bep_stocks_all  = [(f"・{TICKER_NAME_MAP.get(t, t)} {get_trend(df)}", t) for t, df in combined_df.groupby("Ticker") if df["Ace_with_BEP_Start"].tail(3).any()]
 
+# --- シグナル的中率トラッキング(「追跡」シートへの新規登録+判定確定) ---
+print("\n📊 シグナル的中率トラッキング処理中...")
+tracking_result = run_signal_tracking(combined_df, TICKER_NAME_MAP)
+
 # ============================================================
 # ファンダメンタルズ解説(EDINET財務データ + Gemini)
 # ============================================================
@@ -721,6 +874,12 @@ bep_pairs  = [(t, df) for t, df in combined_df.groupby("Ticker") if df["Ace_with
 bep_stocks = [_line_format(t, df) for t, df in bep_pairs[:10]]
 msg += f"\n\n🅰️🐢 Ace×BEP同時({len(bep_pairs)}銘柄、上位{len(bep_stocks)}件表示)\n"
 msg += "\n".join(bep_stocks) if bep_stocks else "  (該当なし)"
+
+if tracking_result:
+    _new_count, _resolved_count, _hit_count = tracking_result
+    if _resolved_count > 0:
+        _hit_rate = _hit_count / _resolved_count * 100
+        msg += f"\n\n📊 シグナル的中率({TRACKING_HOLD_DAYS}営業日後+{TRACKING_HIT_THRESHOLD_PCT:.1f}%以上): {_hit_count}/{_resolved_count}件 ({_hit_rate:.1f}%)"
 
 send_line(msg)
 
