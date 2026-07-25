@@ -115,13 +115,6 @@ def get_us_tickers():
         print(f"⚠️ S&P500リスト取得失敗({e}) → 主要30銘柄を使用")
         return list(US_FALLBACK_MAP.keys()), US_FALLBACK_MAP
 
-def chart_url(ticker):
-    """銘柄チャートへのリンク(TradingViewに統一)"""
-    if MARKET == "US":
-        return f"https://www.tradingview.com/symbols/{ticker}/"
-    code = ticker.replace(".T", "")
-    return f"https://www.tradingview.com/chart/?symbol=TSE%3A{code}"
-
 # ============================================================
 # LINE通知設定 (GAS経由)
 # ============================================================
@@ -716,97 +709,6 @@ msg += "\n".join(bep_stocks) if bep_stocks else "  (該当なし)"
 
 send_line(msg)
 
-# ============================================================
-# HTML結果ページ生成 (GitHub Pages用)
-# ============================================================
-print("\n📄 HTMLページ生成中...")
-
-def signal_table_html(stocks, title, emoji, commentaries=None):
-    commentaries = commentaries or {}
-    def _row(n, t):
-        comment = commentaries.get(t, "")
-        comment_html = f'<div class="commentary">{comment}</div>' if comment else ""
-        return f'<li><a href="{chart_url(t)}" target="_blank" rel="noopener">{n}</a>{comment_html}</li>'
-    rows = "".join(_row(n, t) for n, t in stocks) if stocks else "<li class='none'>該当なし</li>"
-    return f"""
-    <div class="card">
-      <h2>{emoji} {title} ({len(stocks)}銘柄)</h2>
-      <ul>{rows}</ul>
-    </div>
-    """
-
-ace_list  = [(f"{TICKER_NAME_MAP.get(t, t)} {get_trend(df)} [{get_market_label(t)}]", t) for t, df in combined_df.groupby("Ticker") if df["Ace_Start"].tail(3).any()]
-king_list = [(f"{TICKER_NAME_MAP.get(t, t)} {get_trend(df)} [{get_market_label(t)}]", t) for t, df in combined_df.groupby("Ticker") if df["King_Start"].tail(3).any()]
-poly_list = [(f"{TICKER_NAME_MAP.get(t, t)} {get_trend(df)} [{get_market_label(t)}]", t) for t, df in combined_df.groupby("Ticker") if df["Polygraph_Start"].tail(3).any()]
-bep_list  = [(f"{TICKER_NAME_MAP.get(t, t)} {get_trend(df)} [{get_market_label(t)}]", t) for t, df in combined_df.groupby("Ticker") if df["Ace_with_BEP_Start"].tail(3).any()]
-
-top10_html = ""
-if not rankings["Ace_Start"].empty:
-    top10 = rankings["Ace_Start"].sort_values("_sort", ascending=False).head(10)
-    rows = "".join(
-        f'<tr><td><a href="{chart_url(ticker)}" target="_blank" rel="noopener">{r["会社名"]}</a></td>'
-        f'<td>{r["シグナル回数"]}</td><td>{r["勝率"]}</td><td>{r["平均リターン"]}</td>'
-        f'<td>{get_trend(combined_df[combined_df["Ticker"] == ticker])}</td><td>{get_market_label(ticker)}</td></tr>'
-        for ticker, r in top10.iterrows()
-    )
-    top10_html = f"""
-    <div class="card">
-      <h2>🏆 優秀銘柄ランキング TOP10</h2>
-      <table>
-        <tr><th>会社名</th><th>シグナル回数</th><th>勝率</th><th>平均リターン</th><th>トレンド</th><th>市場</th></tr>
-        {rows}
-      </table>
-    </div>
-    """
-
-html = f"""<!DOCTYPE html>
-<html lang="ja">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>フジコシグナル {MARKET_LABEL} {today}</title>
-<style>
-  body {{ font-family: -apple-system, BlinkMacSystemFont, "Hiragino Sans", sans-serif;
-          background: #0f1117; color: #e8e8e8; margin: 0; padding: 16px; }}
-  h1 {{ font-size: 1.3em; margin-bottom: 4px; }}
-  .updated {{ color: #888; font-size: 0.85em; margin-bottom: 20px; }}
-  .card {{ background: #1a1d27; border-radius: 12px; padding: 16px; margin-bottom: 16px;
-           box-shadow: 0 2px 8px rgba(0,0,0,0.3); }}
-  .card h2 {{ font-size: 1.05em; margin-top: 0; margin-bottom: 10px; }}
-  ul {{ list-style: none; padding: 0; margin: 0; }}
-  li {{ padding: 6px 0; border-bottom: 1px solid #2a2d3a; }}
-  li:last-child {{ border-bottom: none; }}
-  li.none {{ color: #666; }}
-  li a {{ color: #e8e8e8; text-decoration: none; display: block; }}
-  li a:hover {{ color: #4da6ff; text-decoration: underline; }}
-  li .commentary {{ color: #9aa0ac; font-size: 0.82em; margin-top: 2px; line-height: 1.4; }}
-  table {{ width: 100%; border-collapse: collapse; font-size: 0.9em; }}
-  th, td {{ text-align: left; padding: 6px 4px; border-bottom: 1px solid #2a2d3a; }}
-  th {{ color: #888; font-weight: normal; }}
-  td a {{ color: #e8e8e8; text-decoration: none; }}
-  td a:hover {{ color: #4da6ff; text-decoration: underline; }}
-</style>
-</head>
-<body>
-  <h1>📊 フジコシグナル({MARKET_LABEL})</h1>
-  <div class="updated">最終更新: {today}</div>
-
-  {signal_table_html(ace_list, "Ace点灯中", "🅰️", fundamental_commentaries)}
-  {signal_table_html(king_list, "King点灯中", "👑", fundamental_commentaries)}
-  {signal_table_html(poly_list, "ポリグラフ点灯中", "🎯", fundamental_commentaries)}
-  {signal_table_html(bep_list, "Ace×BEP同時", "🅰️🐢", fundamental_commentaries)}
-  {top10_html}
-
-</body>
-</html>"""
-
-output_filename = "index_us.html" if MARKET == "US" else "index.html"
-with open(output_filename, "w", encoding="utf-8") as f:
-    f.write(html)
-
-print(f"✅ {output_filename} 生成完了")
-
-# ============================================================
 # スプレッドシートに履歴を書き込む
 # ============================================================
 write_to_spreadsheet(today, ace_stocks_all, king_stocks_all, poly_stocks_all, bep_stocks_all, fundamental_commentaries)

@@ -1,4 +1,4 @@
-name: Fujiko Daily Signal
+﻿name: Fujiko Daily Signal
 
 on:
   schedule:
@@ -7,8 +7,6 @@ on:
 
 permissions:
   contents: write
-  pages: write
-  id-token: write
 
 jobs:
   run-fujiko:
@@ -49,20 +47,4 @@ jobs:
           GAS_TOKEN: ${{ secrets.GAS_TOKEN }}
         run: |
           python fujiko.py
-
-      - name: Upload Pages artifact
-        uses: actions/upload-pages-artifact@v3
-        with:
-          path: .
-
-  deploy-pages:
-    needs: run-fujiko
-    runs-on: ubuntu-latest
-    environment:
-      name: github-pages
-      url: ${{ steps.deployment.outputs.page_url }}
-    steps:
-      - name: Deploy to GitHub Pages
-        id: deployment
-        uses: actions/deploy-pages@v4
         
