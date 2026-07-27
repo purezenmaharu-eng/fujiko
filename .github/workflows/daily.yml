@@ -22,9 +22,28 @@ jobs:
 
       - name: Install dependencies
         run: |
-          pip install yfinance pandas numpy requests jquants-api-client gspread google-auth google-generativeai lxml
+          pip install yfinance pandas numpy requests jquants-api-client gspread google-auth google-generativeai lxml jpholiday
+
+      - name: Check JP business day
+        id: bizday
+        run: |
+          python - <<'EOF' >> "$GITHUB_OUTPUT"
+          import datetime
+          from zoneinfo import ZoneInfo
+          import jpholiday
+
+          today = datetime.datetime.now(ZoneInfo("Asia/Tokyo")).date()
+          is_weekend = today.weekday() >= 5
+          is_holiday = jpholiday.is_holiday(today)
+          skip = is_weekend or is_holiday
+          print(f"skip={'true' if skip else 'false'}")
+          if skip:
+              reason = "weekend" if is_weekend else jpholiday.is_holiday_name(today)
+              print(f"::notice::{today} is not a JP business day ({reason}) - skipping run")
+          EOF
 
       - name: Run Fujiko script (JP market)
+        if: steps.bizday.outputs.skip != 'true'
         env:
           MARKET: JP
           JQUANTS_API_KEY: ${{ secrets.JQUANTS_API_KEY }}
@@ -38,6 +57,7 @@ jobs:
           python fujiko.py
 
       - name: Run Fujiko script (US market)
+        if: steps.bizday.outputs.skip != 'true'
         env:
           MARKET: US
           GOOGLE_SHEETS_CREDENTIALS: ${{ secrets.GOOGLE_SHEETS_CREDENTIALS }}
