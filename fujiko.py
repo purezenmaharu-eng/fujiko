@@ -311,6 +311,13 @@ def _sheets_call_with_retry(func, *args, max_retries=4, **kwargs):
             else:
                 raise
 
+def chart_url(ticker):
+    """銘柄チャートへのリンク(TradingViewに統一)"""
+    if MARKET == "US":
+        return f"https://www.tradingview.com/symbols/{ticker}/"
+    code = ticker.replace(".T", "")
+    return f"https://www.tradingview.com/chart/?symbol=TSE%3A{code}"
+
 def write_to_spreadsheet(today, ace_stocks, king_stocks, poly_stocks, bep_stocks, commentaries=None):
     commentaries = commentaries or {}
     try:
@@ -336,26 +343,29 @@ def write_to_spreadsheet(today, ace_stocks, king_stocks, poly_stocks, bep_stocks
             is_new_sheet = True
 
         if is_new_sheet or ws.row_count == 0 or ws.cell(1, 1).value != "日付":
-            _sheets_call_with_retry(ws.append_row, ["日付", "種別", "銘柄名", "市場", "解説"])
+            _sheets_call_with_retry(ws.append_row, ["日付", "種別", "銘柄名", "市場", "解説", "チャート"])
             # 見出し行を固定し、フィルタと列幅を自動設定
             try:
                 ws.freeze(rows=1)
                 ws.set_basic_filter()
-                ws.columns_auto_resize(0, 4)
+                ws.columns_auto_resize(0, 5)
             except Exception as e:
                 print(f"⚠️ シート書式設定に失敗(処理は継続): {e}")
 
+        def _chart_link(ticker):
+            return f'=HYPERLINK("{chart_url(ticker)}", "チャートを見る")'
+
         rows_to_write = []
         for stock, ticker in ace_stocks:
-            rows_to_write.append([today, "Ace", stock.replace("・", ""), get_market_label(ticker), commentaries.get(ticker, "")])
+            rows_to_write.append([today, "Ace", stock.replace("・", ""), get_market_label(ticker), commentaries.get(ticker, ""), _chart_link(ticker)])
         for stock, ticker in king_stocks:
-            rows_to_write.append([today, "King", stock.replace("・", ""), get_market_label(ticker), commentaries.get(ticker, "")])
+            rows_to_write.append([today, "King", stock.replace("・", ""), get_market_label(ticker), commentaries.get(ticker, ""), _chart_link(ticker)])
         for stock, ticker in poly_stocks:
-            rows_to_write.append([today, "ポリグラフ", stock.replace("・", ""), get_market_label(ticker), commentaries.get(ticker, "")])
+            rows_to_write.append([today, "ポリグラフ", stock.replace("・", ""), get_market_label(ticker), commentaries.get(ticker, ""), _chart_link(ticker)])
         for stock, ticker in bep_stocks:
-            rows_to_write.append([today, "Ace×BEP", stock.replace("・", ""), get_market_label(ticker), commentaries.get(ticker, "")])
+            rows_to_write.append([today, "Ace×BEP", stock.replace("・", ""), get_market_label(ticker), commentaries.get(ticker, ""), _chart_link(ticker)])
         if rows_to_write:
-            _sheets_call_with_retry(ws.append_rows, rows_to_write, value_input_option="RAW")
+            _sheets_call_with_retry(ws.append_rows, rows_to_write, value_input_option="USER_ENTERED")
 
         try:
             ws_summary = sh.worksheet("サマリー")
