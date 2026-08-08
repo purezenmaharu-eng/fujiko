@@ -1,4 +1,4 @@
-﻿import os
+import os
 import json
 import time
 import io
@@ -222,34 +222,141 @@ def radikabunavi_call_tool(tool_name, arguments):
         return None
 
 def get_fundamental_data(ticker):
-    """EDINET財務データ(推移+会社予想)と決算短信ベースの業績予想を取得"""
+    """EDINET財務データ(推移+会社予想)と6軸スコア+理想株価を取得(旧earnings_forecastの代替)"""
     code = ticker.replace(".T", "")
     fin = radikabunavi_call_tool("get_edinet_financial_data", {
         "code": code,
-        "metrics": ["netSales", "operatingIncome", "netIncome", "salesGrowth", "operatingMargin"],
+        "metrics": ["netSales", "operatingIncome", "netIncome", "salesGrowth",
+                     "operatingMargin", "eps", "per", "bps"],
     })
-    forecast = radikabunavi_call_tool("get_earnings_forecast", {"code": code})
-    return fin, forecast
+    score = radikabunavi_call_tool("get_stock_score", {"code": code})
+    return fin, score
+
+# ============================================================
+# Evy式バリュエーション(自前ロジック)
+# ============================================================
+def evy_valuation(fin_data, score_data):
+    """EDINET財務データから Evy式適正株価を算出する。
+    戻り値: dict(fairPrice, basePER, anchorEPS, discountPct, label) or None"""
+    if not fin_data:
+        return None
+    try:
+        # --- 確約EPS(会社予想優先 → 直近実績フォールバック) ---
+        anchor_eps = None
+        eps_source = "actual"
+        # score_dataに予想EPSがあればそちらを優先
+        if score_data:
+            ip = score_data.get("idealPrice") or {}
+            forecast_eps = ip.get("forecastEps")
+            actual_eps = ip.get("epsAnchor")
+            if forecast_eps and forecast_eps > 0:
+                # Evy式ルール: 前期比2倍超の増額予想は幾何平均で緩和
+                if actual_eps and actual_eps > 0 and forecast_eps > actual_eps * 2:
+                    anchor_eps = (forecast_eps * actual_eps) ** 0.5
+                    eps_source = "blended"
+                else:
+                    anchor_eps = forecast_eps
+                    eps_source = "forecast"
+            elif actual_eps and actual_eps > 0:
+                anchor_eps = actual_eps
+        # score_dataが無い場合はfinデータのEPSを使う
+        if anchor_eps is None and fin_data:
+            annuals = fin_data.get("annuals") or fin_data.get("annual") or []
+            if isinstance(annuals, list) and annuals:
+                latest = annuals[-1]
+                eps_val = latest.get("eps")
+                if eps_val and float(eps_val) > 0:
+                    anchor_eps = float(eps_val)
+        if not anchor_eps or anchor_eps <= 0:
+            return None
+
+        # --- 基準PER(売上成長率で決定) ---
+        sales_growth = None
+        if fin_data:
+            annuals = fin_data.get("annuals") or fin_data.get("annual") or []
+            if isinstance(annuals, list) and len(annuals) >= 2:
+                latest = annuals[-1]
+                sg = latest.get("salesGrowth")
+                if sg is not None:
+                    sales_growth = float(sg)
+        if sales_growth is None and score_data:
+            axes = score_data.get("axes") or {}
+            # growthスコアから概算(50=0%成長相当、70=5%相当、90=15%相当)
+            g_score = axes.get("growth")
+            if g_score is not None:
+                sales_growth = max(0, (g_score - 50) * 0.375)  # 粗い近似
+        if sales_growth is None:
+            sales_growth = 0.0
+        # 成長率→基準PERのマッピング(Evy式を参考に段階設定)
+        if sales_growth >= 10:
+            base_per = 20
+        elif sales_growth >= 5:
+            base_per = 18
+        elif sales_growth >= 2:
+            base_per = 16
+        else:
+            base_per = 14
+
+        fair_price = round(base_per * anchor_eps, 1)
+        # 擬似現在株価(score_dataから取得、なければ算出不可)
+        pseudo_price = None
+        if score_data:
+            ip = score_data.get("idealPrice") or {}
+            pseudo_price = ip.get("pseudoPrice")
+        if not pseudo_price:
+            return None
+        discount_pct = round((fair_price - pseudo_price) / fair_price * 100, 1)
+        # ラベル(割安/適正/割高)
+        if discount_pct >= 20:
+            label = "割安"
+        elif discount_pct >= 0:
+            label = "適正"
+        else:
+            label = "割高"
+        return {
+            "fairPrice": fair_price,
+            "basePER": base_per,
+            "anchorEPS": round(anchor_eps, 2),
+            "epsSource": eps_source,
+            "pseudoPrice": round(pseudo_price, 1),
+            "discountPct": discount_pct,
+            "label": label,
+        }
+    except Exception as e:
+        print(f"⚠️ Evy式バリュエーション算出失敗: {e}")
+        return None
 
 _gemini_disabled = False  # 429が解消しない場合、以降のGemini呼び出しをスキップ
 
-def generate_gemini_commentary(name, ticker, fin_data, forecast_data):
-    """決算・業績データをもとに、Geminiで短い解説コメントを生成する"""
+def generate_gemini_commentary(name, ticker, fin_data, score_data):
+    """決算・業績データと6軸スコアをもとに、Geminiで短い解説コメントを生成する"""
     global _gemini_disabled
     if not GEMINI_API_KEY or _gemini_disabled:
         return ""
-    if not fin_data and not forecast_data:
+    if not fin_data and not score_data:
         return ""
     try:
+        # スコアデータから割安度判定・6軸を抽出(プロンプト用)
+        score_summary = ""
+        if score_data:
+            axes = score_data.get("axes") or {}
+            ip = score_data.get("idealPrice") or {}
+            score_summary = (
+                f"6軸スコア: 割安度{axes.get('valuation','-')}/稼ぐ力{axes.get('profitability','-')}"
+                f"/成長性{axes.get('growth','-')}/安全性{axes.get('safety','-')}"
+                f"/還元力{axes.get('shareholderReturn','-')}/事業独占力{axes.get('moat','-')}\n"
+                f"理想株価判定: {ip.get('verdict','-')} (α値: {ip.get('alphaPct','-')}%)\n"
+            )
         prompt = (
             f"以下は日本株「{name}」({ticker})の決算・業績データです。\n"
             "これをもとに、日本語で40〜60字程度の一言コメントを作成してください。\n"
             "条件:\n"
-            "- 売上高・利益の直近の伸び率と、通期予想との比較(増収増益/減収減益、サプライズの有無)を踏まえること\n"
+            "- 売上高・利益の直近の伸び率を踏まえること\n"
+            "- 割安度判定がある場合はそれにも触れること\n"
             "- 「買い」「売り」など断定的な投資判断は書かず、事実ベースの短評にすること\n"
             "- 絵文字や記号装飾は使わず、文章のみで出力すること\n\n"
             f"財務データ(JSON): {json.dumps(fin_data, ensure_ascii=False)[:2000]}\n"
-            f"業績予想(JSON): {json.dumps(forecast_data, ensure_ascii=False)[:1500]}\n"
+            f"{score_summary}"
         )
         url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}"
         resp = _post_with_429_retry(
@@ -269,31 +376,53 @@ def generate_gemini_commentary(name, ticker, fin_data, forecast_data):
         return ""
 
 def build_fundamental_commentaries(tickers, ticker_name_map):
-    """点灯銘柄それぞれについてEDINETデータを取得しGemini解説を生成する。ticker→コメント文字列の辞書を返す"""
+    """点灯銘柄それぞれについてEDINETデータ+スコアを取得し、Gemini解説とバリュエーション情報を生成する。
+    戻り値: (commentaries, valuations)
+      commentaries: ticker→コメント文字列
+      valuations: ticker→{radi: {verdict, alphaPct, ...}, evy: {fairPrice, discountPct, label, ...}}
+    """
     commentaries = {}
+    valuations = {}
     if not RADIKABUNAVI_API_KEY:
         print("⚠️ RADIKABUNAVI_API_KEY未設定 → ファンダメンタルズ解説をスキップ")
-        return commentaries
-    if not GEMINI_API_KEY:
-        print("⚠️ GEMINI_API_KEY未設定 → ファンダメンタルズ解説をスキップ")
-        return commentaries
-    print(f"📚 ファンダメンタルズ解説生成中({len(tickers)}銘柄)...")
+        return commentaries, valuations
+    print(f"📚 ファンダメンタルズ解説+バリュエーション取得中({len(tickers)}銘柄)...")
     for ticker in tickers:
         if _radikabunavi_disabled:
-            print("⏹️ ラジ株ナビが利用不可のため、残りの解説生成を打ち切ります(財務データなしではGemini解説も生成不可)")
-            break
-        if _gemini_disabled:
-            print("⏹️ Geminiが利用不可のため、残りの解説生成を打ち切ります")
+            print("⏹️ ラジ株ナビが利用不可のため、残りの処理を打ち切ります")
             break
         name = ticker_name_map.get(ticker, ticker)
-        fin, forecast = get_fundamental_data(ticker)
-        comment = generate_gemini_commentary(name, ticker, fin, forecast)
-        if comment:
-            commentaries[ticker] = comment
-  
+        fin, score = get_fundamental_data(ticker)
+
+        # --- バリュエーション情報を抽出 ---
+        val_info = {}
+        if score:
+            ip = score.get("idealPrice") or {}
+            val_info["radi"] = {
+                "verdict": ip.get("verdict"),
+                "alphaPct": ip.get("alphaPct"),
+                "mid": ip.get("mid"),
+                "pseudoPrice": ip.get("pseudoPrice"),
+            }
+            axes = score.get("axes") or {}
+            val_info["scores"] = axes
+        evy = evy_valuation(fin, score)
+        if evy:
+            val_info["evy"] = evy
+        if val_info:
+            valuations[ticker] = val_info
+
+        # --- Gemini解説 ---
+        if not _gemini_disabled and GEMINI_API_KEY:
+            comment = generate_gemini_commentary(name, ticker, fin, score)
+            if comment:
+                commentaries[ticker] = comment
+        elif _gemini_disabled:
+            pass  # Geminiが停止済みでもバリュエーションは取得済みなので続行
+
         time.sleep(4.5)
-    print(f"✅ 解説生成完了({len(commentaries)}/{len(tickers)}銘柄)")
-    return commentaries
+    print(f"✅ 解説生成完了({len(commentaries)}/{len(tickers)}銘柄)、バリュエーション取得({len(valuations)}銘柄)")
+    return commentaries, valuations
 # ============================================================
 # スプレッドシートへの履歴書き込み
 # ============================================================
@@ -318,8 +447,9 @@ def chart_url(ticker):
     code = ticker.replace(".T", "")
     return f"https://www.tradingview.com/chart/?symbol=TSE%3A{code}"
 
-def write_to_spreadsheet(today, ace_stocks, king_stocks, poly_stocks, bep_stocks, commentaries=None):
+def write_to_spreadsheet(today, ace_stocks, king_stocks, poly_stocks, bep_stocks, commentaries=None, valuations=None):
     commentaries = commentaries or {}
+    valuations = valuations or {}
     try:
         creds_json = os.environ.get("GOOGLE_SHEETS_CREDENTIALS", "")
         spreadsheet_id = os.environ.get("SPREADSHEET_ID", "")
@@ -339,31 +469,46 @@ def write_to_spreadsheet(today, ace_stocks, king_stocks, poly_stocks, bep_stocks
             ws = sh.worksheet(sheet_name)
             is_new_sheet = False
         except gspread.exceptions.WorksheetNotFound:
-            ws = sh.add_worksheet(title=sheet_name, rows=500, cols=5)
+            ws = sh.add_worksheet(title=sheet_name, rows=500, cols=10)
             is_new_sheet = True
 
+        SHEET_HEADERS = ["日付", "種別", "銘柄名", "市場", "ラジ株判定", "Evy式適正価格", "Evy式割安率%", "解説", "チャート"]
         if is_new_sheet or ws.row_count == 0 or ws.cell(1, 1).value != "日付":
-            _sheets_call_with_retry(ws.append_row, ["日付", "種別", "銘柄名", "市場", "解説", "チャート"])
+            _sheets_call_with_retry(ws.append_row, SHEET_HEADERS)
             # 見出し行を固定し、フィルタと列幅を自動設定
             try:
                 ws.freeze(rows=1)
                 ws.set_basic_filter()
-                ws.columns_auto_resize(0, 5)
+                ws.columns_auto_resize(0, len(SHEET_HEADERS) - 1)
             except Exception as e:
                 print(f"⚠️ シート書式設定に失敗(処理は継続): {e}")
 
         def _chart_link(ticker):
             return f'=HYPERLINK("{chart_url(ticker)}", "チャートを見る")'
 
+        def _valuation_cells(ticker):
+            """バリュエーション列の値を返す: [ラジ株判定, Evy式適正価格, Evy式割安率%]"""
+            v = valuations.get(ticker)
+            if not v:
+                return ["", "", ""]
+            radi = v.get("radi") or {}
+            evy = v.get("evy") or {}
+            radi_label = radi.get("verdict", "")
+            if radi.get("alphaPct") is not None:
+                radi_label += f" ({radi['alphaPct']:+.1f}%)"
+            evy_price = evy.get("fairPrice", "")
+            evy_discount = evy.get("discountPct", "")
+            return [radi_label, evy_price, evy_discount]
+
         rows_to_write = []
         for stock, ticker in ace_stocks:
-            rows_to_write.append([today, "Ace", stock.replace("・", ""), get_market_label(ticker), commentaries.get(ticker, ""), _chart_link(ticker)])
+            rows_to_write.append([today, "Ace", stock.replace("・", ""), get_market_label(ticker)] + _valuation_cells(ticker) + [commentaries.get(ticker, ""), _chart_link(ticker)])
         for stock, ticker in king_stocks:
-            rows_to_write.append([today, "King", stock.replace("・", ""), get_market_label(ticker), commentaries.get(ticker, ""), _chart_link(ticker)])
+            rows_to_write.append([today, "King", stock.replace("・", ""), get_market_label(ticker)] + _valuation_cells(ticker) + [commentaries.get(ticker, ""), _chart_link(ticker)])
         for stock, ticker in poly_stocks:
-            rows_to_write.append([today, "ポリグラフ", stock.replace("・", ""), get_market_label(ticker), commentaries.get(ticker, ""), _chart_link(ticker)])
+            rows_to_write.append([today, "ポリグラフ", stock.replace("・", ""), get_market_label(ticker)] + _valuation_cells(ticker) + [commentaries.get(ticker, ""), _chart_link(ticker)])
         for stock, ticker in bep_stocks:
-            rows_to_write.append([today, "Ace×BEP", stock.replace("・", ""), get_market_label(ticker), commentaries.get(ticker, ""), _chart_link(ticker)])
+            rows_to_write.append([today, "Ace×BEP", stock.replace("・", ""), get_market_label(ticker)] + _valuation_cells(ticker) + [commentaries.get(ticker, ""), _chart_link(ticker)])
         if rows_to_write:
             _sheets_call_with_retry(ws.append_rows, rows_to_write, value_input_option="USER_ENTERED")
 
@@ -383,6 +528,7 @@ def write_to_spreadsheet(today, ace_stocks, king_stocks, poly_stocks, bep_stocks
 # ============================================================
 TRACKING_HEADERS = [
     "銘柄名", "ティッカー", "種別", "市場", "点灯日", "点灯日終値",
+    "ラジ株判定", "Evy式割安率%",
     "ステータス", "判定日", "判定時終値", "騰落率%", "的中",
 ]
 TRACKING_SIGNAL_COLUMNS = {
@@ -394,8 +540,9 @@ TRACKING_SIGNAL_COLUMNS = {
 TRACKING_HOLD_DAYS = 10
 TRACKING_HIT_THRESHOLD_PCT = 2.0
 
-def _tracking_register_new_signals(ws, combined_df, ticker_name_map, existing_keys):
+def _tracking_register_new_signals(ws, combined_df, ticker_name_map, existing_keys, valuations=None):
     """当日点灯したシグナルを「追跡」シートに新規登録する"""
+    valuations = valuations or {}
     new_rows = []
     for ticker, df in combined_df.groupby("Ticker"):
         if df.empty:
@@ -411,6 +558,12 @@ def _tracking_register_new_signals(ws, combined_df, ticker_name_map, existing_ke
             key = (ticker, label, lit_date_str)
             if key in existing_keys:
                 continue
+            # バリュエーション情報を取得
+            v = valuations.get(ticker, {})
+            radi = v.get("radi") or {}
+            evy = v.get("evy") or {}
+            radi_label = radi.get("verdict", "")
+            evy_discount = evy.get("discountPct", "")
             new_rows.append([
                 ticker_name_map.get(ticker, ticker),
                 ticker,
@@ -418,6 +571,8 @@ def _tracking_register_new_signals(ws, combined_df, ticker_name_map, existing_ke
                 get_market_label(ticker),
                 lit_date_str,
                 round(float(close_price), 2),
+                radi_label,
+                evy_discount,
                 "追跡中", "", "", "", "",
             ])
             existing_keys.add(key)
@@ -474,13 +629,13 @@ def _tracking_resolve_pending_signals(ws, combined_df, records):
         values = ["完了", judge_date_str, round(float(judge_close), 2),
                   round(float(pct_change), 2), "的中" if is_hit else "不的中"]
         for col_offset, value in enumerate(values):
-            cells_to_update.append(gspread.Cell(row=row_num, col=7 + col_offset, value=value))
+            cells_to_update.append(gspread.Cell(row=row_num, col=9 + col_offset, value=value))
 
     if cells_to_update:
         _sheets_call_with_retry(ws.update_cells, cells_to_update, value_input_option="RAW")
     return resolved_count, hit_count
 
-def run_signal_tracking(combined_df, ticker_name_map):
+def run_signal_tracking(combined_df, ticker_name_map, valuations=None):
     """当日点灯シグナルの「追跡」シートへの新規登録と、10営業日経過分の的中判定確定を行う。
     戻り値: (新規登録件数, 判定確定件数, 的中件数)。スプレッドシート設定が無い場合はNone"""
     creds_json = os.environ.get("GOOGLE_SHEETS_CREDENTIALS", "")
@@ -516,7 +671,7 @@ def run_signal_tracking(combined_df, ticker_name_map):
         existing_records = _sheets_call_with_retry(ws.get_all_records)
         existing_keys = {(r["ティッカー"], r["種別"], r["点灯日"]) for r in existing_records}
 
-        new_count = _tracking_register_new_signals(ws, combined_df, ticker_name_map, existing_keys)
+        new_count = _tracking_register_new_signals(ws, combined_df, ticker_name_map, existing_keys, valuations)
 
         records = _sheets_call_with_retry(ws.get_all_records) if new_count else existing_records
         resolved_count, hit_count = _tracking_resolve_pending_signals(ws, combined_df, records)
@@ -829,12 +984,8 @@ king_stocks_all = [(f"・{TICKER_NAME_MAP.get(t, t)} {get_trend(df)}", t) for t,
 poly_stocks_all = [(f"・{TICKER_NAME_MAP.get(t, t)} {get_trend(df)}", t) for t, df in combined_df.groupby("Ticker") if df["Polygraph_Start"].tail(3).any()]
 bep_stocks_all  = [(f"・{TICKER_NAME_MAP.get(t, t)} {get_trend(df)}", t) for t, df in combined_df.groupby("Ticker") if df["Ace_with_BEP_Start"].tail(3).any()]
 
-# --- シグナル的中率トラッキング(「追跡」シートへの新規登録+判定確定) ---
-print("\n📊 シグナル的中率トラッキング処理中...")
-tracking_result = run_signal_tracking(combined_df, TICKER_NAME_MAP)
-
 # ============================================================
-# ファンダメンタルズ解説(EDINET財務データ + Gemini)
+# ファンダメンタルズ解説 + バリュエーション(EDINET財務 + ラジ株スコア + Evy式)
 # ============================================================
 # 優先度順(厳選度が高いシグナルを優先): ポリグラフ → Ace×BEP → Ace → King
 # ラジ株ナビ無料プランは1日150リクエスト、1銘柄につき2リクエスト消費するため上限75銘柄
@@ -854,11 +1005,30 @@ _all_signaled_tickers = _priority_ordered_tickers
 if len(_all_signaled_tickers) > MAX_FUNDAMENTAL_TICKERS:
     print(f"priority list exceeds free-tier limit, trimming to top {MAX_FUNDAMENTAL_TICKERS}")
     _all_signaled_tickers = _all_signaled_tickers[:MAX_FUNDAMENTAL_TICKERS]
-fundamental_commentaries = build_fundamental_commentaries(_all_signaled_tickers, TICKER_NAME_MAP)
+fundamental_commentaries, fundamental_valuations = build_fundamental_commentaries(_all_signaled_tickers, TICKER_NAME_MAP)
+
+# --- シグナル的中率トラッキング(バリュエーション情報付きで登録) ---
+print("\n📊 シグナル的中率トラッキング処理中...")
+tracking_result = run_signal_tracking(combined_df, TICKER_NAME_MAP, fundamental_valuations)
 
 # --- LINE通知用(文字数制限があるため上位20件のみ、ヘッダーには正しい総数を表示) ---
+def _valuation_tag(t):
+    """バリュエーション情報から短いタグを生成(LINE表示用)"""
+    v = fundamental_valuations.get(t)
+    if not v:
+        return ""
+    parts = []
+    radi = v.get("radi") or {}
+    if radi.get("verdict"):
+        parts.append(f"ラジ:{radi['verdict']}")
+    evy = v.get("evy") or {}
+    if evy.get("label"):
+        parts.append(f"Evy:{evy['label']}({evy['discountPct']:+.0f}%)")
+    return f" [{'/'.join(parts)}]" if parts else ""
+
 def _line_format(t, df):
     base = f"{get_trend(df)} {TICKER_NAME_MAP.get(t, t)} [{get_market_label(t)}]"
+    base += _valuation_tag(t)
     comment = fundamental_commentaries.get(t, "")
     if comment:
         short_comment = comment[:20] + ("…" if len(comment) > 20 else "")
@@ -895,4 +1065,4 @@ send_line(msg)
 
 # スプレッドシートに履歴を書き込む
 # ============================================================
-write_to_spreadsheet(today, ace_stocks_all, king_stocks_all, poly_stocks_all, bep_stocks_all, fundamental_commentaries)
+write_to_spreadsheet(today, ace_stocks_all, king_stocks_all, poly_stocks_all, bep_stocks_all, fundamental_commentaries, fundamental_valuations)
