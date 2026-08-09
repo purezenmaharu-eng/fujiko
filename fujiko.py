@@ -184,11 +184,58 @@ def _radikabunavi_ensure_session():
     except Exception:
         pass
 
+# テスト実行時にラジ株ナビ・Gemini呼び出しをスキップする環境変数フラグ
+# GitHub Actions: 設定しない(本番実行) / ローカルテスト: SKIP_FUNDAMENTALS=1 で設定
+SKIP_FUNDAMENTALS = os.environ.get("SKIP_FUNDAMENTALS", "").strip().lower() in ("1", "true", "yes")
+if SKIP_FUNDAMENTALS:
+    print("⚠️ SKIP_FUNDAMENTALS=true → ラジ株ナビ・Geminiの呼び出しをスキップします(テストモード)")
+
+# ラジ株ナビAPIキャッシュ(同日の再実行でクォータを消費しない)
+_CACHE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".cache")
+_CACHE_DATE = date.today().strftime("%Y-%m-%d")
+
+def _cache_key(tool_name, arguments):
+    """キャッシュ用のファイルパスを生成"""
+    import hashlib
+    arg_hash = hashlib.md5(json.dumps(arguments, sort_keys=True).encode()).hexdigest()[:12]
+    return os.path.join(_CACHE_DIR, f"{_CACHE_DATE}_{tool_name}_{arg_hash}.json")
+
+def _cache_read(tool_name, arguments):
+    """キャッシュがあれば読み込んで返す。なければNone"""
+    path = _cache_key(tool_name, arguments)
+    if os.path.exists(path):
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return None
+
+def _cache_write(tool_name, arguments, data):
+    """結果をキャッシュに保存"""
+    if data is None:
+        return
+    try:
+        os.makedirs(_CACHE_DIR, exist_ok=True)
+        path = _cache_key(tool_name, arguments)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False)
+    except Exception:
+        pass  # キャッシュ書き込み失敗は無視
+
 def radikabunavi_call_tool(tool_name, arguments):
-    """ラジ株ナビMCPのツールを呼び出し、結果(dict)を返す。失敗時はNone"""
+    """ラジ株ナビMCPのツールを呼び出し、結果(dict)を返す。失敗時はNone。
+    同日のキャッシュがあればAPIを呼ばずに再利用する。"""
     global _radikabunavi_disabled
+    if SKIP_FUNDAMENTALS:
+        return None
     if not RADIKABUNAVI_API_KEY or _radikabunavi_disabled:
         return None
+    # --- キャッシュ確認 ---
+    cached = _cache_read(tool_name, arguments)
+    if cached is not None:
+        return cached
+    # --- API呼び出し ---
     try:
         _radikabunavi_ensure_session()
         result = _radikabunavi_request("tools/call", {
@@ -202,7 +249,9 @@ def radikabunavi_call_tool(tool_name, arguments):
         for block in content:
             if block.get("type") == "text":
                 try:
-                    return json.loads(block["text"])
+                    parsed = json.loads(block["text"])
+                    _cache_write(tool_name, arguments, parsed)
+                    return parsed
                 except json.JSONDecodeError:
                     return {"raw_text": block["text"]}
         return None
@@ -331,7 +380,7 @@ _gemini_disabled = False  # 429が解消しない場合、以降のGemini呼び�
 def generate_gemini_commentary(name, ticker, fin_data, score_data):
     """決算・業績データと6軸スコアをもとに、Geminiで短い解説コメントを生成する"""
     global _gemini_disabled
-    if not GEMINI_API_KEY or _gemini_disabled:
+    if SKIP_FUNDAMENTALS or not GEMINI_API_KEY or _gemini_disabled:
         return ""
     if not fin_data and not score_data:
         return ""
