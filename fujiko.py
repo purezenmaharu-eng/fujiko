@@ -831,7 +831,7 @@ def chart_url(ticker):
     if MARKET == "US":
         return f"https://www.tradingview.com/symbols/{ticker}/"
     code = ticker.replace(".T", "")
-    return f"https://www.tradingview.com/chart/?symbol=TSE%3A{code}"
+    return f"https://www.tradingview.com/chart/oDVJP3xq/?symbol=TSE%3A{code}"
 
 def yahoo_finance_url(ticker):
     """銘柄ページへのリンク(Yahoo!ファイナンス)"""
