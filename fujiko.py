@@ -275,7 +275,7 @@ def get_fundamental_data(ticker):
     code = ticker.replace(".T", "")
     fin = radikabunavi_call_tool("get_edinet_financial_data", {
         "code": code,
-        "metrics": ["netSales", "operatingIncome", "netIncome", "salesGrowth",
+        "metrics": ["netSales", "operatingIncome", "netIncome",
                      "operatingMargin", "eps", "per", "bps"],
     })
     score = radikabunavi_call_tool("get_stock_score", {"code": code})
@@ -285,55 +285,56 @@ def get_fundamental_data(ticker):
 # Evy式バリュエーション(自前ロジック)
 # ============================================================
 def evy_valuation(fin_data, score_data):
-    """EDINET財務データから Evy式適正株価を算出する。
+    """EDINET財務データ(get_edinet_financial_data)から Evy式適正株価を算出する。
+    実データ構造の注意点:
+      - fin_data["fiscalYears"] は日付キー("2025-12-31"等)の辞書(リストではない)
+      - 会社予想EPSは fin_data["companyForecast"]["forecast"]["eps"](無い場合はnull)
+      - get_stock_scoreのidealPriceには forecastEps/epsAnchor は含まれない(get_ideal_price専用)ため参照しない
     戻り値: dict(fairPrice, basePER, anchorEPS, discountPct, label) or None"""
     if not fin_data:
         return None
     try:
-        # --- 確約EPS(会社予想優先 → 直近実績フォールバック) ---
+        fiscal_years = fin_data.get("fiscalYears") or {}
+        sorted_fy_keys = sorted(fiscal_years.keys())  # "YYYY-MM-DD"昇順→末尾が最新期
+
+        # --- 直近実績EPS(fiscalYearsの最新期) ---
+        latest_actual_eps = None
+        if sorted_fy_keys:
+            latest_actual_eps = fiscal_years[sorted_fy_keys[-1]].get("eps")
+
+        # --- 会社予想EPS(companyForecast.forecast.eps。無ければnull) ---
+        company_forecast = fin_data.get("companyForecast") or {}
+        forecast_block = company_forecast.get("forecast") or {}
+        forecast_eps = forecast_block.get("eps")
+
+        # --- 確約EPS決定(会社予想優先、2倍超の増額予想は幾何平均で緩和) ---
         anchor_eps = None
-        eps_source = "actual"
-        # score_dataに予想EPSがあればそちらを優先
-        if score_data:
-            ip = score_data.get("idealPrice") or {}
-            forecast_eps = ip.get("forecastEps")
-            actual_eps = ip.get("epsAnchor")
-            if forecast_eps and forecast_eps > 0:
-                # Evy式ルール: 前期比2倍超の増額予想は幾何平均で緩和
-                if actual_eps and actual_eps > 0 and forecast_eps > actual_eps * 2:
-                    anchor_eps = (forecast_eps * actual_eps) ** 0.5
-                    eps_source = "blended"
-                else:
-                    anchor_eps = forecast_eps
-                    eps_source = "forecast"
-            elif actual_eps and actual_eps > 0:
-                anchor_eps = actual_eps
-        # score_dataが無い場合はfinデータのEPSを使う
-        if anchor_eps is None and fin_data:
-            annuals = fin_data.get("annuals") or fin_data.get("annual") or []
-            if isinstance(annuals, list) and annuals:
-                latest = annuals[-1]
-                eps_val = latest.get("eps")
-                if eps_val and float(eps_val) > 0:
-                    anchor_eps = float(eps_val)
+        eps_source = None
+        if forecast_eps and forecast_eps > 0:
+            if latest_actual_eps and latest_actual_eps > 0 and forecast_eps > latest_actual_eps * 2:
+                anchor_eps = (forecast_eps * latest_actual_eps) ** 0.5
+                eps_source = "blended"
+            else:
+                anchor_eps = forecast_eps
+                eps_source = "forecast"
+        elif latest_actual_eps and latest_actual_eps > 0:
+            anchor_eps = latest_actual_eps
+            eps_source = "actual"
         if not anchor_eps or anchor_eps <= 0:
             return None
 
-        # --- 基準PER(売上成長率で決定) ---
+        # --- 基準PER(売上高3年CAGRで決定。fiscalYearsが4期未満ならスコアのgrowth軸から概算) ---
         sales_growth = None
-        if fin_data:
-            annuals = fin_data.get("annuals") or fin_data.get("annual") or []
-            if isinstance(annuals, list) and len(annuals) >= 2:
-                latest = annuals[-1]
-                sg = latest.get("salesGrowth")
-                if sg is not None:
-                    sales_growth = float(sg)
+        if len(sorted_fy_keys) >= 4:
+            latest_sales = fiscal_years[sorted_fy_keys[-1]].get("netSales")
+            past_sales = fiscal_years[sorted_fy_keys[-4]].get("netSales")  # 3期前
+            if latest_sales and past_sales and past_sales > 0:
+                sales_growth = ((latest_sales / past_sales) ** (1 / 3) - 1) * 100
         if sales_growth is None and score_data:
             axes = score_data.get("axes") or {}
-            # growthスコアから概算(50=0%成長相当、70=5%相当、90=15%相当)
             g_score = axes.get("growth")
             if g_score is not None:
-                sales_growth = max(0, (g_score - 50) * 0.375)  # 粗い近似
+                sales_growth = max(0, (g_score - 50) * 0.375)  # 粗い近似(50=0%、90=15%相当)
         if sales_growth is None:
             sales_growth = 0.0
         # 成長率→基準PERのマッピング(Evy式を参考に段階設定)
@@ -347,7 +348,8 @@ def evy_valuation(fin_data, score_data):
             base_per = 14
 
         fair_price = round(base_per * anchor_eps, 1)
-        # 擬似現在株価(score_dataから取得、なければ算出不可)
+
+        # --- 擬似現在株価(get_stock_scoreのidealPrice.pseudoPriceを使用) ---
         pseudo_price = None
         if score_data:
             ip = score_data.get("idealPrice") or {}
@@ -355,10 +357,9 @@ def evy_valuation(fin_data, score_data):
         if not pseudo_price:
             return None
         discount_pct = round((fair_price - pseudo_price) / fair_price * 100, 1)
-        # ラベル(割安/適正/割高)
         if discount_pct >= 20:
             label = "割安"
-        elif discount_pct >= 0:
+        elif discount_pct >= -10:
             label = "適正"
         else:
             label = "割高"
@@ -396,6 +397,21 @@ def generate_gemini_commentary(name, ticker, fin_data, score_data):
                 f"/還元力{axes.get('shareholderReturn','-')}/事業独占力{axes.get('moat','-')}\n"
                 f"理想株価判定: {ip.get('verdict','-')} (α値: {ip.get('alphaPct','-')}%)\n"
             )
+        # fin_dataは全期間・全項目を含み巨大なため、直近3期分の主要指標だけに絞って渡す
+        fin_summary = ""
+        if fin_data:
+            fiscal_years = fin_data.get("fiscalYears") or {}
+            sorted_keys = sorted(fiscal_years.keys())[-3:]
+            lines = []
+            for k in sorted_keys:
+                fy = fiscal_years[k]
+                lines.append(
+                    f"{k}: 売上高{fy.get('netSales')} 営業利益{fy.get('operatingIncome')} "
+                    f"純利益{fy.get('netIncome')} EPS{fy.get('eps')} 営業利益率{fy.get('operatingMargin')}%"
+                )
+            forecast = (fin_data.get("companyForecast") or {}).get("forecast") or {}
+            forecast_line = f"会社予想: 売上高{forecast.get('netSales')} 純利益{forecast.get('netIncome')} EPS{forecast.get('eps')}" if forecast.get("eps") else "会社予想: 未開示"
+            fin_summary = "直近3期の実績:\n" + "\n".join(lines) + f"\n{forecast_line}\n"
         prompt = (
             f"以下は日本株「{name}」({ticker})の決算・業績データです。\n"
             "これをもとに、日本語で40〜60字程度の一言コメントを作成してください。\n"
@@ -404,7 +420,7 @@ def generate_gemini_commentary(name, ticker, fin_data, score_data):
             "- 割安度判定がある場合はそれにも触れること\n"
             "- 「買い」「売り」など断定的な投資判断は書かず、事実ベースの短評にすること\n"
             "- 絵文字や記号装飾は使わず、文章のみで出力すること\n\n"
-            f"財務データ(JSON): {json.dumps(fin_data, ensure_ascii=False)[:2000]}\n"
+            f"{fin_summary}"
             f"{score_summary}"
         )
         url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}"
