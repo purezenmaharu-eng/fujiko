@@ -275,7 +275,7 @@ def get_fundamental_data(ticker):
     code = ticker.replace(".T", "")
     fin = radikabunavi_call_tool("get_edinet_financial_data", {
         "code": code,
-        "metrics": ["netSales", "operatingIncome", "netIncome",
+        "metrics": ["netSales", "operatingIncome", "netIncome", "salesGrowth",
                      "operatingMargin", "eps", "per", "bps"],
     })
     score = radikabunavi_call_tool("get_stock_score", {"code": code})
@@ -285,56 +285,55 @@ def get_fundamental_data(ticker):
 # Evy式バリュエーション(自前ロジック)
 # ============================================================
 def evy_valuation(fin_data, score_data):
-    """EDINET財務データ(get_edinet_financial_data)から Evy式適正株価を算出する。
-    実データ構造の注意点:
-      - fin_data["fiscalYears"] は日付キー("2025-12-31"等)の辞書(リストではない)
-      - 会社予想EPSは fin_data["companyForecast"]["forecast"]["eps"](無い場合はnull)
-      - get_stock_scoreのidealPriceには forecastEps/epsAnchor は含まれない(get_ideal_price専用)ため参照しない
+    """EDINET財務データから Evy式適正株価を算出する。
     戻り値: dict(fairPrice, basePER, anchorEPS, discountPct, label) or None"""
     if not fin_data:
         return None
     try:
-        fiscal_years = fin_data.get("fiscalYears") or {}
-        sorted_fy_keys = sorted(fiscal_years.keys())  # "YYYY-MM-DD"昇順→末尾が最新期
-
-        # --- 直近実績EPS(fiscalYearsの最新期) ---
-        latest_actual_eps = None
-        if sorted_fy_keys:
-            latest_actual_eps = fiscal_years[sorted_fy_keys[-1]].get("eps")
-
-        # --- 会社予想EPS(companyForecast.forecast.eps。無ければnull) ---
-        company_forecast = fin_data.get("companyForecast") or {}
-        forecast_block = company_forecast.get("forecast") or {}
-        forecast_eps = forecast_block.get("eps")
-
-        # --- 確約EPS決定(会社予想優先、2倍超の増額予想は幾何平均で緩和) ---
+        # --- 確約EPS(会社予想優先 → 直近実績フォールバック) ---
         anchor_eps = None
-        eps_source = None
-        if forecast_eps and forecast_eps > 0:
-            if latest_actual_eps and latest_actual_eps > 0 and forecast_eps > latest_actual_eps * 2:
-                anchor_eps = (forecast_eps * latest_actual_eps) ** 0.5
-                eps_source = "blended"
-            else:
-                anchor_eps = forecast_eps
-                eps_source = "forecast"
-        elif latest_actual_eps and latest_actual_eps > 0:
-            anchor_eps = latest_actual_eps
-            eps_source = "actual"
+        eps_source = "actual"
+        # score_dataに予想EPSがあればそちらを優先
+        if score_data:
+            ip = score_data.get("idealPrice") or {}
+            forecast_eps = ip.get("forecastEps")
+            actual_eps = ip.get("epsAnchor")
+            if forecast_eps and forecast_eps > 0:
+                # Evy式ルール: 前期比2倍超の増額予想は幾何平均で緩和
+                if actual_eps and actual_eps > 0 and forecast_eps > actual_eps * 2:
+                    anchor_eps = (forecast_eps * actual_eps) ** 0.5
+                    eps_source = "blended"
+                else:
+                    anchor_eps = forecast_eps
+                    eps_source = "forecast"
+            elif actual_eps and actual_eps > 0:
+                anchor_eps = actual_eps
+        # score_dataが無い場合はfinデータのEPSを使う
+        if anchor_eps is None and fin_data:
+            annuals = fin_data.get("annuals") or fin_data.get("annual") or []
+            if isinstance(annuals, list) and annuals:
+                latest = annuals[-1]
+                eps_val = latest.get("eps")
+                if eps_val and float(eps_val) > 0:
+                    anchor_eps = float(eps_val)
         if not anchor_eps or anchor_eps <= 0:
             return None
 
-        # --- 基準PER(売上高3年CAGRで決定。fiscalYearsが4期未満ならスコアのgrowth軸から概算) ---
+        # --- 基準PER(売上成長率で決定) ---
         sales_growth = None
-        if len(sorted_fy_keys) >= 4:
-            latest_sales = fiscal_years[sorted_fy_keys[-1]].get("netSales")
-            past_sales = fiscal_years[sorted_fy_keys[-4]].get("netSales")  # 3期前
-            if latest_sales and past_sales and past_sales > 0:
-                sales_growth = ((latest_sales / past_sales) ** (1 / 3) - 1) * 100
+        if fin_data:
+            annuals = fin_data.get("annuals") or fin_data.get("annual") or []
+            if isinstance(annuals, list) and len(annuals) >= 2:
+                latest = annuals[-1]
+                sg = latest.get("salesGrowth")
+                if sg is not None:
+                    sales_growth = float(sg)
         if sales_growth is None and score_data:
             axes = score_data.get("axes") or {}
+            # growthスコアから概算(50=0%成長相当、70=5%相当、90=15%相当)
             g_score = axes.get("growth")
             if g_score is not None:
-                sales_growth = max(0, (g_score - 50) * 0.375)  # 粗い近似(50=0%、90=15%相当)
+                sales_growth = max(0, (g_score - 50) * 0.375)  # 粗い近似
         if sales_growth is None:
             sales_growth = 0.0
         # 成長率→基準PERのマッピング(Evy式を参考に段階設定)
@@ -348,8 +347,7 @@ def evy_valuation(fin_data, score_data):
             base_per = 14
 
         fair_price = round(base_per * anchor_eps, 1)
-
-        # --- 擬似現在株価(get_stock_scoreのidealPrice.pseudoPriceを使用) ---
+        # 擬似現在株価(score_dataから取得、なければ算出不可)
         pseudo_price = None
         if score_data:
             ip = score_data.get("idealPrice") or {}
@@ -357,9 +355,10 @@ def evy_valuation(fin_data, score_data):
         if not pseudo_price:
             return None
         discount_pct = round((fair_price - pseudo_price) / fair_price * 100, 1)
+        # ラベル(割安/適正/割高)
         if discount_pct >= 20:
             label = "割安"
-        elif discount_pct >= -10:
+        elif discount_pct >= 0:
             label = "適正"
         else:
             label = "割高"
@@ -397,21 +396,6 @@ def generate_gemini_commentary(name, ticker, fin_data, score_data):
                 f"/還元力{axes.get('shareholderReturn','-')}/事業独占力{axes.get('moat','-')}\n"
                 f"理想株価判定: {ip.get('verdict','-')} (α値: {ip.get('alphaPct','-')}%)\n"
             )
-        # fin_dataは全期間・全項目を含み巨大なため、直近3期分の主要指標だけに絞って渡す
-        fin_summary = ""
-        if fin_data:
-            fiscal_years = fin_data.get("fiscalYears") or {}
-            sorted_keys = sorted(fiscal_years.keys())[-3:]
-            lines = []
-            for k in sorted_keys:
-                fy = fiscal_years[k]
-                lines.append(
-                    f"{k}: 売上高{fy.get('netSales')} 営業利益{fy.get('operatingIncome')} "
-                    f"純利益{fy.get('netIncome')} EPS{fy.get('eps')} 営業利益率{fy.get('operatingMargin')}%"
-                )
-            forecast = (fin_data.get("companyForecast") or {}).get("forecast") or {}
-            forecast_line = f"会社予想: 売上高{forecast.get('netSales')} 純利益{forecast.get('netIncome')} EPS{forecast.get('eps')}" if forecast.get("eps") else "会社予想: 未開示"
-            fin_summary = "直近3期の実績:\n" + "\n".join(lines) + f"\n{forecast_line}\n"
         prompt = (
             f"以下は日本株「{name}」({ticker})の決算・業績データです。\n"
             "これをもとに、日本語で40〜60字程度の一言コメントを作成してください。\n"
@@ -420,7 +404,7 @@ def generate_gemini_commentary(name, ticker, fin_data, score_data):
             "- 割安度判定がある場合はそれにも触れること\n"
             "- 「買い」「売り」など断定的な投資判断は書かず、事実ベースの短評にすること\n"
             "- 絵文字や記号装飾は使わず、文章のみで出力すること\n\n"
-            f"{fin_summary}"
+            f"財務データ(JSON): {json.dumps(fin_data, ensure_ascii=False)[:2000]}\n"
             f"{score_summary}"
         )
         url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}"
@@ -540,40 +524,143 @@ def write_to_spreadsheet(today, ace_stocks, king_stocks, poly_stocks, bep_stocks
         SHEET_HEADERS = ["日付", "種別", "銘柄名", "市場", "ラジ株判定", "Evy式適正価格", "Evy式割安率%", "解説", "チャート"]
         if is_new_sheet or ws.row_count == 0 or ws.cell(1, 1).value != "日付":
             _sheets_call_with_retry(ws.append_row, SHEET_HEADERS)
-            # 見出し行を固定し、フィルタと列幅を自動設定
+            # 見出し行を固定し、フィルタを設定
             try:
                 ws.freeze(rows=1)
                 ws.set_basic_filter()
-                ws.columns_auto_resize(0, len(SHEET_HEADERS) - 1)
             except Exception as e:
-                print(f"⚠️ シート書式設定に失敗(処理は継続): {e}")
+                print(f"⚠️ 見出し固定/フィルタ設定に失敗(処理は継続): {e}")
+            # 列幅・折り返し・色分け・縞模様を一括設定(視認性向上)
+            try:
+                sheet_id = ws.id
+                # 列インデックス(0始まり): 日付0 種別1 銘柄名2 市場3 ラジ株判定4 Evy適正価格5 Evy割安率6 解説7 チャート8
+                COL_DATE, COL_TYPE, COL_NAME, COL_MARKET, COL_RADI, COL_EVY_PRICE, COL_EVY_PCT, COL_COMMENT, COL_CHART = range(9)
+                requests = []
+
+                # --- 列幅の個別指定(自動リサイズだと解説列が広がりすぎるため固定) ---
+                col_widths = {
+                    COL_DATE: 95, COL_TYPE: 90, COL_NAME: 160, COL_MARKET: 90,
+                    COL_RADI: 130, COL_EVY_PRICE: 110, COL_EVY_PCT: 110,
+                    COL_COMMENT: 340, COL_CHART: 110,
+                }
+                for col_idx, width in col_widths.items():
+                    requests.append({
+                        "updateDimensionProperties": {
+                            "range": {"sheetId": sheet_id, "dimension": "COLUMNS", "startIndex": col_idx, "endIndex": col_idx + 1},
+                            "properties": {"pixelSize": width},
+                            "fields": "pixelSize",
+                        }
+                    })
+
+                # --- 解説列はテキスト折り返し+上揃え、行の高さも自動調整 ---
+                requests.append({
+                    "repeatCell": {
+                        "range": {"sheetId": sheet_id, "startColumnIndex": COL_COMMENT, "endColumnIndex": COL_COMMENT + 1},
+                        "cell": {"userEnteredFormat": {"wrapStrategy": "WRAP", "verticalAlignment": "TOP"}},
+                        "fields": "userEnteredFormat.wrapStrategy,userEnteredFormat.verticalAlignment",
+                    }
+                })
+
+                # --- 見出し行を太字+背景色で強調 ---
+                requests.append({
+                    "repeatCell": {
+                        "range": {"sheetId": sheet_id, "startRowIndex": 0, "endRowIndex": 1},
+                        "cell": {"userEnteredFormat": {
+                            "textFormat": {"bold": True},
+                            "backgroundColor": {"red": 0.85, "green": 0.89, "blue": 0.96},
+                        }},
+                        "fields": "userEnteredFormat.textFormat.bold,userEnteredFormat.backgroundColor",
+                    }
+                })
+
+                # --- 縞模様(1行おきの背景色)でデータ行を見やすく ---
+                requests.append({
+                    "addBanding": {
+                        "bandedRange": {
+                            "range": {"sheetId": sheet_id, "startRowIndex": 1, "startColumnIndex": 0, "endColumnIndex": len(SHEET_HEADERS)},
+                            "rowProperties": {
+                                "headerColor": {"red": 0.85, "green": 0.89, "blue": 0.96},
+                                "firstBandColor": {"red": 1, "green": 1, "blue": 1},
+                                "secondBandColor": {"red": 0.96, "green": 0.96, "blue": 0.96},
+                            },
+                        }
+                    }
+                })
+
+                # --- 条件付き書式: ラジ株判定列(テキストに応じて色分け) ---
+                radi_range = {"sheetId": sheet_id, "startRowIndex": 1, "startColumnIndex": COL_RADI, "endColumnIndex": COL_RADI + 1}
+                for keyword, color in [
+                    ("超割安", {"red": 0.71, "green": 0.88, "blue": 0.71}),
+                    ("割安", {"red": 0.85, "green": 0.94, "blue": 0.85}),
+                    ("超割高", {"red": 0.96, "green": 0.71, "blue": 0.71}),
+                    ("割高", {"red": 0.98, "green": 0.85, "blue": 0.85}),
+                ]:
+                    requests.append({
+                        "addConditionalFormatRule": {
+                            "rule": {
+                                "ranges": [radi_range],
+                                "booleanRule": {
+                                    "condition": {"type": "TEXT_CONTAINS", "values": [{"userEnteredValue": keyword}]},
+                                    "format": {"backgroundColor": color},
+                                },
+                            },
+                            "index": 0,
+                        }
+                    })
+
+                # --- 条件付き書式: Evy式割安率%列(数値の正負で色分け) ---
+                evy_pct_range = {"sheetId": sheet_id, "startRowIndex": 1, "startColumnIndex": COL_EVY_PCT, "endColumnIndex": COL_EVY_PCT + 1}
+                for condition_type, threshold, color in [
+                    ("NUMBER_GREATER_THAN_EQ", 20, {"red": 0.85, "green": 0.94, "blue": 0.85}),
+                    ("NUMBER_LESS_THAN", -10, {"red": 0.98, "green": 0.85, "blue": 0.85}),
+                ]:
+                    requests.append({
+                        "addConditionalFormatRule": {
+                            "rule": {
+                                "ranges": [evy_pct_range],
+                                "booleanRule": {
+                                    "condition": {"type": condition_type, "values": [{"userEnteredValue": str(threshold)}]},
+                                    "format": {"backgroundColor": color},
+                                },
+                            },
+                            "index": 0,
+                        }
+                    })
+
+                _sheets_call_with_retry(sh.batch_update, {"requests": requests})
+            except Exception as e:
+                print(f"⚠️ シート装飾設定に失敗(処理は継続): {e}")
 
         def _chart_link(ticker):
             return f'=HYPERLINK("{chart_url(ticker)}", "チャートを見る")'
 
         def _valuation_cells(ticker):
-            """バリュエーション列の値を返す: [ラジ株判定, Evy式適正価格, Evy式割安率%]"""
+            """バリュエーション列の値を返す: [ラジ株判定, Evy式適正価格, Evy式割安率%]
+            データが無い項目は空文字ではなく「－」で埋め、シート上の見た目を統一する"""
             v = valuations.get(ticker)
             if not v:
-                return ["", "", ""]
+                return ["－", "－", "－"]
             radi = v.get("radi") or {}
             evy = v.get("evy") or {}
-            radi_label = radi.get("verdict", "")
-            if radi.get("alphaPct") is not None:
+            radi_label = radi.get("verdict") or "－"
+            if radi.get("verdict") and radi.get("alphaPct") is not None:
                 radi_label += f" ({radi['alphaPct']:+.1f}%)"
-            evy_price = evy.get("fairPrice", "")
-            evy_discount = evy.get("discountPct", "")
+            evy_price = evy.get("fairPrice", "－")
+            evy_discount = evy.get("discountPct", "－")
             return [radi_label, evy_price, evy_discount]
+
+        def _comment_cell(ticker):
+            return commentaries.get(ticker) or "－"
 
         rows_to_write = []
         for stock, ticker in ace_stocks:
-            rows_to_write.append([today, "Ace", stock.replace("・", ""), get_market_label(ticker)] + _valuation_cells(ticker) + [commentaries.get(ticker, ""), _chart_link(ticker)])
+            rows_to_write.append([today, "Ace", stock.replace("・", ""), get_market_label(ticker)] + _valuation_cells(ticker) + [_comment_cell(ticker), _chart_link(ticker)])
         for stock, ticker in king_stocks:
-            rows_to_write.append([today, "King", stock.replace("・", ""), get_market_label(ticker)] + _valuation_cells(ticker) + [commentaries.get(ticker, ""), _chart_link(ticker)])
+            rows_to_write.append([today, "King", stock.replace("・", ""), get_market_label(ticker)] + _valuation_cells(ticker) + [_comment_cell(ticker), _chart_link(ticker)])
         for stock, ticker in poly_stocks:
-            rows_to_write.append([today, "ポリグラフ", stock.replace("・", ""), get_market_label(ticker)] + _valuation_cells(ticker) + [commentaries.get(ticker, ""), _chart_link(ticker)])
+            rows_to_write.append([today, "ポリグラフ", stock.replace("・", ""), get_market_label(ticker)] + _valuation_cells(ticker) + [_comment_cell(ticker), _chart_link(ticker)])
         for stock, ticker in bep_stocks:
-            rows_to_write.append([today, "Ace×BEP", stock.replace("・", ""), get_market_label(ticker)] + _valuation_cells(ticker) + [commentaries.get(ticker, ""), _chart_link(ticker)])
+            rows_to_write.append([today, "Ace×BEP", stock.replace("・", ""), get_market_label(ticker)] + _valuation_cells(ticker) + [_comment_cell(ticker), _chart_link(ticker)])
         if rows_to_write:
             _sheets_call_with_retry(ws.append_rows, rows_to_write, value_input_option="USER_ENTERED")
 
