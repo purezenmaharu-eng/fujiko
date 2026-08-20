@@ -436,12 +436,24 @@ def build_fundamental_commentaries(tickers, ticker_name_map):
         print("⚠️ RADIKABUNAVI_API_KEY未設定 → ファンダメンタルズ解説をスキップ")
         return commentaries, valuations
     print(f"📚 ファンダメンタルズ解説+バリュエーション取得中({len(tickers)}銘柄)...")
+    _evy_debug_count = 0
     for ticker in tickers:
         if _radikabunavi_disabled:
             print("⏹️ ラジ株ナビが利用不可のため、残りの処理を打ち切ります")
             break
         name = ticker_name_map.get(ticker, ticker)
         fin, score = get_fundamental_data(ticker)
+
+        # --- [DEBUG] Evy式が常に「－」になる原因調査用。原因判明後は削除する ---
+        if _evy_debug_count < 3:
+            _evy_debug_count += 1
+            print(f"🔍[EVY-DEBUG] {name}({ticker}) fin={'あり' if fin else 'なし'} score={'あり' if score else 'なし'}")
+            if score:
+                _ip_debug = score.get("idealPrice")
+                print(f"🔍[EVY-DEBUG]   idealPrice = {json.dumps(_ip_debug, ensure_ascii=False)}")
+            if fin:
+                _annuals_debug = fin.get("annuals") or fin.get("annual") or []
+                print(f"🔍[EVY-DEBUG]   fin.annuals件数={len(_annuals_debug) if isinstance(_annuals_debug, list) else 'リストでない'} 最新={json.dumps(_annuals_debug[-1], ensure_ascii=False) if isinstance(_annuals_debug, list) and _annuals_debug else 'なし'}")
 
         # --- バリュエーション情報を抽出 ---
         val_info = {}
