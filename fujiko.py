@@ -436,24 +436,12 @@ def build_fundamental_commentaries(tickers, ticker_name_map):
         print("⚠️ RADIKABUNAVI_API_KEY未設定 → ファンダメンタルズ解説をスキップ")
         return commentaries, valuations
     print(f"📚 ファンダメンタルズ解説+バリュエーション取得中({len(tickers)}銘柄)...")
-    _evy_debug_count = 0
     for ticker in tickers:
         if _radikabunavi_disabled:
             print("⏹️ ラジ株ナビが利用不可のため、残りの処理を打ち切ります")
             break
         name = ticker_name_map.get(ticker, ticker)
         fin, score = get_fundamental_data(ticker)
-
-        # --- [DEBUG] Evy式が常に「－」になる原因調査用。原因判明後は削除する ---
-        if _evy_debug_count < 3:
-            _evy_debug_count += 1
-            print(f"🔍[EVY-DEBUG] {name}({ticker}) fin={'あり' if fin else 'なし'} score={'あり' if score else 'なし'}")
-            if score:
-                _ip_debug = score.get("idealPrice")
-                print(f"🔍[EVY-DEBUG]   idealPrice = {json.dumps(_ip_debug, ensure_ascii=False)}")
-            if fin:
-                _annuals_debug = fin.get("annuals") or fin.get("annual") or []
-                print(f"🔍[EVY-DEBUG]   fin.annuals件数={len(_annuals_debug) if isinstance(_annuals_debug, list) else 'リストでない'} 最新={json.dumps(_annuals_debug[-1], ensure_ascii=False) if isinstance(_annuals_debug, list) and _annuals_debug else 'なし'}")
 
         # --- バリュエーション情報を抽出 ---
         val_info = {}
@@ -1152,24 +1140,31 @@ bep_stocks_all  = [(f"・{TICKER_NAME_MAP.get(t, t)} {get_trend(df)}", t) for t,
 # ファンダメンタルズ解説 + バリュエーション(EDINET財務 + ラジ株スコア + Evy式)
 # ============================================================
 # 優先度順(厳選度が高いシグナルを優先): ポリグラフ → Ace×BEP → Ace → King
-# ラジ株ナビ無料プランは1日150リクエスト、1銘柄につき2リクエスト消費するため上限75銘柄
+# ラジ株ナビ無料プランは1日150リクエスト、1銘柄につき2リクエスト消費するため上限75銘柄。
+# 同じGitHub Actions実行内で日本株→米国株の順に実行されるため、両方の市場でこの上限まで
+# 呼ぼうとすると合計で日次クォータ(150)を超えてしまい、米国株側(あるいは2回目の呼び出し)が
+# 即座に429で失敗していた。ラジ株ナビ/Evy式は日本株のみを対象とし、米国株ではスキップする。
 RADIKABUNAVI_DAILY_LIMIT = 150
 CALLS_PER_TICKER = 2
 MAX_FUNDAMENTAL_TICKERS = RADIKABUNAVI_DAILY_LIMIT // CALLS_PER_TICKER
 
-_priority_ordered_tickers = []
-_seen_tickers = set()
-for _stocks in (poly_stocks_all, bep_stocks_all, ace_stocks_all, king_stocks_all):
-    for _, _t in _stocks:
-        if _t not in _seen_tickers:
-            _seen_tickers.add(_t)
-            _priority_ordered_tickers.append(_t)
+if MARKET == "US":
+    print("⏭️ 米国株はラジ株ナビ/Evy式バリュエーションの対象外のためスキップします(日次クォータを日本株用に温存)")
+    fundamental_commentaries, fundamental_valuations = {}, {}
+else:
+    _priority_ordered_tickers = []
+    _seen_tickers = set()
+    for _stocks in (poly_stocks_all, bep_stocks_all, ace_stocks_all, king_stocks_all):
+        for _, _t in _stocks:
+            if _t not in _seen_tickers:
+                _seen_tickers.add(_t)
+                _priority_ordered_tickers.append(_t)
 
-_all_signaled_tickers = _priority_ordered_tickers
-if len(_all_signaled_tickers) > MAX_FUNDAMENTAL_TICKERS:
-    print(f"priority list exceeds free-tier limit, trimming to top {MAX_FUNDAMENTAL_TICKERS}")
-    _all_signaled_tickers = _all_signaled_tickers[:MAX_FUNDAMENTAL_TICKERS]
-fundamental_commentaries, fundamental_valuations = build_fundamental_commentaries(_all_signaled_tickers, TICKER_NAME_MAP)
+    _all_signaled_tickers = _priority_ordered_tickers
+    if len(_all_signaled_tickers) > MAX_FUNDAMENTAL_TICKERS:
+        print(f"priority list exceeds free-tier limit, trimming to top {MAX_FUNDAMENTAL_TICKERS}")
+        _all_signaled_tickers = _all_signaled_tickers[:MAX_FUNDAMENTAL_TICKERS]
+    fundamental_commentaries, fundamental_valuations = build_fundamental_commentaries(_all_signaled_tickers, TICKER_NAME_MAP)
 
 # --- シグナル的中率トラッキング(バリュエーション情報付きで登録) ---
 print("\n📊 シグナル的中率トラッキング処理中...")
