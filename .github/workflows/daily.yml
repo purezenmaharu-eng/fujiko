@@ -1,4 +1,4 @@
-﻿name: Fujiko Daily Signal
+name: Fujiko Daily Signal
 
 on:
   schedule:
@@ -23,6 +23,22 @@ jobs:
       - name: Install dependencies
         run: |
           pip install yfinance pandas numpy requests jquants-api-client gspread google-auth google-generativeai lxml jpholiday
+
+      - name: Get JST date for cache key
+        id: jstdate
+        run: |
+          echo "date=$(TZ=Asia/Tokyo date +%Y-%m-%d)" >> "$GITHUB_OUTPUT"
+
+      - name: Restore radikabunavi cache (同日の再実行・JP/US間でAPI呼び出しを再利用)
+        uses: actions/cache@v4
+        with:
+          path: .cache
+          # 日付単位でキャッシュを分ける(ラジ株ナビのクォータが日次リセットのため)。
+          # 同じ日の2回目以降の実行(手動再実行やUS市場の実行)ではキャッシュを再利用し、
+          # 同一銘柄への重複APIコールを避けてクォータを温存する。
+          key: radikabunavi-cache-${{ steps.jstdate.outputs.date }}-${{ github.run_id }}
+          restore-keys: |
+            radikabunavi-cache-${{ steps.jstdate.outputs.date }}-
 
       - name: Check JP business day
         id: bizday
@@ -67,4 +83,3 @@ jobs:
           GAS_TOKEN: ${{ secrets.GAS_TOKEN }}
         run: |
           python fujiko.py
-        
