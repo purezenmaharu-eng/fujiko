@@ -288,48 +288,79 @@ def get_fundamental_data(ticker):
 # ============================================================
 def evy_valuation(fin_data, score_data):
     """EDINET財務データから Evy式適正株価を算出する。
-    戻り値: dict(fairPrice, basePER, anchorEPS, discountPct, label) or None"""
+    戻り値: dict(fairPrice, basePER, anchorEPS, discountPct, label) or None
+
+    【2026/08修正】旧実装は fin_data.get("annuals") / .get("annual") を参照していたが、
+    get_edinet_financial_data の実際のレスポンスは fiscalYears という日付キー辞書であり、
+    annuals/annual キーは常に存在しない。このためEPS・売上成長率のfin_data由来フォールバックが
+    常に無効化され、score_data(get_stock_scoreのidealPrice)にforecastEps/epsAnchorが
+    含まれるケースだけでしか値が出ない状態になっていた(=ほぼ常に空欄)。
+    今回、fiscalYears辞書を正しく参照するよう修正し、以下の優先順位に変更した:
+      EPS: 会社予想(companyForecast.forecast.eps) → 直近実績(fiscalYears最新期のeps)
+      売上成長率: fiscalYears複数期のnetSalesから自前でCAGR算出(salesGrowthというキー自体が
+                  EDINETデータに存在しないため)
+    """
     if not fin_data:
         return None
     try:
+        fiscal_years = fin_data.get("fiscalYears") or {}
+        if not isinstance(fiscal_years, dict) or not fiscal_years:
+            return None
+        years_sorted = sorted(fiscal_years.keys())
+        latest_key = years_sorted[-1]
+        latest = fiscal_years.get(latest_key) or {}
+
         # --- 確約EPS(会社予想優先 → 直近実績フォールバック) ---
-        anchor_eps = None
-        eps_source = "actual"
-        # score_dataに予想EPSがあればそちらを優先
-        if score_data:
+        forecast_eps = None
+        company_forecast = fin_data.get("companyForecast") or {}
+        forecast_block = company_forecast.get("forecast") or {}
+        f_eps = forecast_block.get("eps")
+        if f_eps and float(f_eps) > 0:
+            forecast_eps = float(f_eps)
+        # score_data(get_ideal_price経由等でforecastEpsが入っているケース)もフォールバックとして許容
+        if forecast_eps is None and score_data:
             ip = score_data.get("idealPrice") or {}
-            forecast_eps = ip.get("forecastEps")
-            actual_eps = ip.get("epsAnchor")
-            if forecast_eps and forecast_eps > 0:
-                # Evy式ルール: 前期比2倍超の増額予想は幾何平均で緩和
-                if actual_eps and actual_eps > 0 and forecast_eps > actual_eps * 2:
-                    anchor_eps = (forecast_eps * actual_eps) ** 0.5
-                    eps_source = "blended"
-                else:
-                    anchor_eps = forecast_eps
-                    eps_source = "forecast"
-            elif actual_eps and actual_eps > 0:
-                anchor_eps = actual_eps
-        # score_dataが無い場合はfinデータのEPSを使う
-        if anchor_eps is None and fin_data:
-            annuals = fin_data.get("annuals") or fin_data.get("annual") or []
-            if isinstance(annuals, list) and annuals:
-                latest = annuals[-1]
-                eps_val = latest.get("eps")
-                if eps_val and float(eps_val) > 0:
-                    anchor_eps = float(eps_val)
+            se = ip.get("forecastEps")
+            if se and se > 0:
+                forecast_eps = float(se)
+
+        actual_eps = None
+        eps_val = latest.get("eps")
+        if eps_val and float(eps_val) > 0:
+            actual_eps = float(eps_val)
+        if actual_eps is None and score_data:
+            ip = score_data.get("idealPrice") or {}
+            ae = ip.get("epsAnchor")
+            if ae and ae > 0:
+                actual_eps = float(ae)
+
+        anchor_eps = None
+        eps_source = None
+        if forecast_eps and forecast_eps > 0:
+            # Evy式ルール: 前期比2倍超の増額予想は幾何平均で緩和
+            if actual_eps and actual_eps > 0 and forecast_eps > actual_eps * 2:
+                anchor_eps = (forecast_eps * actual_eps) ** 0.5
+                eps_source = "blended"
+            else:
+                anchor_eps = forecast_eps
+                eps_source = "forecast"
+        elif actual_eps and actual_eps > 0:
+            anchor_eps = actual_eps
+            eps_source = "actual"
         if not anchor_eps or anchor_eps <= 0:
             return None
 
-        # --- 基準PER(売上成長率で決定) ---
+        # --- 基準PER(売上高CAGRで決定。fiscalYears複数期のnetSalesから自前算出) ---
         sales_growth = None
-        if fin_data:
-            annuals = fin_data.get("annuals") or fin_data.get("annual") or []
-            if isinstance(annuals, list) and len(annuals) >= 2:
-                latest = annuals[-1]
-                sg = latest.get("salesGrowth")
-                if sg is not None:
-                    sales_growth = float(sg)
+        sales_years = [k for k in years_sorted if fiscal_years[k].get("netSales")]
+        if len(sales_years) >= 2:
+            # 直近最大4期分(=最大3年間のCAGR)を使用。2期しかなければ1年分のみで計算
+            span_keys = sales_years[-4:]
+            start_sales = fiscal_years[span_keys[0]].get("netSales")
+            end_sales = fiscal_years[span_keys[-1]].get("netSales")
+            n_years = len(span_keys) - 1
+            if start_sales and end_sales and float(start_sales) > 0 and n_years > 0:
+                sales_growth = ((float(end_sales) / float(start_sales)) ** (1 / n_years) - 1) * 100
         if sales_growth is None and score_data:
             axes = score_data.get("axes") or {}
             # growthスコアから概算(50=0%成長相当、70=5%相当、90=15%相当)
