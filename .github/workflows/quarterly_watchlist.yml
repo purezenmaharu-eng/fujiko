@@ -1,0 +1,43 @@
+name: Fujiko Quarterly Watchlist (株おじさん式 監視銘柄リスト構築)
+on:
+  schedule:
+    # 四半期に一度(1/4/7/10月の1日) UTC5:00 = JST14:00 に実行。
+    # 株おじさんの記事の「四半期指標:年4回見直し」「本格見直し:年1〜2回」を踏まえた頻度。
+    - cron: '0 5 1 1,4,7,10 *'
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  build-watchlist:
+    runs-on: ubuntu-latest
+    # 全銘柄の週足取得+Fスコア判定を伴うため、日次実行より時間がかかる想定
+    timeout-minutes: 240
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install dependencies
+        run: |
+          pip install yfinance pandas numpy requests jquants-api-client gspread google-auth
+      - name: Get JST date for cache key
+        id: jstdate
+        run: |
+          echo "date=$(TZ=Asia/Tokyo date +%Y-%m-%d)" >> "$GITHUB_OUTPUT"
+      - name: Restore radikabunavi cache (同日の再実行でAPI呼び出しを再利用)
+        uses: actions/cache@v4
+        with:
+          path: .cache
+          key: radikabunavi-cache-${{ steps.jstdate.outputs.date }}-${{ github.run_id }}
+          restore-keys: |
+            radikabunavi-cache-${{ steps.jstdate.outputs.date }}-
+      - name: "Build watchlist (株おじさん式: 流動性 → 長期トレンド → Fスコア)"
+        env:
+          JQUANTS_API_KEY: ${{ secrets.JQUANTS_API_KEY }}
+          RADIKABUNAVI_API_KEY: ${{ secrets.RADIKABUNAVI_API_KEY }}
+          GOOGLE_SHEETS_CREDENTIALS: ${{ secrets.GOOGLE_SHEETS_CREDENTIALS }}
+          SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
+        run: |
+          python build_watchlist.py
