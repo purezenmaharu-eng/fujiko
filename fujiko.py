@@ -276,7 +276,8 @@ def get_fundamental_data(ticker):
     fin = radikabunavi_call_tool("get_edinet_financial_data", {
         "code": code,
         "metrics": ["netSales", "operatingIncome", "netIncome", "salesGrowth",
-                     "operatingMargin", "eps", "per", "bps"],
+                     "operatingMargin", "eps", "per", "bps",
+                     "ebitda", "marketCap", "interestBearingDebt", "netCash"],
     })
     score = radikabunavi_call_tool("get_stock_score", {"code": code})
     return fin, score
@@ -375,6 +376,97 @@ def evy_valuation(fin_data, score_data):
         print(f"⚠️ Evy式バリュエーション算出失敗: {e}")
         return None
 
+# ============================================================
+# 株おじさん式 理論株価(TSP: Target Stock Price)
+# 出典: 株おじさんが配布しているTradingViewインジケーター「Target Stock Price」のPineロジックを移植
+#   TSP = BPS + (EPS × EV/EBITDA倍率)
+#   資産価値(BPS)に、事業の収益力(EPS)を市場のEV/EBITDA倍率で評価した事業価値を足し込む考え方。
+#   EV/EBITDA倍率は自前算出: (時価総額 + 有利子負債 - 現金及び現金同等物) ÷ EBITDA
+# ============================================================
+def kabuojisan_valuation(fin_data, score_data):
+    """EDINET財務データから株おじさん式理論株価(TSP)を算出する。
+    戻り値: dict(targetPrice, bps, eps, evEbitda, pseudoPrice, discountPct, label) or None"""
+    if not fin_data:
+        return None
+    try:
+        fiscal_years = fin_data.get("fiscalYears") or {}
+        if not isinstance(fiscal_years, dict) or not fiscal_years:
+            return None
+        latest_key = sorted(fiscal_years.keys())[-1]
+        latest = fiscal_years.get(latest_key) or {}
+
+        # --- BPS(直近期実績) ---
+        bps = latest.get("bps")
+        if not bps or float(bps) <= 0:
+            return None
+        bps = float(bps)
+
+        # --- EPS(Evy式と同じ優先順位: 会社予想 → 直近実績) ---
+        eps = None
+        if score_data:
+            ip = score_data.get("idealPrice") or {}
+            forecast_eps = ip.get("forecastEps")
+            actual_eps = ip.get("epsAnchor")
+            if forecast_eps and forecast_eps > 0:
+                eps = float(forecast_eps)
+            elif actual_eps and actual_eps > 0:
+                eps = float(actual_eps)
+        if eps is None:
+            eps_val = latest.get("eps")
+            if eps_val and float(eps_val) > 0:
+                eps = float(eps_val)
+        if not eps or eps <= 0:
+            return None
+
+        # --- EV/EBITDA倍率(自前算出) ---
+        ebitda = latest.get("ebitda")
+        market_cap = latest.get("marketCap")
+        ibd = latest.get("interestBearingDebt") or 0
+        net_cash = latest.get("netCash")
+        if not ebitda or float(ebitda) <= 0 or not market_cap:
+            return None
+        if net_cash is not None:
+            ev = float(market_cap) - float(net_cash)
+        else:
+            cash = latest.get("cashAndDeposits") or 0
+            ev = float(market_cap) + float(ibd) - float(cash)
+        ev_ebitda = ev / float(ebitda)
+        if ev_ebitda <= 0:
+            return None
+
+        target_price = round(bps + (eps * ev_ebitda), 1)
+        if target_price <= 0:
+            target_price = 0.0
+
+        # --- 擬似現在株価(Evy式と同じくscore_dataから取得) ---
+        pseudo_price = None
+        if score_data:
+            ip = score_data.get("idealPrice") or {}
+            pseudo_price = ip.get("pseudoPrice")
+        if not pseudo_price:
+            return None
+        discount_pct = round((target_price - pseudo_price) / target_price * 100, 1) if target_price > 0 else None
+        if discount_pct is None:
+            return None
+        if discount_pct >= 20:
+            label = "割安"
+        elif discount_pct >= 0:
+            label = "適正"
+        else:
+            label = "割高"
+        return {
+            "targetPrice": target_price,
+            "bps": round(bps, 1),
+            "eps": round(eps, 2),
+            "evEbitda": round(ev_ebitda, 2),
+            "pseudoPrice": round(pseudo_price, 1),
+            "discountPct": discount_pct,
+            "label": label,
+        }
+    except Exception as e:
+        print(f"⚠️ 株おじさん式バリュエーション算出失敗: {e}")
+        return None
+
 _gemini_disabled = False  # 429が解消しない場合、以降のGemini呼び出しをスキップ
 
 def generate_gemini_commentary(name, ticker, fin_data, score_data):
@@ -428,7 +520,8 @@ def build_fundamental_commentaries(tickers, ticker_name_map):
     """点灯銘柄それぞれについてEDINETデータ+スコアを取得し、Gemini解説とバリュエーション情報を生成する。
     戻り値: (commentaries, valuations)
       commentaries: ticker→コメント文字列
-      valuations: ticker→{radi: {verdict, alphaPct, ...}, evy: {fairPrice, discountPct, label, ...}}
+      valuations: ticker→{radi: {verdict, alphaPct, ...}, evy: {fairPrice, discountPct, label, ...},
+                          kabuojisan: {targetPrice, discountPct, label, ...}}
     """
     commentaries = {}
     valuations = {}
@@ -458,6 +551,9 @@ def build_fundamental_commentaries(tickers, ticker_name_map):
         evy = evy_valuation(fin, score)
         if evy:
             val_info["evy"] = evy
+        kabuojisan = kabuojisan_valuation(fin, score)
+        if kabuojisan:
+            val_info["kabuojisan"] = kabuojisan
         if val_info:
             valuations[ticker] = val_info
 
@@ -521,7 +617,8 @@ def write_to_spreadsheet(today, ace_stocks, king_stocks, poly_stocks, bep_stocks
             ws = sh.add_worksheet(title=sheet_name, rows=500, cols=10)
             is_new_sheet = True
 
-        SHEET_HEADERS = ["日付", "種別", "銘柄名", "市場", "ラジ株判定", "Evy式適正価格", "Evy式割安率%", "解説", "チャート"]
+        SHEET_HEADERS = ["日付", "種別", "銘柄名", "市場", "ラジ株判定", "Evy式適正価格", "Evy式割安率%",
+                         "株おじさん式理論株価", "株おじさん式割安率%", "解説", "チャート"]
         if is_new_sheet or ws.row_count == 0 or ws.cell(1, 1).value != "日付":
             _sheets_call_with_retry(ws.append_row, SHEET_HEADERS)
             # 見出し行を固定し、フィルタを設定
@@ -533,14 +630,17 @@ def write_to_spreadsheet(today, ace_stocks, king_stocks, poly_stocks, bep_stocks
             # 列幅・折り返し・色分け・縞模様を一括設定(視認性向上)
             try:
                 sheet_id = ws.id
-                # 列インデックス(0始まり): 日付0 種別1 銘柄名2 市場3 ラジ株判定4 Evy適正価格5 Evy割安率6 解説7 チャート8
-                COL_DATE, COL_TYPE, COL_NAME, COL_MARKET, COL_RADI, COL_EVY_PRICE, COL_EVY_PCT, COL_COMMENT, COL_CHART = range(9)
+                # 列インデックス(0始まり): 日付0 種別1 銘柄名2 市場3 ラジ株判定4 Evy適正価格5 Evy割安率6
+                #                          株おじさん理論株価7 株おじさん割安率8 解説9 チャート10
+                (COL_DATE, COL_TYPE, COL_NAME, COL_MARKET, COL_RADI, COL_EVY_PRICE, COL_EVY_PCT,
+                 COL_KABU_PRICE, COL_KABU_PCT, COL_COMMENT, COL_CHART) = range(11)
                 requests = []
 
                 # --- 列幅の個別指定(自動リサイズだと解説列が広がりすぎるため固定) ---
                 col_widths = {
                     COL_DATE: 95, COL_TYPE: 90, COL_NAME: 160, COL_MARKET: 90,
                     COL_RADI: 130, COL_EVY_PRICE: 110, COL_EVY_PCT: 110,
+                    COL_KABU_PRICE: 130, COL_KABU_PCT: 130,
                     COL_COMMENT: 340, COL_CHART: 110,
                 }
                 for col_idx, width in col_widths.items():
@@ -627,6 +727,25 @@ def write_to_spreadsheet(today, ace_stocks, king_stocks, poly_stocks, bep_stocks
                         }
                     })
 
+                # --- 条件付き書式: 株おじさん式割安率%列(数値の正負で色分け) ---
+                kabu_pct_range = {"sheetId": sheet_id, "startRowIndex": 1, "startColumnIndex": COL_KABU_PCT, "endColumnIndex": COL_KABU_PCT + 1}
+                for condition_type, threshold, color in [
+                    ("NUMBER_GREATER_THAN_EQ", 20, {"red": 0.85, "green": 0.94, "blue": 0.85}),
+                    ("NUMBER_LESS_THAN", -10, {"red": 0.98, "green": 0.85, "blue": 0.85}),
+                ]:
+                    requests.append({
+                        "addConditionalFormatRule": {
+                            "rule": {
+                                "ranges": [kabu_pct_range],
+                                "booleanRule": {
+                                    "condition": {"type": condition_type, "values": [{"userEnteredValue": str(threshold)}]},
+                                    "format": {"backgroundColor": color},
+                                },
+                            },
+                            "index": 0,
+                        }
+                    })
+
                 _sheets_call_with_retry(sh.batch_update, {"requests": requests})
             except Exception as e:
                 print(f"⚠️ シート装飾設定に失敗(処理は継続): {e}")
@@ -635,19 +754,22 @@ def write_to_spreadsheet(today, ace_stocks, king_stocks, poly_stocks, bep_stocks
             return f'=HYPERLINK("{chart_url(ticker)}", "チャートを見る")'
 
         def _valuation_cells(ticker):
-            """バリュエーション列の値を返す: [ラジ株判定, Evy式適正価格, Evy式割安率%]
+            """バリュエーション列の値を返す: [ラジ株判定, Evy式適正価格, Evy式割安率%, 株おじさん式理論株価, 株おじさん式割安率%]
             データが無い項目は空文字ではなく「－」で埋め、シート上の見た目を統一する"""
             v = valuations.get(ticker)
             if not v:
-                return ["－", "－", "－"]
+                return ["－", "－", "－", "－", "－"]
             radi = v.get("radi") or {}
             evy = v.get("evy") or {}
+            kabuojisan = v.get("kabuojisan") or {}
             radi_label = radi.get("verdict") or "－"
             if radi.get("verdict") and radi.get("alphaPct") is not None:
                 radi_label += f" ({radi['alphaPct']:+.1f}%)"
             evy_price = evy.get("fairPrice", "－")
             evy_discount = evy.get("discountPct", "－")
-            return [radi_label, evy_price, evy_discount]
+            kabu_price = kabuojisan.get("targetPrice", "－")
+            kabu_discount = kabuojisan.get("discountPct", "－")
+            return [radi_label, evy_price, evy_discount, kabu_price, kabu_discount]
 
         def _comment_cell(ticker):
             return commentaries.get(ticker) or "－"
@@ -1183,6 +1305,9 @@ def _valuation_tag(t):
     evy = v.get("evy") or {}
     if evy.get("label"):
         parts.append(f"Evy:{evy['label']}({evy['discountPct']:+.0f}%)")
+    kabuojisan = v.get("kabuojisan") or {}
+    if kabuojisan.get("label"):
+        parts.append(f"株:{kabuojisan['label']}({kabuojisan['discountPct']:+.0f}%)")
     return f" [{'/'.join(parts)}]" if parts else ""
 
 def _line_format(t, df):
