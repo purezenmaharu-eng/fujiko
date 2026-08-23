@@ -373,55 +373,142 @@ def calc_f_score(fin_data):
         return None
 
 
+
+
 # ============================================================
-# スプレッドシートへの書き込み(「監視銘柄」タブを丸ごと置き換え)
+# スプレッドシート構成
 # ============================================================
-WATCHLIST_HEADERS = [
+# 「監視銘柄_作業用」タブ: 流動性+長期トレンドを通過した候補全件を保持する作業台帳。
+#   Fスコア判定はクォータ制約(150件/日)により複数日に分けて進めるため、
+#   「済み」列で処理状況を管理し、四半期の初回実行で候補を書き込んだ後、
+#   翌日以降の実行では未処理分だけを追加でFスコア判定していく。
+# 「監視銘柄」タブ: 全候補のFスコア判定が完了した時点で、合格銘柄のみを書き出す最終成果物。
+#   日次のfujiko.pyはこのタブだけを読む。
+WORK_SHEET_NAME = "監視銘柄_作業用"
+FINAL_SHEET_NAME = "監視銘柄"
+
+WORK_HEADERS = [
+    "四半期", "銘柄コード", "銘柄名", "市場", "平均売買代金(百万円/日)",
+    "現在値", "40週MA", "3年前値", "済み", "Fスコア", "Fスコア達成率%", "判定",
+]
+FINAL_HEADERS = [
     "更新日", "銘柄コード", "銘柄名", "市場", "平均売買代金(百万円/日)",
     "現在値", "40週MA", "3年前値", "Fスコア", "Fスコア達成率%",
 ]
 
 
-def write_watchlist(rows):
+def current_quarter_label():
+    """現在日付から '2026-Q3' のような四半期ラベルを生成する"""
+    today = date.today()
+    q = (today.month - 1) // 3 + 1
+    return f"{today.year}-Q{q}"
+
+
+def _open_spreadsheet():
     creds_json = os.environ.get("GOOGLE_SHEETS_CREDENTIALS", "")
     spreadsheet_id = os.environ.get("SPREADSHEET_ID", "")
     if not creds_json or not spreadsheet_id:
-        print("⚠️ スプレッドシート設定未完了 → 書き込みスキップ")
-        return
+        print("⚠️ スプレッドシート設定未完了")
+        return None
     creds_dict = json.loads(creds_json)
     creds = Credentials.from_service_account_info(
         creds_dict, scopes=["https://www.googleapis.com/auth/spreadsheets"]
     )
     gc = gspread.authorize(creds)
-    sh = gc.open_by_key(spreadsheet_id)
+    return gc.open_by_key(spreadsheet_id)
+
+
+def read_work_sheet(sh):
+    """「監視銘柄_作業用」タブを読み込む。存在しない場合はNoneを返す。"""
     try:
-        ws = sh.worksheet("監視銘柄")
+        ws = sh.worksheet(WORK_SHEET_NAME)
+    except gspread.exceptions.WorksheetNotFound:
+        return None, None
+    records = ws.get_all_records()
+    return ws, records
+
+
+def write_work_sheet_fresh(sh, rows):
+    """流動性+長期トレンド通過候補で「監視銘柄_作業用」タブを丸ごと作り直す(四半期の初回実行時)"""
+    try:
+        ws = sh.worksheet(WORK_SHEET_NAME)
         ws.clear()
     except gspread.exceptions.WorksheetNotFound:
-        ws = sh.add_worksheet(title="監視銘柄", rows=1000, cols=len(WATCHLIST_HEADERS))
-    ws.append_row(WATCHLIST_HEADERS)
+        ws = sh.add_worksheet(title=WORK_SHEET_NAME, rows=max(len(rows) + 10, 100), cols=len(WORK_HEADERS))
+    ws.append_row(WORK_HEADERS)
     try:
         ws.freeze(rows=1)
     except Exception as e:
         print(f"⚠️ 見出し固定に失敗(処理は継続): {e}")
     if rows:
         ws.append_rows(rows, value_input_option="USER_ENTERED")
-    print(f"✅ 「監視銘柄」タブに{len(rows)}銘柄を書き込みました")
+    return ws
 
 
-# ============================================================
-# メイン処理
-# ============================================================
-def main():
+def update_work_sheet_rows(ws, records, updates):
+    """処理済みになった行を「監視銘柄_作業用」タブに書き戻す。
+    updates: {row_index(0始まり、recordsに対応) -> {済み, Fスコア, Fスコア達成率%, 判定}}"""
+    if not updates:
+        return
+    col_index = {name: i + 1 for i, name in enumerate(WORK_HEADERS)}
+    cell_updates = []
+    for row_idx, values in updates.items():
+        sheet_row = row_idx + 2  # ヘッダー行の次から
+        for col_name, value in values.items():
+            cell_updates.append({
+                "range": gspread.utils.rowcol_to_a1(sheet_row, col_index[col_name]),
+                "values": [[value]],
+            })
+    if cell_updates:
+        ws.batch_update(cell_updates, value_input_option="USER_ENTERED")
+
+
+def write_final_watchlist(sh, records):
+    """全候補の処理が完了した時点で、合格銘柄のみを「監視銘柄」タブに書き出す"""
     today_str = date.today().strftime("%Y/%m/%d")
-    print("🔍 監視銘柄リスト構築を開始します(株おじさん式・四半期実行)")
+    rows = []
+    for rec in records:
+        if str(rec.get("判定", "")).strip() != "合格":
+            continue
+        rows.append([
+            today_str,
+            rec.get("銘柄コード", ""),
+            rec.get("銘柄名", ""),
+            rec.get("市場", ""),
+            rec.get("平均売買代金(百万円/日)", ""),
+            rec.get("現在値", ""),
+            rec.get("40週MA", ""),
+            rec.get("3年前値", ""),
+            rec.get("Fスコア", ""),
+            rec.get("Fスコア達成率%", ""),
+        ])
+    try:
+        ws = sh.worksheet(FINAL_SHEET_NAME)
+        ws.clear()
+    except gspread.exceptions.WorksheetNotFound:
+        ws = sh.add_worksheet(title=FINAL_SHEET_NAME, rows=max(len(rows) + 10, 100), cols=len(FINAL_HEADERS))
+    ws.append_row(FINAL_HEADERS)
+    try:
+        ws.freeze(rows=1)
+    except Exception as e:
+        print(f"⚠️ 見出し固定に失敗(処理は継続): {e}")
+    if rows:
+        ws.append_rows(rows, value_input_option="USER_ENTERED")
+    print(f"✅ 「{FINAL_SHEET_NAME}」タブに{len(rows)}銘柄を書き込みました(全候補の判定完了)")
 
+
+# ============================================================
+# Phase 1: 流動性+長期トレンドのスクリーニング(四半期の初回実行時のみ)
+# ============================================================
+def screen_liquidity_and_trend():
+    """全銘柄に対して流動性+長期トレンドフィルタを適用し、通過候補のリストを返す。
+    戻り値: list of [四半期, 銘柄コード, 銘柄名, 市場, 平均売買代金, 現在値, 40週MA, 3年前値, 済み, Fスコア, 達成率%, 判定]"""
+    quarter = current_quarter_label()
     tickers, name_map, market_segment_map = get_all_tickers()
     if not tickers:
         print("❌ ティッカー一覧の取得に失敗したため処理を中止します")
-        return
+        return []
 
-    # プライム/スタンダード/グロースのみ対象(その他区分は除外)
     valid_segments = {"プライム", "スタンダード", "グロース"}
     tickers = [t for t in tickers if market_segment_map.get(t) in valid_segments]
     print(f"📋 対象ユニバース: {len(tickers)}銘柄(プライム/スタンダード/グロースのみ)")
@@ -429,7 +516,7 @@ def main():
     START = (date.today() - pd.Timedelta(days=365 * 4 + 60)).strftime("%Y-%m-%d")
     END = (date.today() + pd.Timedelta(days=1)).strftime("%Y-%m-%d")
 
-    liquidity_survivors = []  # (ticker, avg_value)
+    survivors = []
     failed = []
     print("🚀 流動性・長期トレンドのスクリーニング中(yfinance)...")
     for ticker in tickers:
@@ -446,57 +533,116 @@ def main():
             trend_ok, trend_detail = check_long_term_trend(df)
             if not trend_ok:
                 continue
-            liquidity_survivors.append((ticker, avg_value, trend_detail))
+            survivors.append((ticker, avg_value, trend_detail))
         except Exception as e:
             failed.append((ticker, str(e)))
 
     if failed:
         print(f"⚠️ 取得失敗/データなし {len(failed)}件(スキップ)")
-    print(f"✅ 流動性+長期トレンド通過: {len(liquidity_survivors)}銘柄")
+    print(f"✅ 流動性+長期トレンド通過: {len(survivors)}銘柄")
 
-    # Fスコア判定はクォータ制約があるため、流動性が高い順に上限まで処理
-    liquidity_survivors.sort(key=lambda x: x[1], reverse=True)
-    if len(liquidity_survivors) > MAX_FSCORE_TICKERS:
-        dropped = len(liquidity_survivors) - MAX_FSCORE_TICKERS
-        print(f"⚠️ ラジ株ナビ日次クォータ({RADIKABUNAVI_DAILY_LIMIT}件)の制約により、"
-              f"流動性下位{dropped}銘柄をFスコア判定の対象から除外します(次回実行時に再評価される可能性あり)")
-        candidates = liquidity_survivors[:MAX_FSCORE_TICKERS]
-    else:
-        candidates = liquidity_survivors
+    # 流動性が高い順に並べ、Fスコア判定を流動性上位から進められるようにする
+    survivors.sort(key=lambda x: x[1], reverse=True)
 
-    print(f"📚 Fスコア判定中({len(candidates)}銘柄)...")
-    final_rows = []
-    for ticker, avg_value, trend_detail in candidates:
-        if _radikabunavi_disabled:
-            print("⏹️ ラジ株ナビが利用不可のため、残りのFスコア判定を打ち切ります")
-            break
+    rows = []
+    for ticker, avg_value, trend_detail in survivors:
         code = ticker.replace(".T", "")
+        rows.append([
+            quarter, code, name_map.get(ticker, ticker), market_segment_map.get(ticker, "－"),
+            round(avg_value / 1_000_000, 1),
+            trend_detail.get("currentPrice", "－"), trend_detail.get("ma40", "－"),
+            trend_detail.get("pastPrice", "－"),
+            "FALSE", "", "", "",
+        ])
+    return rows
+
+
+# ============================================================
+# Phase 2: Fスコア判定(未処理分から日次クォータ上限まで処理)
+# ============================================================
+def score_pending_candidates(ws, records):
+    """「済み」がFALSEの行から、ラジ株ナビの日次クォータ上限まで処理し、結果を書き戻す。
+    戻り値: 今回処理できた件数"""
+    pending_indices = [i for i, rec in enumerate(records) if str(rec.get("済み", "")).strip().upper() != "TRUE"]
+    if not pending_indices:
+        print("✅ 全候補のFスコア判定が完了済みです")
+        return 0
+
+    print(f"📚 Fスコア判定中: 未処理{len(pending_indices)}件のうち最大{MAX_FSCORE_TICKERS}件を処理します")
+    updates = {}
+    processed = 0
+    for idx in pending_indices:
+        if processed >= MAX_FSCORE_TICKERS:
+            break
+        if _radikabunavi_disabled:
+            print("⏹️ ラジ株ナビが利用不可のため、残りのFスコア判定を打ち切ります(次回実行で継続)")
+            break
+        rec = records[idx]
+        code = str(rec.get("銘柄コード", "")).strip()
+        if not code:
+            continue
         fin = radikabunavi_call_tool("get_edinet_financial_data", {
             "code": code,
             "metrics": ["roa", "cashFlowFromOperations", "netIncome", "debtToEquityRatio",
                         "currentRatio", "sharesOutstanding", "grossProfitMargin", "assetTurnover"],
         })
         f_score = calc_f_score(fin)
+        processed += 1
         if not f_score:
+            # データ不足で判定不能な銘柄は「済み」にして再処理を避け、不合格扱いにする
+            updates[idx] = {"済み": "TRUE", "Fスコア": "－", "Fスコア達成率%": "－", "判定": "不合格(データ不足)"}
             continue
-        if f_score["ratio"] < F_SCORE_RATIO_THRESHOLD:
-            continue
-        final_rows.append([
-            today_str,
-            code,
-            name_map.get(ticker, ticker),
-            market_segment_map.get(ticker, "－"),
-            round(avg_value / 1_000_000, 1),
-            trend_detail.get("currentPrice", "－"),
-            trend_detail.get("ma40", "－"),
-            trend_detail.get("pastPrice", "－"),
-            f"{f_score['score']}/{f_score['maxScore']}",
-            round(f_score["ratio"] * 100, 1),
-        ])
+        verdict = "合格" if f_score["ratio"] >= F_SCORE_RATIO_THRESHOLD else "不合格"
+        updates[idx] = {
+            "済み": "TRUE",
+            "Fスコア": f"{f_score['score']}/{f_score['maxScore']}",
+            "Fスコア達成率%": round(f_score["ratio"] * 100, 1),
+            "判定": verdict,
+        }
         time.sleep(1.0)
 
-    print(f"✅ 最終監視銘柄数: {len(final_rows)}銘柄")
-    write_watchlist(final_rows)
+    update_work_sheet_rows(ws, records, updates)
+    print(f"✅ 今回のFスコア判定: {len(updates)}件処理")
+    return len(updates)
+
+
+# ============================================================
+# メイン処理
+# ============================================================
+def main():
+    print("🔍 監視銘柄リスト構築を開始します(株おじさん式・四半期実行・複数日分割処理対応)")
+    quarter = current_quarter_label()
+
+    sh = _open_spreadsheet()
+    if sh is None:
+        print("❌ スプレッドシートに接続できないため処理を中止します")
+        return
+
+    ws, records = read_work_sheet(sh)
+    existing_quarter = records[0].get("四半期") if records else None
+
+    if ws is None or not records or existing_quarter != quarter:
+        # 新しい四半期の初回実行、またはタブ未作成 → Phase 1からやり直す
+        print(f"🆕 新しい四半期({quarter})の監視銘柄リスト構築を開始します(流動性+長期トレンドを再スクリーニング)")
+        rows = screen_liquidity_and_trend()
+        if not rows:
+            print("⚠️ 流動性+長期トレンド通過銘柄が0件のため処理を中止します")
+            return
+        ws = write_work_sheet_fresh(sh, rows)
+        _, records = read_work_sheet(sh)
+    else:
+        print(f"📋 既存の作業用リスト({quarter})を継続処理します(候補{len(records)}件)")
+
+    score_pending_candidates(ws, records)
+
+    # 処理後、全件済みになったかを再チェックして最終タブを更新
+    _, records_after = read_work_sheet(sh)
+    if records_after and all(str(r.get("済み", "")).strip().upper() == "TRUE" for r in records_after):
+        write_final_watchlist(sh, records_after)
+    else:
+        remaining = sum(1 for r in (records_after or []) if str(r.get("済み", "")).strip().upper() != "TRUE")
+        print(f"⏳ 未処理が{remaining}件残っています。翌日以降の実行で継続します"
+              f"(「{FINAL_SHEET_NAME}」タブは全件処理完了まで更新されません)")
 
 
 if __name__ == "__main__":
