@@ -1,34 +1,27 @@
 name: Fujiko Daily Signal
-
 on:
   schedule:
     - cron: '0 7 * * 1-5'
   workflow_dispatch:
-
 permissions:
   contents: write
-
 jobs:
   run-fujiko:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
-
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-
       - name: Install dependencies
         run: |
           pip install yfinance pandas numpy requests jquants-api-client gspread google-auth google-generativeai lxml jpholiday
-
       - name: Get JST date for cache key
         id: jstdate
         run: |
           echo "date=$(TZ=Asia/Tokyo date +%Y-%m-%d)" >> "$GITHUB_OUTPUT"
-
       - name: Restore radikabunavi cache (同日の再実行・JP/US間でAPI呼び出しを再利用)
         uses: actions/cache@v4
         with:
@@ -39,25 +32,30 @@ jobs:
           key: radikabunavi-cache-${{ steps.jstdate.outputs.date }}-${{ github.run_id }}
           restore-keys: |
             radikabunavi-cache-${{ steps.jstdate.outputs.date }}-
-
       - name: Check JP business day
         id: bizday
         run: |
-          python - <<'EOF' >> "$GITHUB_OUTPUT"
+          result=$(python - <<'EOF'
           import datetime
           from zoneinfo import ZoneInfo
           import jpholiday
-
           today = datetime.datetime.now(ZoneInfo("Asia/Tokyo")).date()
           is_weekend = today.weekday() >= 5
           is_holiday = jpholiday.is_holiday(today)
           skip = is_weekend or is_holiday
-          print(f"skip={'true' if skip else 'false'}")
+          print("true" if skip else "false")
           if skip:
               reason = "weekend" if is_weekend else jpholiday.is_holiday_name(today)
-              print(f"::notice::{today} is not a JP business day ({reason}) - skipping run")
+              print(reason)
           EOF
-
+          )
+          skip_line=$(echo "$result" | sed -n '1p')
+          echo "skip=$skip_line" >> "$GITHUB_OUTPUT"
+          if [ "$skip_line" = "true" ]; then
+            reason_line=$(echo "$result" | sed -n '2p')
+            today_str=$(TZ=Asia/Tokyo date +%Y-%m-%d)
+            echo "::notice::${today_str} is not a JP business day (${reason_line}) - skipping run"
+          fi
       - name: Run Fujiko script (JP market)
         if: steps.bizday.outputs.skip != 'true'
         env:
@@ -71,7 +69,6 @@ jobs:
           GAS_TOKEN: ${{ secrets.GAS_TOKEN }}
         run: |
           python fujiko.py
-
       - name: Run Fujiko script (US market)
         if: steps.bizday.outputs.skip != 'true'
         env:
