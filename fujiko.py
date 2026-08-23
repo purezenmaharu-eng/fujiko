@@ -277,7 +277,8 @@ def get_fundamental_data(ticker):
         "code": code,
         "metrics": ["netSales", "operatingIncome", "netIncome", "salesGrowth",
                      "operatingMargin", "eps", "per", "bps",
-                     "ebitda", "marketCap", "interestBearingDebt", "netCash"],
+                     "ebitda", "marketCap", "interestBearingDebt", "netCash",
+                     "equityRatio", "debtToEquityRatio", "effectiveTaxRate", "equity"],
     })
     score = radikabunavi_call_tool("get_stock_score", {"code": code})
     return fin, score
@@ -467,6 +468,103 @@ def kabuojisan_valuation(fin_data, score_data):
         print(f"⚠️ 株おじさん式バリュエーション算出失敗: {e}")
         return None
 
+# ============================================================
+# 株おじさん式 健全性スコア(ファンダメンタル銘柄選定フレームワーク)
+# 出典: 株おじさんの銘柄選び記事シリーズ(資産価値・事業価値・経営効率の3視点)
+#   資産価値: BPS 5期推移(右肩上がり) / 自己資本比率50%以上 / DEレシオ1.0倍以下
+#   事業価値: EPS 5期推移(右肩上がり)
+#   経営効率: ROIC(製造業8%/他業種10%目安) / EV-EBITDA 11倍以下
+#   単年度の数値だけでなく複数期の時系列改善を重視、という記事の考え方に沿い、
+#   直近最大5期分のBPS/EPS推移で判定する。
+# ============================================================
+def kabuojisan_health_score(fin_data, score_data):
+    """EDINET財務データから株おじさん式健全性スコアを算出する。
+    戻り値: dict(passed, total, label, checks) or None"""
+    if not fin_data:
+        return None
+    try:
+        fiscal_years = fin_data.get("fiscalYears") or {}
+        if not isinstance(fiscal_years, dict) or not fiscal_years:
+            return None
+        years_sorted = sorted(fiscal_years.keys())
+        latest_key = years_sorted[-1]
+        latest = fiscal_years.get(latest_key) or {}
+        # 直近最大5期分(時系列トレンド判定用)
+        window_keys = years_sorted[-5:] if len(years_sorted) >= 2 else years_sorted
+
+        checks = {}
+
+        # --- 資産価値①: BPS 5期推移(右肩上がりか) ---
+        bps_series = [fiscal_years[k].get("bps") for k in window_keys if fiscal_years[k].get("bps") is not None]
+        if len(bps_series) >= 2:
+            checks["bpsUp"] = float(bps_series[-1]) > float(bps_series[0])
+
+        # --- 資産価値②: 自己資本比率50%以上 ---
+        equity_ratio = latest.get("equityRatio")
+        if equity_ratio is not None:
+            checks["equityRatioOk"] = float(equity_ratio) >= 50
+
+        # --- 資産価値③: DEレシオ1.0倍以下(APIはパーセント表記のため100%以下で判定) ---
+        de_ratio = latest.get("debtToEquityRatio")
+        if de_ratio is not None:
+            checks["deRatioOk"] = float(de_ratio) <= 100
+
+        # --- 事業価値: EPS 5期推移(右肩上がりか) ---
+        eps_series = [fiscal_years[k].get("eps") for k in window_keys if fiscal_years[k].get("eps") is not None]
+        if len(eps_series) >= 2:
+            checks["epsUp"] = float(eps_series[-1]) > float(eps_series[0])
+
+        # --- 経営効率①: ROIC(NOPAT ÷ 投下資本、自前算出) ---
+        op_income = latest.get("operatingIncome")
+        equity = latest.get("equity")
+        ibd = latest.get("interestBearingDebt") or 0
+        if op_income is not None and equity and float(equity) > 0:
+            tax_rate = latest.get("effectiveTaxRate")
+            tax_rate = float(tax_rate) / 100 if tax_rate is not None else 0.30
+            nopat = float(op_income) * (1 - tax_rate)
+            invested_capital = float(equity) + float(ibd)
+            if invested_capital > 0:
+                roic = nopat / invested_capital * 100
+                sector = (score_data or {}).get("sector") or ""
+                roic_threshold = 8 if "製造" in sector else 10
+                checks["roicOk"] = roic >= roic_threshold
+
+        # --- 経営効率②: EV/EBITDA 11倍以下 ---
+        ebitda = latest.get("ebitda")
+        market_cap = latest.get("marketCap")
+        net_cash = latest.get("netCash")
+        if ebitda and float(ebitda) > 0 and market_cap:
+            if net_cash is not None:
+                ev = float(market_cap) - float(net_cash)
+            else:
+                cash = latest.get("cashAndDeposits") or 0
+                ev = float(market_cap) + float(ibd) - float(cash)
+            ev_ebitda = ev / float(ebitda)
+            checks["evEbitdaOk"] = ev_ebitda <= 11
+
+        if not checks:
+            return None
+
+        passed = sum(1 for v in checks.values() if v)
+        total = len(checks)
+        pct = passed / total
+        if pct >= 0.8:
+            label = "健全"
+        elif pct >= 0.5:
+            label = "普通"
+        else:
+            label = "注意"
+
+        return {
+            "passed": passed,
+            "total": total,
+            "label": label,
+            "checks": checks,
+        }
+    except Exception as e:
+        print(f"⚠️ 株おじさん式健全性スコア算出失敗: {e}")
+        return None
+
 _gemini_disabled = False  # 429が解消しない場合、以降のGemini呼び出しをスキップ
 
 def generate_gemini_commentary(name, ticker, fin_data, score_data):
@@ -521,7 +619,8 @@ def build_fundamental_commentaries(tickers, ticker_name_map):
     戻り値: (commentaries, valuations)
       commentaries: ticker→コメント文字列
       valuations: ticker→{radi: {verdict, alphaPct, ...}, evy: {fairPrice, discountPct, label, ...},
-                          kabuojisan: {targetPrice, discountPct, label, ...}}
+                          kabuojisan: {targetPrice, discountPct, label, ...},
+                          kabuHealth: {passed, total, label, checks}}
     """
     commentaries = {}
     valuations = {}
@@ -554,6 +653,9 @@ def build_fundamental_commentaries(tickers, ticker_name_map):
         kabuojisan = kabuojisan_valuation(fin, score)
         if kabuojisan:
             val_info["kabuojisan"] = kabuojisan
+        kabu_health = kabuojisan_health_score(fin, score)
+        if kabu_health:
+            val_info["kabuHealth"] = kabu_health
         if val_info:
             valuations[ticker] = val_info
 
@@ -618,7 +720,7 @@ def write_to_spreadsheet(today, ace_stocks, king_stocks, poly_stocks, bep_stocks
             is_new_sheet = True
 
         SHEET_HEADERS = ["日付", "種別", "銘柄名", "市場", "ラジ株判定", "Evy式適正価格", "Evy式割安率%",
-                         "株おじさん式理論株価", "株おじさん式割安率%", "解説", "チャート"]
+                         "株おじさん式理論株価", "株おじさん式割安率%", "株おじさん健全性", "解説", "チャート"]
         if is_new_sheet or ws.row_count == 0 or ws.cell(1, 1).value != "日付":
             _sheets_call_with_retry(ws.append_row, SHEET_HEADERS)
             # 見出し行を固定し、フィルタを設定
@@ -631,16 +733,16 @@ def write_to_spreadsheet(today, ace_stocks, king_stocks, poly_stocks, bep_stocks
             try:
                 sheet_id = ws.id
                 # 列インデックス(0始まり): 日付0 種別1 銘柄名2 市場3 ラジ株判定4 Evy適正価格5 Evy割安率6
-                #                          株おじさん理論株価7 株おじさん割安率8 解説9 チャート10
+                #                          株おじさん理論株価7 株おじさん割安率8 株おじさん健全性9 解説10 チャート11
                 (COL_DATE, COL_TYPE, COL_NAME, COL_MARKET, COL_RADI, COL_EVY_PRICE, COL_EVY_PCT,
-                 COL_KABU_PRICE, COL_KABU_PCT, COL_COMMENT, COL_CHART) = range(11)
+                 COL_KABU_PRICE, COL_KABU_PCT, COL_KABU_HEALTH, COL_COMMENT, COL_CHART) = range(12)
                 requests = []
 
                 # --- 列幅の個別指定(自動リサイズだと解説列が広がりすぎるため固定) ---
                 col_widths = {
                     COL_DATE: 95, COL_TYPE: 90, COL_NAME: 160, COL_MARKET: 90,
                     COL_RADI: 130, COL_EVY_PRICE: 110, COL_EVY_PCT: 110,
-                    COL_KABU_PRICE: 130, COL_KABU_PCT: 130,
+                    COL_KABU_PRICE: 130, COL_KABU_PCT: 130, COL_KABU_HEALTH: 130,
                     COL_COMMENT: 340, COL_CHART: 110,
                 }
                 for col_idx, width in col_widths.items():
@@ -746,6 +848,25 @@ def write_to_spreadsheet(today, ace_stocks, king_stocks, poly_stocks, bep_stocks
                         }
                     })
 
+                # --- 条件付き書式: 株おじさん健全性列(テキストに応じて色分け) ---
+                kabu_health_range = {"sheetId": sheet_id, "startRowIndex": 1, "startColumnIndex": COL_KABU_HEALTH, "endColumnIndex": COL_KABU_HEALTH + 1}
+                for keyword, color in [
+                    ("健全", {"red": 0.85, "green": 0.94, "blue": 0.85}),
+                    ("注意", {"red": 0.98, "green": 0.85, "blue": 0.85}),
+                ]:
+                    requests.append({
+                        "addConditionalFormatRule": {
+                            "rule": {
+                                "ranges": [kabu_health_range],
+                                "booleanRule": {
+                                    "condition": {"type": "TEXT_CONTAINS", "values": [{"userEnteredValue": keyword}]},
+                                    "format": {"backgroundColor": color},
+                                },
+                            },
+                            "index": 0,
+                        }
+                    })
+
                 _sheets_call_with_retry(sh.batch_update, {"requests": requests})
             except Exception as e:
                 print(f"⚠️ シート装飾設定に失敗(処理は継続): {e}")
@@ -754,14 +875,16 @@ def write_to_spreadsheet(today, ace_stocks, king_stocks, poly_stocks, bep_stocks
             return f'=HYPERLINK("{chart_url(ticker)}", "チャートを見る")'
 
         def _valuation_cells(ticker):
-            """バリュエーション列の値を返す: [ラジ株判定, Evy式適正価格, Evy式割安率%, 株おじさん式理論株価, 株おじさん式割安率%]
+            """バリュエーション列の値を返す: [ラジ株判定, Evy式適正価格, Evy式割安率%,
+            株おじさん式理論株価, 株おじさん式割安率%, 株おじさん健全性]
             データが無い項目は空文字ではなく「－」で埋め、シート上の見た目を統一する"""
             v = valuations.get(ticker)
             if not v:
-                return ["－", "－", "－", "－", "－"]
+                return ["－", "－", "－", "－", "－", "－"]
             radi = v.get("radi") or {}
             evy = v.get("evy") or {}
             kabuojisan = v.get("kabuojisan") or {}
+            kabu_health = v.get("kabuHealth") or {}
             radi_label = radi.get("verdict") or "－"
             if radi.get("verdict") and radi.get("alphaPct") is not None:
                 radi_label += f" ({radi['alphaPct']:+.1f}%)"
@@ -769,7 +892,10 @@ def write_to_spreadsheet(today, ace_stocks, king_stocks, poly_stocks, bep_stocks
             evy_discount = evy.get("discountPct", "－")
             kabu_price = kabuojisan.get("targetPrice", "－")
             kabu_discount = kabuojisan.get("discountPct", "－")
-            return [radi_label, evy_price, evy_discount, kabu_price, kabu_discount]
+            kabu_health_label = "－"
+            if kabu_health.get("label") is not None:
+                kabu_health_label = f"{kabu_health['label']}({kabu_health['passed']}/{kabu_health['total']})"
+            return [radi_label, evy_price, evy_discount, kabu_price, kabu_discount, kabu_health_label]
 
         def _comment_cell(ticker):
             return commentaries.get(ticker) or "－"
@@ -1308,6 +1434,9 @@ def _valuation_tag(t):
     kabuojisan = v.get("kabuojisan") or {}
     if kabuojisan.get("label"):
         parts.append(f"株:{kabuojisan['label']}({kabuojisan['discountPct']:+.0f}%)")
+    kabu_health = v.get("kabuHealth") or {}
+    if kabu_health.get("label"):
+        parts.append(f"健:{kabu_health['label']}{kabu_health['passed']}/{kabu_health['total']}")
     return f" [{'/'.join(parts)}]" if parts else ""
 
 def _line_format(t, df):
