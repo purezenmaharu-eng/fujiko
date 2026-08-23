@@ -1156,6 +1156,44 @@ def get_all_tickers(ticker_name_map):
         return list(ticker_name_map.keys()), ticker_name_map
 
 # ============================================================
+# 監視銘柄リスト読み込み(Stage A: build_watchlist.pyが四半期で構築)
+# ============================================================
+# 株おじさんの銘柄選定手法に沿い、フジコ(Ace/King/Polygraph/BEP)は「タイミング計測ツール」
+# として、事前にファンダメンタル・長期トレンド・流動性で選別された監視銘柄リストにのみ
+# 適用する。「監視銘柄」タブが存在しない/空の場合は、リスト未構築とみなし全銘柄を対象に
+# フォールバックする(日次運用を止めないため)。
+def get_watchlist_tickers():
+    """スプレッドシートの「監視銘柄」タブから銘柄コード一覧を取得し、
+    ".T"付きティッカーのsetを返す。取得できない場合は空setを返す(呼び出し元でフォールバック判断)。"""
+    try:
+        creds_json = os.environ.get("GOOGLE_SHEETS_CREDENTIALS", "")
+        spreadsheet_id = os.environ.get("SPREADSHEET_ID", "")
+        if not creds_json or not spreadsheet_id:
+            print("⚠️ スプレッドシート設定未完了 → 監視銘柄リストを取得できません")
+            return set()
+        creds_dict = json.loads(creds_json)
+        creds = Credentials.from_service_account_info(
+            creds_dict, scopes=["https://www.googleapis.com/auth/spreadsheets"]
+        )
+        gc = gspread.authorize(creds)
+        sh = gc.open_by_key(spreadsheet_id)
+        try:
+            ws = sh.worksheet("監視銘柄")
+        except gspread.exceptions.WorksheetNotFound:
+            print("⚠️ 「監視銘柄」タブが見つかりません(build_watchlist.py未実行) → 全銘柄を対象にフォールバックします")
+            return set()
+        records = ws.get_all_records()
+        tickers = set()
+        for rec in records:
+            code = str(rec.get("銘柄コード", "")).strip()
+            if code:
+                tickers.add(f"{code}.T")
+        return tickers
+    except Exception as e:
+        print(f"⚠️ 監視銘柄リスト取得失敗({e}) → 全銘柄を対象にフォールバックします")
+        return set()
+
+# ============================================================
 # 関数定義
 # ============================================================
 def detect_bullish_ep(df, lookback=10):
@@ -1333,6 +1371,20 @@ if MARKET == "US":
     target_stocks, TICKER_NAME_MAP = get_us_tickers()
 else:
     target_stocks, TICKER_NAME_MAP = get_all_tickers(TICKER_NAME_MAP)
+    # --- 監視銘柄リストによる絞り込み(株おじさん式: フジコはタイミング計測のみに使う) ---
+    # 米国株は対象外(株おじさんの記事は日本株の銘柄選定手法のため、米国株は従来通り全銘柄スキャン)
+    _watchlist_tickers = get_watchlist_tickers()
+    if _watchlist_tickers:
+        _before_count = len(target_stocks)
+        target_stocks = [t for t in target_stocks if t in _watchlist_tickers]
+        print(f"🎯 監視銘柄リストで絞り込み: {_before_count}銘柄 → {len(target_stocks)}銘柄"
+              f"(build_watchlist.pyが選別した株おじさん式監視銘柄のみを対象にスキャン)")
+        if not target_stocks:
+            print("⚠️ 監視銘柄リストとJ-Quantsティッカー一覧の突合結果が0件のため、全銘柄にフォールバックします")
+            target_stocks, TICKER_NAME_MAP = get_all_tickers(TICKER_NAME_MAP)
+    else:
+        print("⚠️ 監視銘柄リストが空/未構築のため、全銘柄を対象にフォールバックします"
+              "(build_watchlist.pyを四半期ワークフローで実行すると絞り込みが有効になります)")
 
 print("🚀 データダウンロード開始...")
 df_bench = yf.download(BENCH, start=START, end=END, auto_adjust=True, progress=False)
