@@ -1373,8 +1373,12 @@ else:
     target_stocks, TICKER_NAME_MAP = get_all_tickers(TICKER_NAME_MAP)
     # --- 監視銘柄リストによる絞り込み(株おじさん式: フジコはタイミング計測のみに使う) ---
     # 米国株は対象外(株おじさんの記事は日本株の銘柄選定手法のため、米国株は従来通り全銘柄スキャン)
+    # 監視銘柄リストはFスコア判定がクォータ制約で複数日に分かれて完成するため、
+    # 完成前の少なすぎる件数で絞り込みが有効になってしまうと日次シグナルがほぼ0件になりかねない。
+    # そのため一定件数(MIN_WATCHLIST_SIZE)に達するまでは絞り込みを見送り、全銘柄スキャンを継続する。
+    MIN_WATCHLIST_SIZE = 100
     _watchlist_tickers = get_watchlist_tickers()
-    if _watchlist_tickers:
+    if _watchlist_tickers and len(_watchlist_tickers) >= MIN_WATCHLIST_SIZE:
         _before_count = len(target_stocks)
         target_stocks = [t for t in target_stocks if t in _watchlist_tickers]
         print(f"🎯 監視銘柄リストで絞り込み: {_before_count}銘柄 → {len(target_stocks)}銘柄"
@@ -1382,6 +1386,10 @@ else:
         if not target_stocks:
             print("⚠️ 監視銘柄リストとJ-Quantsティッカー一覧の突合結果が0件のため、全銘柄にフォールバックします")
             target_stocks, TICKER_NAME_MAP = get_all_tickers(TICKER_NAME_MAP)
+    elif _watchlist_tickers:
+        print(f"⚠️ 監視銘柄リストがまだ{len(_watchlist_tickers)}銘柄しかありません"
+              f"(最低{MIN_WATCHLIST_SIZE}銘柄に達するまで絞り込みを見送り、全銘柄を対象にフォールバックします。"
+              f"quarterly_watchlist.ymlを再実行してFスコア判定を進めてください)")
     else:
         print("⚠️ 監視銘柄リストが空/未構築のため、全銘柄を対象にフォールバックします"
               "(build_watchlist.pyを四半期ワークフローで実行すると絞り込みが有効になります)")
