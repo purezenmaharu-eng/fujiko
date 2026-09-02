@@ -17,6 +17,18 @@ from datetime import date
 RADIKABUNAVI_MCP_URL = "https://radikabunavi.com/mcp"
 RADIKABUNAVI_API_KEY = os.environ.get("RADIKABUNAVI_API_KEY", "")
 
+# --- ファンダメンタルズ事前フィルタ(screen_stocks=窓口B、150リクエスト制限を消費しない)---
+# scoreTotalはラジ株ナビの6軸(割安度/稼ぐ力/成長性/安全性/還元力/事業独占力)合成スコア(0-100)。
+# 60はscreen_by_frameworkのvalue/growth "ok"tier(ROE>=5〜8%程度)よりやや厳しく、
+# "good"tier(ROE>=10〜15%)より緩い中庸の初期値。ここでは技術シグナル側のタイミング判定に
+# 委ねる余地を残すため、極端な割高(超割高)のみ除外し、割安〜適正までを通過させる。
+# いずれも運用しながら調整可能(値を変えるだけでフィルタの強弱を変更できる)。
+FUNDAMENTAL_SCREEN_ENABLED = True
+FUNDAMENTAL_MIN_SCORE_TOTAL = 60
+FUNDAMENTAL_ACCEPTABLE_VERDICTS = ["超割安", "割安", "適正"]
+FUNDAMENTAL_SCREEN_PAGE_LIMIT = 100
+FUNDAMENTAL_SCREEN_MAX_PAGES = 50  # 100件×50頁=最大5000銘柄まで走査(全上場企業をカバー可能)
+
 # Gemini設定 (ファンダメンタルズ解説コメント生成)
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 GEMINI_MODEL = "gemini-3.1-flash-lite"
@@ -693,6 +705,54 @@ def kabuojisan_health_score(fin_data, score_data):
     except Exception as e:
         print(f"⚠️ 株おじさん式健全性スコア算出失敗: {e}")
         return None
+
+def screen_fundamentally_sound_stocks(min_score_total=FUNDAMENTAL_MIN_SCORE_TOTAL,
+                                       acceptable_verdicts=FUNDAMENTAL_ACCEPTABLE_VERDICTS):
+    """screen_stocks(窓口B、edinet-summary.jsonを検索するのみで150リクエスト制限を消費しない)で
+    全上場企業のROE/PER/PBR/scoreTotal/verdictを一括取得し、ファンダメンタルズが良好な
+    銘柄コード(4桁、.T無し)→指標dictのマップを返す。
+    API未設定・呼び出し失敗時はNoneを返す(呼び出し側でフィルタなし運用を判断できるように)"""
+    if not FUNDAMENTAL_SCREEN_ENABLED:
+        return None
+    if not RADIKABUNAVI_API_KEY or _radikabunavi_disabled:
+        print("⚠️ RADIKABUNAVI_API_KEY未設定 → ファンダメンタルズ事前フィルタをスキップ")
+        return None
+    fundamentals = {}
+    offset = 0
+    for _ in range(FUNDAMENTAL_SCREEN_MAX_PAGES):
+        result = radikabunavi_call_tool("screen_stocks", {
+            "conditions": [{"metric": "scoreTotal", "operator": ">=", "value": min_score_total}],
+            "verdict": acceptable_verdicts,
+            "fields": ["roe", "per", "pbr", "scoreTotal", "verdict"],
+            "sort": {"metric": "scoreTotal", "order": "desc"},
+            "limit": FUNDAMENTAL_SCREEN_PAGE_LIMIT,
+            "offset": offset,
+        })
+        if not result:
+            break
+        rows = result.get("results") or result.get("result") or result.get("stocks") or []
+        if not rows:
+            break
+        for row in rows:
+            code = str(row.get("code") or row.get("secCode") or row.get("ticker") or "").replace(".T", "")
+            if not code:
+                continue
+            fundamentals[code] = {
+                "roe": row.get("roe"),
+                "per": row.get("per"),
+                "pbr": row.get("pbr"),
+                "scoreTotal": row.get("scoreTotal"),
+                "verdict": row.get("verdict"),
+            }
+        if len(rows) < FUNDAMENTAL_SCREEN_PAGE_LIMIT:
+            break
+        offset += FUNDAMENTAL_SCREEN_PAGE_LIMIT
+    if not fundamentals:
+        print("⚠️ ファンダメンタルズ事前フィルタ: 該当銘柄0件、または取得失敗 → フィルタなしで続行")
+        return None
+    print(f"✅ ファンダメンタルズ事前フィルタ(screen_stocks): {len(fundamentals)}銘柄が条件を満たしました"
+          f"(scoreTotal>={min_score_total}, verdict∈{acceptable_verdicts})")
+    return fundamentals
 
 _gemini_disabled = False  # 429が解消しない場合、以降のGemini呼び出しをスキップ
 
@@ -1505,6 +1565,19 @@ else:
     else:
         print("⚠️ 監視銘柄リストが空/未構築のため、本日のシグナルは0件になります"
               "(build_watchlist.pyを四半期ワークフローで実行すると監視銘柄が構築されます)")
+
+    # --- ファンダメンタルズ事前フィルタ(screen_stocks=窓口B) ---
+    # 監視銘柄(または全4,000社)をROE・PER・PBR・scoreTotal・verdictで一括スクリーニングし、
+    # ファンダメンタルズが良好な銘柄のみ技術シグナル(Ace/King/黒猫法等)の計算対象に絞り込む。
+    # 個別深掘り用のget_stock_score/get_ideal_price/get_dcf_valuation(窓口A、150リクエスト制限あり)
+    # はここでは使わず、シグナル点灯銘柄の詳細解説(build_fundamental_commentaries)専用に温存する。
+    fundamentals_map = screen_fundamentally_sound_stocks()
+    if fundamentals_map:
+        _before_count = len(target_stocks)
+        target_stocks = [t for t in target_stocks if t.replace(".T", "") in fundamentals_map]
+        print(f"📉 ファンダメンタルズ事前フィルタ適用: {_before_count}銘柄 → {len(target_stocks)}銘柄に絞り込み")
+    else:
+        print("⚠️ ファンダメンタルズ事前フィルタ未適用(取得失敗またはキー未設定) → 全銘柄で技術シグナル判定")
 
 print("🚀 データダウンロード開始...")
 df_bench = yf.download(BENCH, start=START, end=END, auto_adjust=True, progress=False)
