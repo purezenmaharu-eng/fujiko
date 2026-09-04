@@ -284,6 +284,77 @@ def get_fundamental_data(ticker):
     return fin, score
 
 # ============================================================
+# 一括スクリーニング(窓口B: screen_stocks)によるファンダメンタルズ一括取得
+# ============================================================
+# 【2026/09 根本改革】従来は「Ace/King等のテクニカルシグナルが点灯した銘柄だけ」に
+# ファンダメンタルズ(ラジ株判定・Evy式等)を後付けしていたが、これは株おじさん式の
+# 「ファンダメンタルズで良い会社を先に選び、その中でタイミングを見る」という方針と
+# 順序が逆になっていた。
+#
+# screen_stocks(窓口B)は get_stock_score 等の個別銘柄問い合わせ(窓口A、日次150リクエスト
+# 上限)とは別枠で、EDINETサマリーを一括検索するだけの仕組みのため日次上限を消費しない
+# (2026/08/31検証: 15回呼び出し・累計1,500銘柄超取得でも429なし)。
+# これを使い、監視銘柄"全体"に対して毎日ラジ株判定(verdict)・割安度スコアを一括取得する。
+SCREEN_STOCKS_PAGE_SIZE = 100
+SCREEN_STOCKS_MAX_PAGES = 45  # 全上場企業(約4000社)をカバーする想定の上限(4000/100+余裕)
+_screen_stocks_disabled = False  # 429が解消しない場合、以降の一括取得をスキップ
+
+def get_screened_fundamentals(watchlist_codes):
+    """screen_stocks(窓口B)を使い、全上場企業のラジ株判定・割安度スコアをページングで
+    一括取得し、watchlist_codes(証券コード、".T"なしの文字列set)に含まれる銘柄分だけを
+    返す。戻り値: code(str, ".T"なし) → screen_stocksの1レコード(dict)。
+    watchlist_codesが空の場合は空dictを返す(全銘柄相手に回す必要はないため)。"""
+    global _screen_stocks_disabled
+    result = {}
+    if not watchlist_codes or SKIP_FUNDAMENTALS or not RADIKABUNAVI_API_KEY or _screen_stocks_disabled:
+        return result
+    remaining = set(watchlist_codes)
+    fields = ["per", "pbr", "roe", "equityRatio", "salesGrowth", "dividendYield",
+              "scoreTotal", "scoreValuation", "scoreProfitability", "scoreGrowth",
+              "scoreSafety", "scoreShareholderReturn", "scoreMoat",
+              "idealPriceMid", "alphaPct", "verdict", "marketCap"]
+    for page in range(SCREEN_STOCKS_MAX_PAGES):
+        if not remaining:
+            break
+        arguments = {
+            "conditions": [{"metric": "marketCap", "operator": ">=", "value": 1}],
+            "limit": SCREEN_STOCKS_PAGE_SIZE,
+            "offset": page * SCREEN_STOCKS_PAGE_SIZE,
+            "fields": fields,
+        }
+        resp = radikabunavi_call_tool("screen_stocks", arguments)
+        if resp is None:
+            if _radikabunavi_disabled:
+                print("⏹️ screen_stocksが利用不可のため、一括ファンダメンタルズ取得を打ち切ります")
+                _screen_stocks_disabled = True
+            break
+        rows = resp.get("results") or resp.get("stocks") or resp.get("data") or []
+        if not isinstance(rows, list) or not rows:
+            break
+        for row in rows:
+            code = str(row.get("code") or row.get("securityCode") or "").strip()
+            if code and code in remaining:
+                result[code] = row
+                remaining.discard(code)
+        if len(rows) < SCREEN_STOCKS_PAGE_SIZE:
+            break  # 最終ページ
+    if remaining:
+        print(f"⚠️ screen_stocksで見つからなかった監視銘柄: {len(remaining)}件(上場廃止・データ欠損等の可能性)")
+    print(f"✅ 一括ファンダメンタルズ取得完了({len(result)}/{len(watchlist_codes)}銘柄、screen_stocksはクォータ消費なし)")
+    return result
+
+def _screened_row_to_valuation(row):
+    """screen_stocksの1レコードを、既存のvaluations辞書と同じ形の"radi"部分に変換する。"""
+    if not row:
+        return None
+    return {
+        "verdict": row.get("verdict"),
+        "alphaPct": row.get("alphaPct"),
+        "mid": row.get("idealPriceMid"),
+        "scoreTotal": row.get("scoreTotal"),
+    }
+
+# ============================================================
 # Evy式バリュエーション(自前ロジック)
 # ============================================================
 def evy_valuation(fin_data, score_data):
@@ -725,9 +796,21 @@ def chart_url(ticker):
     code = ticker.replace(".T", "")
     return f"https://www.tradingview.com/chart/?symbol=TSE%3A{code}"
 
-def write_to_spreadsheet(today, ace_stocks, king_stocks, poly_stocks, bep_stocks, commentaries=None, valuations=None):
+def write_to_spreadsheet(today, top_tickers, ticker_name_map, valuations=None, commentaries=None, signal_sets=None):
+    """監視銘柄の中からファンダメンタルズ評価が高い順に選んだ上位銘柄(通常30件)を、
+    日付ごとのシートに書き込む。
+    【2026/09 根本改革】以前はAce/King/Polygraph/BEPが点灯した銘柄"だけ"を並べていたため、
+    ファンダメンタルズ列が点灯銘柄以外は空欄だらけになり、また行を選ぶ基準もテクニカル
+    シグナル頼みだった。株おじさん式の「まずファンダメンタルズで良い会社を探し、その中で
+    タイミングを見極める」という方針に合わせ、行の選定基準を「ファンダメンタルズ評価上位」
+    に変更した。テクニカルシグナル(Ace/King等)は行を増やす基準ではなく、「本日のテクニカル」
+    という1列の参考情報(タイミングの健康診断)として添えるだけにする。
+    top_tickers: 表示する銘柄のティッカーのリスト(すでにファンダメンタルズ評価順)
+    signal_sets: {"Ace": {ticker,...}, "King": {...}, "ポリグラフ": {...}, "Ace×BEP": {...}}
+      (本日Ace/King等が点灯したticker集合。テクニカル状態列の表示用、参考情報)"""
     commentaries = commentaries or {}
     valuations = valuations or {}
+    signal_sets = signal_sets or {}
     try:
         creds_json = os.environ.get("GOOGLE_SHEETS_CREDENTIALS", "")
         spreadsheet_id = os.environ.get("SPREADSHEET_ID", "")
@@ -750,7 +833,7 @@ def write_to_spreadsheet(today, ace_stocks, king_stocks, poly_stocks, bep_stocks
             ws = sh.add_worksheet(title=sheet_name, rows=500, cols=10)
             is_new_sheet = True
 
-        SHEET_HEADERS = ["日付", "種別", "銘柄名", "市場", "ラジ株判定", "Evy式適正価格", "Evy式割安率%",
+        SHEET_HEADERS = ["日付", "銘柄名", "市場", "本日のテクニカル", "ラジ株判定", "Evy式適正価格", "Evy式割安率%",
                          "株おじさん式理論株価", "株おじさん式割安率%", "株おじさん健全性", "解説", "チャート"]
         if is_new_sheet or ws.row_count == 0 or ws.cell(1, 1).value != "日付":
             _sheets_call_with_retry(ws.append_row, SHEET_HEADERS)
@@ -763,15 +846,15 @@ def write_to_spreadsheet(today, ace_stocks, king_stocks, poly_stocks, bep_stocks
             # 列幅・折り返し・色分け・縞模様を一括設定(視認性向上)
             try:
                 sheet_id = ws.id
-                # 列インデックス(0始まり): 日付0 種別1 銘柄名2 市場3 ラジ株判定4 Evy適正価格5 Evy割安率6
+                # 列インデックス(0始まり): 日付0 銘柄名1 市場2 本日のテクニカル3 ラジ株判定4 Evy適正価格5 Evy割安率6
                 #                          株おじさん理論株価7 株おじさん割安率8 株おじさん健全性9 解説10 チャート11
-                (COL_DATE, COL_TYPE, COL_NAME, COL_MARKET, COL_RADI, COL_EVY_PRICE, COL_EVY_PCT,
+                (COL_DATE, COL_NAME, COL_MARKET, COL_TECH, COL_RADI, COL_EVY_PRICE, COL_EVY_PCT,
                  COL_KABU_PRICE, COL_KABU_PCT, COL_KABU_HEALTH, COL_COMMENT, COL_CHART) = range(12)
                 requests = []
 
                 # --- 列幅の個別指定(自動リサイズだと解説列が広がりすぎるため固定) ---
                 col_widths = {
-                    COL_DATE: 95, COL_TYPE: 90, COL_NAME: 160, COL_MARKET: 90,
+                    COL_DATE: 95, COL_NAME: 160, COL_MARKET: 90, COL_TECH: 130,
                     COL_RADI: 130, COL_EVY_PRICE: 110, COL_EVY_PCT: 110,
                     COL_KABU_PRICE: 130, COL_KABU_PCT: 130, COL_KABU_HEALTH: 130,
                     COL_COMMENT: 340, COL_CHART: 110,
@@ -931,15 +1014,18 @@ def write_to_spreadsheet(today, ace_stocks, king_stocks, poly_stocks, bep_stocks
         def _comment_cell(ticker):
             return commentaries.get(ticker) or "－"
 
+        def _technical_tag(ticker):
+            hit = [label for label, s in signal_sets.items() if ticker in s]
+            return "/".join(hit) if hit else "－"
+
         rows_to_write = []
-        for stock, ticker in ace_stocks:
-            rows_to_write.append([today, "Ace", stock.replace("・", ""), get_market_label(ticker)] + _valuation_cells(ticker) + [_comment_cell(ticker), _chart_link(ticker)])
-        for stock, ticker in king_stocks:
-            rows_to_write.append([today, "King", stock.replace("・", ""), get_market_label(ticker)] + _valuation_cells(ticker) + [_comment_cell(ticker), _chart_link(ticker)])
-        for stock, ticker in poly_stocks:
-            rows_to_write.append([today, "ポリグラフ", stock.replace("・", ""), get_market_label(ticker)] + _valuation_cells(ticker) + [_comment_cell(ticker), _chart_link(ticker)])
-        for stock, ticker in bep_stocks:
-            rows_to_write.append([today, "Ace×BEP", stock.replace("・", ""), get_market_label(ticker)] + _valuation_cells(ticker) + [_comment_cell(ticker), _chart_link(ticker)])
+        for ticker in top_tickers:
+            name = ticker_name_map.get(ticker, ticker).replace("・", "")
+            rows_to_write.append(
+                [today, name, get_market_label(ticker), _technical_tag(ticker)]
+                + _valuation_cells(ticker)
+                + [_comment_cell(ticker), _chart_link(ticker)]
+            )
         if rows_to_write:
             _sheets_call_with_retry(ws.append_rows, rows_to_write, value_input_option="USER_ENTERED")
 
@@ -948,9 +1034,13 @@ def write_to_spreadsheet(today, ace_stocks, king_stocks, poly_stocks, bep_stocks
         except gspread.exceptions.WorksheetNotFound:
             ws_summary = sh.add_worksheet(title="サマリー", rows=1000, cols=10)
             _sheets_call_with_retry(ws_summary.append_row, ["日付", "Ace銘柄数", "King銘柄数", "ポリグラフ銘柄数", "Ace×BEP銘柄数", "市場"])
-        _sheets_call_with_retry(ws_summary.append_row, [today, len(ace_pairs), len(king_pairs), len(poly_pairs), len(bep_pairs), MARKET])
+        _ace_n = len(signal_sets.get("Ace", set()))
+        _king_n = len(signal_sets.get("King", set()))
+        _poly_n = len(signal_sets.get("ポリグラフ", set()))
+        _bep_n = len(signal_sets.get("Ace×BEP", set()))
+        _sheets_call_with_retry(ws_summary.append_row, [today, _ace_n, _king_n, _poly_n, _bep_n, MARKET])
 
-        print("✅ スプレッドシート書き込み完了")
+        print(f"✅ スプレッドシート書き込み完了({len(rows_to_write)}銘柄)")
     except Exception as e:
         print(f"❌ スプレッドシート書き込み失敗: {e}")
 
@@ -1367,32 +1457,31 @@ START = "2023-01-01"
 END   = (date.today() + pd.Timedelta(days=1)).strftime("%Y-%m-%d")
 BENCH = "^GSPC" if MARKET == "US" else "1306.T"
 
+_watchlist_tickers = set()
 if MARKET == "US":
     target_stocks, TICKER_NAME_MAP = get_us_tickers()
 else:
     target_stocks, TICKER_NAME_MAP = get_all_tickers(TICKER_NAME_MAP)
     # --- 監視銘柄リストによる絞り込み(株おじさん式: フジコはタイミング計測のみに使う) ---
     # 米国株は対象外(株おじさんの記事は日本株の銘柄選定手法のため、米国株は従来通り全銘柄スキャン)
-    # 監視銘柄リストはFスコア判定がクォータ制約で複数日に分かれて完成するため、
-    # 完成前の少なすぎる件数で絞り込みが有効になってしまうと日次シグナルがほぼ0件になりかねない。
-    # そのため一定件数(MIN_WATCHLIST_SIZE)に達するまでは絞り込みを見送り、全銘柄スキャンを継続する。
-    MIN_WATCHLIST_SIZE = 100
+    # 【2026/09 根本改革】以前は監視銘柄が100銘柄未満の間、絞り込みを見送って全銘柄
+    # スキャンにフォールバックしていた。しかしこれは「ファンダメンタルズで選ばれた
+    # 会社だけをタイミング判定の対象にする」という株おじさん式の原則を、監視銘柄数
+    # 次第で日によって有効/無効が入れ替わる不安定な状態にしてしまっていた。
+    # 常に監視銘柄だけを対象にする(監視銘柄が少ない日は、対象が少ないままでよい)。
     _watchlist_tickers = get_watchlist_tickers()
-    if _watchlist_tickers and len(_watchlist_tickers) >= MIN_WATCHLIST_SIZE:
+    if _watchlist_tickers:
         _before_count = len(target_stocks)
         target_stocks = [t for t in target_stocks if t in _watchlist_tickers]
         print(f"🎯 監視銘柄リストで絞り込み: {_before_count}銘柄 → {len(target_stocks)}銘柄"
-              f"(build_watchlist.pyが選別した株おじさん式監視銘柄のみを対象にスキャン)")
+              f"(build_watchlist.pyが選別した株おじさん式監視銘柄のみを対象にスキャン。"
+              f"全銘柄へのフォールバックは廃止済み)")
         if not target_stocks:
-            print("⚠️ 監視銘柄リストとJ-Quantsティッカー一覧の突合結果が0件のため、全銘柄にフォールバックします")
-            target_stocks, TICKER_NAME_MAP = get_all_tickers(TICKER_NAME_MAP)
-    elif _watchlist_tickers:
-        print(f"⚠️ 監視銘柄リストがまだ{len(_watchlist_tickers)}銘柄しかありません"
-              f"(最低{MIN_WATCHLIST_SIZE}銘柄に達するまで絞り込みを見送り、全銘柄を対象にフォールバックします。"
-              f"quarterly_watchlist.ymlを再実行してFスコア判定を進めてください)")
+            print("⚠️ 監視銘柄リストとJ-Quantsティッカー一覧の突合結果が0件です。"
+                  "本日のシグナルは0件になります(quarterly_watchlist.ymlの進捗を確認してください)")
     else:
-        print("⚠️ 監視銘柄リストが空/未構築のため、全銘柄を対象にフォールバックします"
-              "(build_watchlist.pyを四半期ワークフローで実行すると絞り込みが有効になります)")
+        print("⚠️ 監視銘柄リストが空/未構築のため、本日のシグナルは0件になります"
+              "(build_watchlist.pyを四半期ワークフローで実行すると監視銘柄が構築されます)")
 
 print("🚀 データダウンロード開始...")
 df_bench = yf.download(BENCH, start=START, end=END, auto_adjust=True, progress=False)
@@ -1476,34 +1565,65 @@ poly_stocks_all = [(f"・{TICKER_NAME_MAP.get(t, t)} {get_trend(df)}", t) for t,
 bep_stocks_all  = [(f"・{TICKER_NAME_MAP.get(t, t)} {get_trend(df)}", t) for t, df in combined_df.groupby("Ticker") if df["Ace_with_BEP_Start"].tail(3).any()]
 
 # ============================================================
-# ファンダメンタルズ解説 + バリュエーション(EDINET財務 + ラジ株スコア + Evy式)
+# ファンダメンタルズ評価(EDINET財務 + ラジ株スコア + Evy式)
 # ============================================================
-# 優先度順(厳選度が高いシグナルを優先): ポリグラフ → Ace×BEP → Ace → King
-# ラジ株ナビ無料プランは1日150リクエスト、1銘柄につき2リクエスト消費するため上限75銘柄。
-# 同じGitHub Actions実行内で日本株→米国株の順に実行されるため、両方の市場でこの上限まで
-# 呼ぼうとすると合計で日次クォータ(150)を超えてしまい、米国株側(あるいは2回目の呼び出し)が
-# 即座に429で失敗していた。ラジ株ナビ/Evy式は日本株のみを対象とし、米国株ではスキップする。
+# 【2026/09 根本改革】株おじさん式の「ファンダメンタルズで良い会社を先に選び、その中で
+# タイミングを見る」という方針に合わせ、評価の起点をAce/King等のテクニカルシグナル
+# 点灯銘柄から、監視銘柄"全体"に変更した。2段階で構成する:
+#
+#   窓口B(screen_stocks・クォータ消費なし): 監視銘柄"全体"に対して、ラジ株ナビの
+#     割安度判定(verdict)・各種スコアを毎日一括取得する。これにより監視銘柄である限り、
+#     テクニカルシグナルの有無に関わらずラジ株判定が埋まるようになる。
+#   窓口A(get_edinet_financial_data等・日次上限あり): 窓口Bのスコア(scoreValuation等)
+#     が高い上位銘柄"だけ"を対象に、Evy式・株おじさん式TSP・健全性スコアという
+#     フジコ独自の詳細計算まで深掘りする。「テクニカルで跳ねたから深掘りする」のではなく
+#     「ファンダメンタルズが良いから深掘りする」という順序に変更。
+#
+# ラジ株ナビ無料プランは窓口Aが1日150リクエスト、1銘柄につき2リクエスト消費するため
+# 深掘りできる上限は75銘柄。米国株は株おじさんの記事が日本株の銘柄選定手法のため対象外。
 RADIKABUNAVI_DAILY_LIMIT = 150
 CALLS_PER_TICKER = 2
 MAX_FUNDAMENTAL_TICKERS = RADIKABUNAVI_DAILY_LIMIT // CALLS_PER_TICKER
+TOP_FUNDAMENTAL_ROWS = 30  # メインシートに掲載する、ファンダメンタルズ評価上位の件数
+
+_screened = {}
+_ranked = []
 
 if MARKET == "US":
     print("⏭️ 米国株はラジ株ナビ/Evy式バリュエーションの対象外のためスキップします(日次クォータを日本株用に温存)")
     fundamental_commentaries, fundamental_valuations = {}, {}
 else:
-    _priority_ordered_tickers = []
-    _seen_tickers = set()
-    for _stocks in (poly_stocks_all, bep_stocks_all, ace_stocks_all, king_stocks_all):
-        for _, _t in _stocks:
-            if _t not in _seen_tickers:
-                _seen_tickers.add(_t)
-                _priority_ordered_tickers.append(_t)
+    # --- 窓口B: 監視銘柄全体のラジ株判定を一括取得(クォータ消費なし) ---
+    _watchlist_codes = {t.replace(".T", "") for t in _watchlist_tickers} if _watchlist_tickers else set()
+    _screened = get_screened_fundamentals(_watchlist_codes)
+    fundamental_valuations = {}
+    for _code, _row in _screened.items():
+        _t = f"{_code}.T"
+        _radi = _screened_row_to_valuation(_row)
+        if _radi:
+            fundamental_valuations[_t] = {"radi": _radi, "scores": {
+                "valuation": _row.get("scoreValuation"),
+                "profitability": _row.get("scoreProfitability"),
+                "growth": _row.get("scoreGrowth"),
+                "safety": _row.get("scoreSafety"),
+                "shareholderReturn": _row.get("scoreShareholderReturn"),
+                "moat": _row.get("scoreMoat"),
+            }}
 
-    _all_signaled_tickers = _priority_ordered_tickers
-    if len(_all_signaled_tickers) > MAX_FUNDAMENTAL_TICKERS:
-        print(f"priority list exceeds free-tier limit, trimming to top {MAX_FUNDAMENTAL_TICKERS}")
-        _all_signaled_tickers = _all_signaled_tickers[:MAX_FUNDAMENTAL_TICKERS]
-    fundamental_commentaries, fundamental_valuations = build_fundamental_commentaries(_all_signaled_tickers, TICKER_NAME_MAP)
+    # --- 窓口A: 窓口Bの割安度スコア(scoreValuation)が高い上位銘柄だけを深掘り ---
+    # (同点の場合はscoreTotalで補完的にソート)
+    _ranked = sorted(
+        _screened.items(),
+        key=lambda kv: (kv[1].get("scoreValuation") or 0, kv[1].get("scoreTotal") or 0),
+        reverse=True,
+    )
+    _deep_dive_tickers = [f"{code}.T" for code, _ in _ranked[:MAX_FUNDAMENTAL_TICKERS]]
+    if _deep_dive_tickers:
+        print(f"🔎 割安度スコア上位{len(_deep_dive_tickers)}銘柄をEvy式/株おじさん式で深掘り(窓口A)")
+    fundamental_commentaries, _deep_valuations = build_fundamental_commentaries(_deep_dive_tickers, TICKER_NAME_MAP)
+    # 深掘り結果(evy/kabuojisan/kabuHealth)を、窓口Bの結果にマージ(上書きではなく追加)
+    for _t, _v in _deep_valuations.items():
+        fundamental_valuations.setdefault(_t, {}).update(_v)
 
 # --- シグナル的中率トラッキング(バリュエーション情報付きで登録) ---
 print("\n📊 シグナル的中率トラッキング処理中...")
@@ -1569,4 +1689,29 @@ send_line(msg)
 
 # スプレッドシートに履歴を書き込む
 # ============================================================
-write_to_spreadsheet(today, ace_stocks_all, king_stocks_all, poly_stocks_all, bep_stocks_all, fundamental_commentaries, fundamental_valuations)
+# 【2026/09 根本改革】掲載する行は「Ace/King等が点灯した銘柄」ではなく、
+# 「監視銘柄の中でファンダメンタルズ評価が高い上位30件」に変更。テクニカル
+# シグナルは行を増やす基準ではなく、1列の参考情報(本日のテクニカル)として添える。
+signal_sets = {
+    "Ace": {t for _, t in ace_stocks_all},
+    "King": {t for _, t in king_stocks_all},
+    "ポリグラフ": {t for _, t in poly_stocks_all},
+    "Ace×BEP": {t for _, t in bep_stocks_all},
+}
+
+if MARKET == "US":
+    # 米国株はラジ株ナビ/Evy式の対象外のため、ファンダメンタルズ順位が作れない。
+    # 従来通りテクニカル点灯銘柄(重複除去)を上位30件まで掲載する。
+    _seen = set()
+    top_tickers = []
+    for _, _t in ace_stocks_all + king_stocks_all + poly_stocks_all + bep_stocks_all:
+        if _t not in _seen:
+            _seen.add(_t)
+            top_tickers.append(_t)
+        if len(top_tickers) >= TOP_FUNDAMENTAL_ROWS:
+            break
+else:
+    # 窓口Bのスコア(scoreValuation優先、同点はscoreTotal)で並べた_rankedを流用
+    top_tickers = [f"{code}.T" for code, _ in _ranked[:TOP_FUNDAMENTAL_ROWS]]
+
+write_to_spreadsheet(today, top_tickers, TICKER_NAME_MAP, fundamental_valuations, fundamental_commentaries, signal_sets)
