@@ -284,75 +284,102 @@ def get_fundamental_data(ticker):
     return fin, score
 
 # ============================================================
-# 一括スクリーニング(窓口B: screen_stocks)によるファンダメンタルズ一括取得
+# yfinanceベースのファンダメンタルズ取得(ラジ株ナビ依存を削減)
 # ============================================================
-# 【2026/09 根本改革】従来は「Ace/King等のテクニカルシグナルが点灯した銘柄だけ」に
-# ファンダメンタルズ(ラジ株判定・Evy式等)を後付けしていたが、これは株おじさん式の
-# 「ファンダメンタルズで良い会社を先に選び、その中でタイミングを見る」という方針と
-# 順序が逆になっていた。
+# 【2026/09 依存削減】ラジ株ナビは「1日100件まで」の共用クォータ(他プロジェクトとも共有)
+# のため、フジコだけで使い切るわけにいかない。evy_valuation/kabuojisan_valuation/
+# kabuojisan_health_scoreが実際に必要としているのは、ほとんどがEDINET由来の普通の
+# 財務数値(BPS・EPS・売上・EBITDA・時価総額等)と「現在株価」であり、これらはyfinanceの
+# .info から無料・無制限に近い形で取得できる。ラジ株ナビ固有の値(6軸スコア・独自の
+# 理想株価アルゴリズム)は代替できないため、yfinance側では作らず空のままにする。
 #
-# screen_stocks(窓口B)は get_stock_score 等の個別銘柄問い合わせ(窓口A、日次150リクエスト
-# 上限)とは別枠で、EDINETサマリーを一括検索するだけの仕組みのため日次上限を消費しない
-# (2026/08/31検証: 15回呼び出し・累計1,500銘柄超取得でも429なし)。
-# これを使い、監視銘柄"全体"に対して毎日ラジ株判定(verdict)・割安度スコアを一括取得する。
-SCREEN_STOCKS_PAGE_SIZE = 100
-SCREEN_STOCKS_MAX_PAGES = 45  # 全上場企業(約4000社)をカバーする想定の上限(4000/100+余裕)
-_screen_stocks_disabled = False  # 429が解消しない場合、以降の一括取得をスキップ
+# 既存のevy_valuation等の関数シグネチャ(fin_data, score_data)は変えず、
+# fin_data["fiscalYears"]・score_data["idealPrice"]["pseudoPrice"]等、
+# ラジ株ナビのレスポンス形式に合わせた"疑似データ"をyfinanceから組み立てて渡す。
+def get_fundamental_data_yfinance(ticker):
+    """yfinanceの.info等から、ラジ株ナビのget_edinet_financial_data/get_stock_scoreと
+    同じ形の(fin_data, score_data)を組み立てて返す。取得失敗時は(None, None)。
+    score_dataの6軸スコア(axes)は算出できないため空のまま(健全性スコア等は影響を受けない)。"""
+    try:
+        t = yf.Ticker(ticker)
+        info = t.info or {}
+        if not info or not info.get("currentPrice") and not info.get("regularMarketPrice"):
+            return None, None
 
-def get_screened_fundamentals(watchlist_codes):
-    """screen_stocks(窓口B)を使い、全上場企業のラジ株判定・割安度スコアをページングで
-    一括取得し、watchlist_codes(証券コード、".T"なしの文字列set)に含まれる銘柄分だけを
-    返す。戻り値: code(str, ".T"なし) → screen_stocksの1レコード(dict)。
-    watchlist_codesが空の場合は空dictを返す(全銘柄相手に回す必要はないため)。"""
-    global _screen_stocks_disabled
-    result = {}
-    if not watchlist_codes or SKIP_FUNDAMENTALS or not RADIKABUNAVI_API_KEY or _screen_stocks_disabled:
-        return result
-    remaining = set(watchlist_codes)
-    fields = ["per", "pbr", "roe", "equityRatio", "salesGrowth", "dividendYield",
-              "scoreTotal", "scoreValuation", "scoreProfitability", "scoreGrowth",
-              "scoreSafety", "scoreShareholderReturn", "scoreMoat",
-              "idealPriceMid", "alphaPct", "verdict", "marketCap"]
-    for page in range(SCREEN_STOCKS_MAX_PAGES):
-        if not remaining:
-            break
-        arguments = {
-            "conditions": [{"metric": "marketCap", "operator": ">=", "value": 1}],
-            "limit": SCREEN_STOCKS_PAGE_SIZE,
-            "offset": page * SCREEN_STOCKS_PAGE_SIZE,
-            "fields": fields,
+        current_price = info.get("currentPrice") or info.get("regularMarketPrice")
+        market_cap = info.get("marketCap")
+        eps_ttm = info.get("trailingEps")
+        eps_fwd = info.get("forwardEps")
+        bps = info.get("bookValue")
+        ebitda = info.get("ebitda")
+        total_debt = info.get("totalDebt")
+        total_cash = info.get("totalCash")
+        equity_ratio = None
+        de_ratio = info.get("debtToEquity")  # yfinanceは既に%表記(例: 45.2 = 45.2%)
+        net_sales = info.get("totalRevenue")
+        op_margin = info.get("operatingMargins")
+        op_income = (op_margin * net_sales) if (op_margin is not None and net_sales) else None
+        net_income = info.get("netIncomeToCommon")
+
+        # 自己資本比率は自前算出: 自己資本 ≒ 時価総額の簿価版が取れないため、
+        # totalDebtとdebtToEquityから逆算(equity = totalDebt / (debtToEquity/100))
+        if de_ratio and de_ratio > 0 and total_debt:
+            equity_approx = total_debt / (de_ratio / 100)
+            total_assets_approx = equity_approx + (total_debt or 0)
+            if total_assets_approx > 0:
+                equity_ratio = equity_approx / total_assets_approx * 100
+        else:
+            equity_approx = None
+
+        # fiscalYearsは1期分(最新期)だけを疑似的に用意する。
+        # 【制約】yfinanceの.infoは直近1期分の実績しか持たないため、BPS/EPSの
+        # 「5期推移(右肩上がりか)」判定はyfinanceだけでは行えない(1点のみ)。
+        # このため kabuojisan_health_score の bpsUp/epsUp チェックは、yfinance
+        # データでは常にスキップされる(判定項目が減るだけで、エラーにはしない)。
+        latest = {
+            "netSales": net_sales,
+            "operatingIncome": op_income,
+            "netIncome": net_income,
+            "eps": eps_ttm,
+            "bps": bps,
+            "ebitda": ebitda,
+            "marketCap": market_cap,
+            "interestBearingDebt": total_debt,
+            "netCash": (total_cash - total_debt) if (total_cash is not None and total_debt is not None) else None,
+            "equityRatio": equity_ratio,
+            "debtToEquityRatio": de_ratio,
+            "effectiveTaxRate": None,  # yfinanceに直接の項目なし。健全性スコア側は30%既定値にフォールバック
+            "equity": equity_approx,
         }
-        resp = radikabunavi_call_tool("screen_stocks", arguments)
-        if resp is None:
-            if _radikabunavi_disabled:
-                print("⏹️ screen_stocksが利用不可のため、一括ファンダメンタルズ取得を打ち切ります")
-                _screen_stocks_disabled = True
-            break
-        rows = resp.get("results") or resp.get("stocks") or resp.get("data") or []
-        if not isinstance(rows, list) or not rows:
-            break
-        for row in rows:
-            code = str(row.get("code") or row.get("securityCode") or "").strip()
-            if code and code in remaining:
-                result[code] = row
-                remaining.discard(code)
-        if len(rows) < SCREEN_STOCKS_PAGE_SIZE:
-            break  # 最終ページ
-    if remaining:
-        print(f"⚠️ screen_stocksで見つからなかった監視銘柄: {len(remaining)}件(上場廃止・データ欠損等の可能性)")
-    print(f"✅ 一括ファンダメンタルズ取得完了({len(result)}/{len(watchlist_codes)}銘柄、screen_stocksはクォータ消費なし)")
-    return result
+        fin_data = {"fiscalYears": {"latest": latest}}
 
-def _screened_row_to_valuation(row):
-    """screen_stocksの1レコードを、既存のvaluations辞書と同じ形の"radi"部分に変換する。"""
-    if not row:
-        return None
-    return {
-        "verdict": row.get("verdict"),
-        "alphaPct": row.get("alphaPct"),
-        "mid": row.get("idealPriceMid"),
-        "scoreTotal": row.get("scoreTotal"),
-    }
+        score_data = {
+            "sector": info.get("sector"),
+            "axes": {},  # ラジ株ナビ固有の6軸スコアは代替不可のため空
+            "idealPrice": {
+                "pseudoPrice": current_price,
+                "forecastEps": eps_fwd if (eps_fwd and eps_fwd > 0) else None,
+                "epsAnchor": eps_ttm if (eps_ttm and eps_ttm > 0) else None,
+                "verdict": None,
+                "alphaPct": None,
+            },
+        }
+        return fin_data, score_data
+    except Exception as e:
+        print(f"⚠️ yfinanceファンダメンタルズ取得失敗({ticker}): {e}")
+        return None, None
+
+# ============================================================
+# 【2026/09 撤回】窓口B(screen_stocks)による一括スクリーニング機能は削除した。
+# ============================================================
+# 2026/08/31の検証で「screen_stocksは日次クォータを消費しない」と判断していたが、
+# 2026/09/05の実際の日次実行で screen_stocks 自体が429(クォータ超過)を起こし、
+# 監視銘柄18件のうち0件しか評価できない不具合が発生した。さらにラジ株ナビは
+# 他プロジェクトとも共用の「1日100件まで」のAPIであることが判明したため、
+# 「screen_stocksは無料で使い放題」という前提そのものを撤回し、この一括取得機能
+# (get_screened_fundamentals/_screened_row_to_valuation)は削除した。
+# 代わりに、監視銘柄全体の評価はyfinanceベースの get_fundamental_data_yfinance で行う
+# (下記のファンダメンタルズ評価セクションを参照)。
 
 # ============================================================
 # Evy式バリュエーション(自前ロジック)
@@ -717,38 +744,50 @@ def generate_gemini_commentary(name, ticker, fin_data, score_data):
         return ""
 
 def build_fundamental_commentaries(tickers, ticker_name_map):
-    """点灯銘柄それぞれについてEDINETデータ+スコアを取得し、Gemini解説とバリュエーション情報を生成する。
+    """対象銘柄それぞれについて財務データ+スコアを取得し、Gemini解説とバリュエーション情報を生成する。
+    【2026/09 依存削減】ラジ株ナビは複数プロジェクト共用・日次100件までのため、
+    evy_valuation/kabuojisan_valuation/kabuojisan_health_score の計算に必要な財務データは
+    まずyfinanceから取得する(無料・上限なし)。ラジ株ナビは「6軸スコア・理想株価判定
+    (radi)」というyfinanceでは代替できない部分だけを、ラジ株ナビが利用可能な間だけ
+    補助的に取得する(利用不可/クォータ超過の場合は、evy式・株おじさん式・健全性スコアは
+    yfinanceデータだけで計算を続行し、radi判定だけが空欄になる)。
+
     戻り値: (commentaries, valuations)
       commentaries: ticker→コメント文字列
-      valuations: ticker→{radi: {verdict, alphaPct, ...}, evy: {fairPrice, discountPct, label, ...},
+      valuations: ticker→{radi: {verdict, alphaPct, ...}(ラジ株ナビ利用可能時のみ),
+                          evy: {fairPrice, discountPct, label, ...},
                           kabuojisan: {targetPrice, discountPct, label, ...},
                           kabuHealth: {passed, total, label, checks}}
     """
     commentaries = {}
     valuations = {}
-    if not RADIKABUNAVI_API_KEY:
-        print("⚠️ RADIKABUNAVI_API_KEY未設定 → ファンダメンタルズ解説をスキップ")
-        return commentaries, valuations
-    print(f"📚 ファンダメンタルズ解説+バリュエーション取得中({len(tickers)}銘柄)...")
+    print(f"📚 ファンダメンタルズ解説+バリュエーション取得中({len(tickers)}銘柄、まずyfinanceから)...")
     for ticker in tickers:
-        if _radikabunavi_disabled:
-            print("⏹️ ラジ株ナビが利用不可のため、残りの処理を打ち切ります")
-            break
         name = ticker_name_map.get(ticker, ticker)
-        fin, score = get_fundamental_data(ticker)
 
-        # --- バリュエーション情報を抽出 ---
+        # --- 財務データはyfinanceを基本とする(無料・上限なし) ---
+        fin, score = get_fundamental_data_yfinance(ticker)
+
+        # --- ラジ株ナビ固有の6軸スコア・理想株価判定(radi)は、利用可能な時だけ補助取得 ---
         val_info = {}
-        if score:
-            ip = score.get("idealPrice") or {}
-            val_info["radi"] = {
-                "verdict": ip.get("verdict"),
-                "alphaPct": ip.get("alphaPct"),
-                "mid": ip.get("mid"),
-                "pseudoPrice": ip.get("pseudoPrice"),
-            }
-            axes = score.get("axes") or {}
-            val_info["scores"] = axes
+        if RADIKABUNAVI_API_KEY and not _radikabunavi_disabled:
+            radi_fin, radi_score = get_fundamental_data(ticker)
+            if radi_score:
+                ip = radi_score.get("idealPrice") or {}
+                val_info["radi"] = {
+                    "verdict": ip.get("verdict"),
+                    "alphaPct": ip.get("alphaPct"),
+                    "mid": ip.get("mid"),
+                    "pseudoPrice": ip.get("pseudoPrice"),
+                }
+                axes = radi_score.get("axes") or {}
+                val_info["scores"] = axes
+                # ラジ株ナビ側に財務データが取れていれば、そちらの方が精度が高いため優先
+                if radi_fin:
+                    fin = radi_fin
+                if radi_score:
+                    score = radi_score
+
         evy = evy_valuation(fin, score)
         if evy:
             val_info["evy"] = evy
@@ -766,10 +805,8 @@ def build_fundamental_commentaries(tickers, ticker_name_map):
             comment = generate_gemini_commentary(name, ticker, fin, score)
             if comment:
                 commentaries[ticker] = comment
-        elif _gemini_disabled:
-            pass  # Geminiが停止済みでもバリュエーションは取得済みなので続行
 
-        time.sleep(4.5)
+        time.sleep(0.5)  # yfinance連続呼び出しの負荷軽減(ラジ株ナビのクォータ待機は不要になった)
     print(f"✅ 解説生成完了({len(commentaries)}/{len(tickers)}銘柄)、バリュエーション取得({len(valuations)}銘柄)")
     return commentaries, valuations
 # ============================================================
@@ -1565,63 +1602,71 @@ poly_stocks_all = [(f"・{TICKER_NAME_MAP.get(t, t)} {get_trend(df)}", t) for t,
 bep_stocks_all  = [(f"・{TICKER_NAME_MAP.get(t, t)} {get_trend(df)}", t) for t, df in combined_df.groupby("Ticker") if df["Ace_with_BEP_Start"].tail(3).any()]
 
 # ============================================================
-# ファンダメンタルズ評価(EDINET財務 + ラジ株スコア + Evy式)
+# ファンダメンタルズ評価(yfinance財務 + ラジ株スコア[補助] + Evy式)
 # ============================================================
-# 【2026/09 根本改革】株おじさん式の「ファンダメンタルズで良い会社を先に選び、その中で
-# タイミングを見る」という方針に合わせ、評価の起点をAce/King等のテクニカルシグナル
-# 点灯銘柄から、監視銘柄"全体"に変更した。2段階で構成する:
+# 【2026/09 依存削減】2026/09の「根本改革」時点では、screen_stocks(窓口B)を
+# 「クォータを消費しない一括取得」として監視銘柄全体に毎日使う設計にしていた。
+# しかし実際の日次実行(9/5)で、その screen_stocks 自体が429(クォータ超過)を
+# 起こし、監視銘柄18件のうち0件しか評価できないという不具合が発生した。
+# 加えて、ラジ株ナビは他プロジェクトとも共用の日次100件までのAPIであることが
+# 判明したため、「フジコが監視銘柄全体をラジ株ナビで一括評価する」という設計自体を
+# 撤回する。
 #
-#   窓口B(screen_stocks・クォータ消費なし): 監視銘柄"全体"に対して、ラジ株ナビの
-#     割安度判定(verdict)・各種スコアを毎日一括取得する。これにより監視銘柄である限り、
-#     テクニカルシグナルの有無に関わらずラジ株判定が埋まるようになる。
-#   窓口A(get_edinet_financial_data等・日次上限あり): 窓口Bのスコア(scoreValuation等)
-#     が高い上位銘柄"だけ"を対象に、Evy式・株おじさん式TSP・健全性スコアという
-#     フジコ独自の詳細計算まで深掘りする。「テクニカルで跳ねたから深掘りする」のではなく
-#     「ファンダメンタルズが良いから深掘りする」という順序に変更。
-#
-# ラジ株ナビ無料プランは窓口Aが1日150リクエスト、1銘柄につき2リクエスト消費するため
-# 深掘りできる上限は75銘柄。米国株は株おじさんの記事が日本株の銘柄選定手法のため対象外。
-RADIKABUNAVI_DAILY_LIMIT = 150
-CALLS_PER_TICKER = 2
-MAX_FUNDAMENTAL_TICKERS = RADIKABUNAVI_DAILY_LIMIT // CALLS_PER_TICKER
+# 新しい設計:
+#   ステップ1(yfinance、無料・上限なし): 監視銘柄"全体"に対して、evy_valuation・
+#     kabuojisan_valuation・kabuojisan_health_scoreをyfinanceデータだけで計算する
+#     (get_fundamental_data_yfinance)。ラジ株ナビは一切使わない。
+#   ステップ2(ラジ株ナビ、日次上限あり・他プロジェクトと共用): ステップ1の
+#     割安度(discountPct)が高い順の上位銘柄だけ、ラジ株ナビ固有の6軸スコア・
+#     理想株価判定(radi)で補助的に深掘りする。1銘柄2リクエスト消費、フジコの
+#     取り分として1日30銘柄(60リクエスト)を上限とする(他プロジェクトの分を
+#     圧迫しないよう、日次100件のうち一部だけを使う)。429が出た場合は
+#     即座に打ち切り、ステップ1(yfinance)の結果はそのまま活かす。
+FUJIKO_RADIKABUNAVI_DAILY_BUDGET = 30  # フジコの1日あたり深掘り件数(他プロジェクトとの共用に配慮)
 TOP_FUNDAMENTAL_ROWS = 30  # メインシートに掲載する、ファンダメンタルズ評価上位の件数
 
-_screened = {}
-_ranked = []
-
 if MARKET == "US":
-    print("⏭️ 米国株はラジ株ナビ/Evy式バリュエーションの対象外のためスキップします(日次クォータを日本株用に温存)")
+    print("⏭️ 米国株はEvy式/株おじさん式バリュエーションの対象外のためスキップします")
     fundamental_commentaries, fundamental_valuations = {}, {}
 else:
-    # --- 窓口B: 監視銘柄全体のラジ株判定を一括取得(クォータ消費なし) ---
+    # --- ステップ1: 監視銘柄全体をyfinanceで評価(ラジ株ナビ不使用、無料・上限なし) ---
     _watchlist_codes = {t.replace(".T", "") for t in _watchlist_tickers} if _watchlist_tickers else set()
-    _screened = get_screened_fundamentals(_watchlist_codes)
+    _eval_tickers = [f"{code}.T" for code in _watchlist_codes] if _watchlist_codes else list(target_stocks)
+    print(f"📐 監視銘柄全体をyfinanceで評価中({len(_eval_tickers)}銘柄、ラジ株ナビ不使用)...")
     fundamental_valuations = {}
-    for _code, _row in _screened.items():
-        _t = f"{_code}.T"
-        _radi = _screened_row_to_valuation(_row)
-        if _radi:
-            fundamental_valuations[_t] = {"radi": _radi, "scores": {
-                "valuation": _row.get("scoreValuation"),
-                "profitability": _row.get("scoreProfitability"),
-                "growth": _row.get("scoreGrowth"),
-                "safety": _row.get("scoreSafety"),
-                "shareholderReturn": _row.get("scoreShareholderReturn"),
-                "moat": _row.get("scoreMoat"),
-            }}
+    for _t in _eval_tickers:
+        _fin, _score = get_fundamental_data_yfinance(_t)
+        _v = {}
+        _evy = evy_valuation(_fin, _score)
+        if _evy:
+            _v["evy"] = _evy
+        _kabuojisan = kabuojisan_valuation(_fin, _score)
+        if _kabuojisan:
+            _v["kabuojisan"] = _kabuojisan
+        _kabu_health = kabuojisan_health_score(_fin, _score)
+        if _kabu_health:
+            _v["kabuHealth"] = _kabu_health
+        if _v:
+            fundamental_valuations[_t] = _v
+    print(f"✅ yfinance評価完了({len(fundamental_valuations)}/{len(_eval_tickers)}銘柄)")
 
-    # --- 窓口A: 窓口Bの割安度スコア(scoreValuation)が高い上位銘柄だけを深掘り ---
-    # (同点の場合はscoreTotalで補完的にソート)
-    _ranked = sorted(
-        _screened.items(),
-        key=lambda kv: (kv[1].get("scoreValuation") or 0, kv[1].get("scoreTotal") or 0),
-        reverse=True,
-    )
-    _deep_dive_tickers = [f"{code}.T" for code, _ in _ranked[:MAX_FUNDAMENTAL_TICKERS]]
-    if _deep_dive_tickers:
-        print(f"🔎 割安度スコア上位{len(_deep_dive_tickers)}銘柄をEvy式/株おじさん式で深掘り(窓口A)")
+    # --- ステップ2: yfinance評価の割安度(discountPct)が高い上位銘柄だけ、ラジ株ナビで補助深掘り ---
+    def _discount_pct(v):
+        evy = v.get("evy") or {}
+        kabuojisan = v.get("kabuojisan") or {}
+        vals = [x.get("discountPct") for x in (evy, kabuojisan) if x.get("discountPct") is not None]
+        return max(vals) if vals else -9999
+
+    _ranked = sorted(fundamental_valuations.items(), key=lambda kv: _discount_pct(kv[1]), reverse=True)
+    _deep_dive_tickers = [t for t, _ in _ranked[:FUJIKO_RADIKABUNAVI_DAILY_BUDGET]]
+    if _deep_dive_tickers and RADIKABUNAVI_API_KEY and not _radikabunavi_disabled:
+        print(f"🔎 割安度上位{len(_deep_dive_tickers)}銘柄をラジ株ナビで補助深掘り"
+              f"(1日{FUJIKO_RADIKABUNAVI_DAILY_BUDGET}銘柄まで、他プロジェクトとの共用に配慮)")
+    elif not RADIKABUNAVI_API_KEY or _radikabunavi_disabled:
+        print("⏭️ ラジ株ナビ未設定/利用不可のため、補助深掘りをスキップ(yfinance評価のみで続行)")
+        _deep_dive_tickers = []
     fundamental_commentaries, _deep_valuations = build_fundamental_commentaries(_deep_dive_tickers, TICKER_NAME_MAP)
-    # 深掘り結果(evy/kabuojisan/kabuHealth)を、窓口Bの結果にマージ(上書きではなく追加)
+    # 深掘り結果(radi/scores/evy/kabuojisan/kabuHealthの再計算)を、ステップ1の結果にマージ(上書き)
     for _t, _v in _deep_valuations.items():
         fundamental_valuations.setdefault(_t, {}).update(_v)
 
@@ -1711,7 +1756,7 @@ if MARKET == "US":
         if len(top_tickers) >= TOP_FUNDAMENTAL_ROWS:
             break
 else:
-    # 窓口Bのスコア(scoreValuation優先、同点はscoreTotal)で並べた_rankedを流用
-    top_tickers = [f"{code}.T" for code, _ in _ranked[:TOP_FUNDAMENTAL_ROWS]]
+    # yfinance評価の割安度(discountPct)で並べた_rankedを流用(_rankedは(ticker, valuation)のタプル、tickerは".T"付き)
+    top_tickers = [t for t, _ in _ranked[:TOP_FUNDAMENTAL_ROWS]]
 
 write_to_spreadsheet(today, top_tickers, TICKER_NAME_MAP, fundamental_valuations, fundamental_commentaries, signal_sets)
