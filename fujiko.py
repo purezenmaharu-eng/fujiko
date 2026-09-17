@@ -833,6 +833,14 @@ def chart_url(ticker):
     code = ticker.replace(".T", "")
     return f"https://www.tradingview.com/chart/?symbol=TSE%3A{code}"
 
+def yahoo_finance_url(ticker):
+    """銘柄ページへのリンク(Yahoo!ファイナンス)"""
+    if MARKET == "US":
+        symbol = ticker.replace(".T", "")
+        return f"https://finance.yahoo.com/quote/{symbol}/"
+    code = ticker.replace(".T", "")
+    return f"https://finance.yahoo.co.jp/quote/{code}.T"
+
 def write_to_spreadsheet(today, top_tickers, ticker_name_map, valuations=None, commentaries=None, signal_sets=None):
     """監視銘柄の中からファンダメンタルズ評価が高い順に選んだ上位銘柄(通常30件)を、
     日付ごとのシートに書き込む。
@@ -870,8 +878,8 @@ def write_to_spreadsheet(today, top_tickers, ticker_name_map, valuations=None, c
             ws = sh.add_worksheet(title=sheet_name, rows=500, cols=10)
             is_new_sheet = True
 
-        SHEET_HEADERS = ["日付", "銘柄名", "市場", "本日のテクニカル", "ラジ株判定", "Evy式適正価格", "Evy式割安率%",
-                         "株おじさん式理論株価", "株おじさん式割安率%", "株おじさん健全性", "解説", "チャート"]
+        SHEET_HEADERS = ["日付", "銘柄名", "市場", "本日のテクニカル", "Evy式適正価格", "Evy式割安率%",
+                         "株おじさん式理論株価", "株おじさん式割安率%", "株おじさん健全性", "解説", "チャート", "Yahoo!ファイナンス"]
         if is_new_sheet or ws.row_count == 0 or ws.cell(1, 1).value != "日付":
             _sheets_call_with_retry(ws.append_row, SHEET_HEADERS)
             # 見出し行を固定し、フィルタを設定
@@ -883,18 +891,18 @@ def write_to_spreadsheet(today, top_tickers, ticker_name_map, valuations=None, c
             # 列幅・折り返し・色分け・縞模様を一括設定(視認性向上)
             try:
                 sheet_id = ws.id
-                # 列インデックス(0始まり): 日付0 銘柄名1 市場2 本日のテクニカル3 ラジ株判定4 Evy適正価格5 Evy割安率6
-                #                          株おじさん理論株価7 株おじさん割安率8 株おじさん健全性9 解説10 チャート11
-                (COL_DATE, COL_NAME, COL_MARKET, COL_TECH, COL_RADI, COL_EVY_PRICE, COL_EVY_PCT,
-                 COL_KABU_PRICE, COL_KABU_PCT, COL_KABU_HEALTH, COL_COMMENT, COL_CHART) = range(12)
+                # 列インデックス(0始まり): 日付0 銘柄名1 市場2 本日のテクニカル3 Evy適正価格4 Evy割安率5
+                #                          株おじさん理論株価6 株おじさん割安率7 株おじさん健全性8 解説9 チャート10 Yahoo!ファイナンス11
+                (COL_DATE, COL_NAME, COL_MARKET, COL_TECH, COL_EVY_PRICE, COL_EVY_PCT,
+                 COL_KABU_PRICE, COL_KABU_PCT, COL_KABU_HEALTH, COL_COMMENT, COL_CHART, COL_YAHOO) = range(12)
                 requests = []
 
                 # --- 列幅の個別指定(自動リサイズだと解説列が広がりすぎるため固定) ---
                 col_widths = {
                     COL_DATE: 95, COL_NAME: 160, COL_MARKET: 90, COL_TECH: 130,
-                    COL_RADI: 130, COL_EVY_PRICE: 110, COL_EVY_PCT: 110,
+                    COL_EVY_PRICE: 110, COL_EVY_PCT: 110,
                     COL_KABU_PRICE: 130, COL_KABU_PCT: 130, COL_KABU_HEALTH: 130,
-                    COL_COMMENT: 340, COL_CHART: 110,
+                    COL_COMMENT: 340, COL_CHART: 110, COL_YAHOO: 110,
                 }
                 for col_idx, width in col_widths.items():
                     requests.append({
@@ -939,27 +947,6 @@ def write_to_spreadsheet(today, top_tickers, ticker_name_map, valuations=None, c
                         }
                     }
                 })
-
-                # --- 条件付き書式: ラジ株判定列(テキストに応じて色分け) ---
-                radi_range = {"sheetId": sheet_id, "startRowIndex": 1, "startColumnIndex": COL_RADI, "endColumnIndex": COL_RADI + 1}
-                for keyword, color in [
-                    ("超割安", {"red": 0.71, "green": 0.88, "blue": 0.71}),
-                    ("割安", {"red": 0.85, "green": 0.94, "blue": 0.85}),
-                    ("超割高", {"red": 0.96, "green": 0.71, "blue": 0.71}),
-                    ("割高", {"red": 0.98, "green": 0.85, "blue": 0.85}),
-                ]:
-                    requests.append({
-                        "addConditionalFormatRule": {
-                            "rule": {
-                                "ranges": [radi_range],
-                                "booleanRule": {
-                                    "condition": {"type": "TEXT_CONTAINS", "values": [{"userEnteredValue": keyword}]},
-                                    "format": {"backgroundColor": color},
-                                },
-                            },
-                            "index": 0,
-                        }
-                    })
 
                 # --- 条件付き書式: Evy式割安率%列(数値の正負で色分け) ---
                 evy_pct_range = {"sheetId": sheet_id, "startRowIndex": 1, "startColumnIndex": COL_EVY_PCT, "endColumnIndex": COL_EVY_PCT + 1}
@@ -1025,20 +1012,19 @@ def write_to_spreadsheet(today, top_tickers, ticker_name_map, valuations=None, c
         def _chart_link(ticker):
             return f'=HYPERLINK("{chart_url(ticker)}", "チャートを見る")'
 
+        def _yahoo_link(ticker):
+            return f'=HYPERLINK("{yahoo_finance_url(ticker)}", "Yahoo!ファイナンス")'
+
         def _valuation_cells(ticker):
-            """バリュエーション列の値を返す: [ラジ株判定, Evy式適正価格, Evy式割安率%,
+            """バリュエーション列の値を返す: [Evy式適正価格, Evy式割安率%,
             株おじさん式理論株価, 株おじさん式割安率%, 株おじさん健全性]
             データが無い項目は空文字ではなく「－」で埋め、シート上の見た目を統一する"""
             v = valuations.get(ticker)
             if not v:
-                return ["－", "－", "－", "－", "－", "－"]
-            radi = v.get("radi") or {}
+                return ["－", "－", "－", "－", "－"]
             evy = v.get("evy") or {}
             kabuojisan = v.get("kabuojisan") or {}
             kabu_health = v.get("kabuHealth") or {}
-            radi_label = radi.get("verdict") or "－"
-            if radi.get("verdict") and radi.get("alphaPct") is not None:
-                radi_label += f" ({radi['alphaPct']:+.1f}%)"
             evy_price = evy.get("fairPrice", "－")
             evy_discount = evy.get("discountPct", "－")
             kabu_price = kabuojisan.get("targetPrice", "－")
@@ -1046,7 +1032,7 @@ def write_to_spreadsheet(today, top_tickers, ticker_name_map, valuations=None, c
             kabu_health_label = "－"
             if kabu_health.get("label") is not None:
                 kabu_health_label = f"{kabu_health['label']}({kabu_health['passed']}/{kabu_health['total']})"
-            return [radi_label, evy_price, evy_discount, kabu_price, kabu_discount, kabu_health_label]
+            return [evy_price, evy_discount, kabu_price, kabu_discount, kabu_health_label]
 
         def _comment_cell(ticker):
             return commentaries.get(ticker) or "－"
@@ -1061,7 +1047,7 @@ def write_to_spreadsheet(today, top_tickers, ticker_name_map, valuations=None, c
             rows_to_write.append(
                 [today, name, get_market_label(ticker), _technical_tag(ticker)]
                 + _valuation_cells(ticker)
-                + [_comment_cell(ticker), _chart_link(ticker)]
+                + [_comment_cell(ticker), _chart_link(ticker), _yahoo_link(ticker)]
             )
         if rows_to_write:
             _sheets_call_with_retry(ws.append_rows, rows_to_write, value_input_option="USER_ENTERED")
