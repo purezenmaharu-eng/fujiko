@@ -33,6 +33,9 @@ FUNDAMENTAL_SCREEN_MAX_PAGES = 50  # 100件×50頁=最大5000銘柄まで走査(
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 GEMINI_MODEL = "gemini-3.1-flash-lite"
 
+# EDINET DB設定(スクリーニング補助。ラジ株ナビとは別サービス・別APIキー)
+EDINETDB_API_KEY = os.environ.get("EDINETDB_API_KEY", "")
+
 def _post_with_429_retry(url, label, max_retries=3, **kwargs):
     """429(レート制限)時に短時間だけリトライする。それでも解消しない場合は
     一時的な詰まりではなく日次/月次クォータ超過とみなし、呼び出し元で判断できるよう
@@ -294,6 +297,115 @@ def get_fundamental_data(ticker):
     })
     score = radikabunavi_call_tool("get_stock_score", {"code": code})
     return fin, score
+
+# ============================================================
+# EDINET DB(スクリーニング補助。ラジ株ナビとは別サービス・別APIキー)
+# ============================================================
+# 無料プランは100リクエスト/日までのため、日次全銘柄ループの中では絶対に呼ばない。
+# screen_fundamentally_sound_stocks()で絞り込まれた候補、またはディープダイブ対象
+# (_deep_dive_tickers)のような少数の候補リストに対してのみ、get_edinetdb_screening_hint()
+# で信用格付・信用スコア等の補助情報を取得する想定。
+EDINETDB_BASE_URL = "https://edinetdb.jp/v1"
+EDINETDB_DAILY_LIMIT = 100
+EDINETDB_DAILY_SAFE_MARGIN = int(EDINETDB_DAILY_LIMIT * 0.9)  # 安全マージンを取って90回/日でスキップ
+
+_edinetdb_disabled = False  # 401/403等で使用不可と判定したら以降スキップ
+
+def _edinetdb_request_count_path():
+    return os.path.join(_CACHE_DIR, f"edinetdb_request_count_{_CACHE_DATE}.json")
+
+def _edinetdb_get_request_count():
+    """本日のEDINET DBリクエスト回数を読み込む(ファイルが無ければ0)"""
+    path = _edinetdb_request_count_path()
+    if os.path.exists(path):
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                return int(json.load(f).get("count", 0))
+        except Exception:
+            pass
+    return 0
+
+def _edinetdb_increment_request_count():
+    """本日のEDINET DBリクエスト回数を1増やして保存する"""
+    count = _edinetdb_get_request_count() + 1
+    try:
+        os.makedirs(_CACHE_DIR, exist_ok=True)
+        with open(_edinetdb_request_count_path(), "w", encoding="utf-8") as f:
+            json.dump({"count": count}, f)
+    except Exception:
+        pass  # カウント書き込み失敗は無視(次回呼び出し時に0から再カウントされるだけ)
+    return count
+
+def _edinetdb_call(path, params=None):
+    """EDINET DB REST APIを呼び出す薄い関数。結果(dict)を返す。失敗時はNone。
+    同日のキャッシュがあればAPI・リクエスト数カウントを消費せずに再利用する。
+    日次リクエスト数がEDINETDB_DAILY_SAFE_MARGIN(無料プラン100回/日の90%)に
+    達したら、以降はAPIを呼ばずにスキップする。"""
+    global _edinetdb_disabled
+    if SKIP_FUNDAMENTALS:
+        return None
+    if not EDINETDB_API_KEY or _edinetdb_disabled:
+        return None
+    params = params or {}
+    # _cache_read/_cache_writeはtool_nameでキャッシュファイル名を作るため、pathを
+    # そのままtool_name代わりに流用する(スラッシュはアンダースコアに変換)
+    cache_tool_name = f"edinetdb_{path.strip('/').replace('/', '_')}"
+    cached = _cache_read(cache_tool_name, params)
+    if cached is not None:
+        return cached
+    request_count = _edinetdb_get_request_count()
+    if request_count >= EDINETDB_DAILY_SAFE_MARGIN:
+        print(f"⚠️ EDINET DB: 日次リクエスト数が上限({EDINETDB_DAILY_SAFE_MARGIN}/{EDINETDB_DAILY_LIMIT}回)に"
+              f"達したため、以降の呼び出しをスキップします")
+        return None
+    try:
+        resp = requests.get(
+            f"{EDINETDB_BASE_URL}{path}",
+            headers={"X-API-Key": EDINETDB_API_KEY},
+            params=params,
+            timeout=15,
+        )
+        _edinetdb_increment_request_count()
+        if resp.status_code in (401, 403):
+            print(f"❌ EDINET DB認証エラー({resp.status_code}) → 以降のEDINET DB取得をスキップします")
+            _edinetdb_disabled = True
+            return None
+        if resp.status_code == 404:
+            return None  # 対象コードが見つからない(非上場・データ未整備等)、エラーとはせず静かにNone
+        resp.raise_for_status()
+        # レスポンスがUTF-8であることを明示してデコードする(ヘッダのcharset指定に依存しない)
+        data = json.loads(resp.content.decode("utf-8"))
+        _cache_write(cache_tool_name, params, data)
+        return data
+    except Exception as e:
+        print(f"⚠️ EDINET DB呼び出し失敗({path}, {params}): {e}")
+        return None
+
+def get_edinetdb_screening_hint(code):
+    """絞り込み済みの少数の候補銘柄(4桁コード、.T有無どちらでも可)について、
+    EDINET DBの信用格付・信用スコアを補助情報として取得する。
+    【重要】日次の全銘柄ループの中では絶対に呼ばないこと。
+    screen_fundamentally_sound_stocks()で絞り込まれた候補、またはディープダイブ対象の
+    少数の候補リストに対してのみ呼び出す想定(1銘柄1リクエスト消費)。
+    戻り値: {"credit_rating": str, "credit_score": number, "listing_status": str}
+    または取得失敗時はNone"""
+    sec_code = str(code).replace(".T", "")
+    result = _edinetdb_call("/companies", {"sec_code": sec_code})
+    if not result:
+        return None
+    rows = result.get("data") or []
+    if not rows:
+        return None
+    row = rows[0]
+    credit_rating = row.get("credit_rating")
+    credit_score = row.get("credit_score")
+    if credit_rating is None and credit_score is None:
+        return None
+    return {
+        "credit_rating": credit_rating,
+        "credit_score": credit_score,
+        "listing_status": row.get("listing_status"),
+    }
 
 # ============================================================
 # yfinanceベースのファンダメンタルズ取得(ラジ株ナビ依存を削減)
@@ -1728,6 +1840,24 @@ else:
     # 深掘り結果(radi/scores/evy/kabuojisan/kabuHealthの再計算)を、ステップ1の結果にマージ(上書き)
     for _t, _v in _deep_valuations.items():
         fundamental_valuations.setdefault(_t, {}).update(_v)
+
+    # --- ステップ3: EDINET DB(補助、ラジ株ナビとは別サービス・日次100件の無料枠) ---
+    # 絞り込み済みのディープダイブ候補(_deep_dive_tickers)のみ対象。全銘柄ループでは呼ばない。
+    if _deep_dive_tickers and EDINETDB_API_KEY and not _edinetdb_disabled:
+        print(f"🔎 深掘り候補{len(_deep_dive_tickers)}銘柄をEDINET DBで補助確認"
+              f"(信用格付/信用スコア、日次{EDINETDB_DAILY_SAFE_MARGIN}回まで)")
+        for _t in _deep_dive_tickers:
+            _edinetdb_hint = get_edinetdb_screening_hint(_t)
+            if not _edinetdb_hint:
+                continue
+            fundamental_valuations.setdefault(_t, {})["edinetdb"] = _edinetdb_hint
+            _hint_text = f"EDINET DB信用:{_edinetdb_hint.get('credit_rating', '-')}({_edinetdb_hint.get('credit_score', '-')}点)"
+            if fundamental_commentaries.get(_t):
+                fundamental_commentaries[_t] += f" / {_hint_text}"
+            else:
+                fundamental_commentaries[_t] = _hint_text
+    elif not EDINETDB_API_KEY or _edinetdb_disabled:
+        print("⏭️ EDINET DB未設定/利用不可のため、補助確認をスキップ")
 
 # --- シグナル的中率トラッキング(バリュエーション情報付きで登録) ---
 print("\n📊 シグナル的中率トラッキング処理中...")
