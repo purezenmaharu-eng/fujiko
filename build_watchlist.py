@@ -404,16 +404,23 @@ def current_quarter_label():
     return f"{today.year}-Q{q}"
 
 
+def _load_sheets_credentials(raw_value, scopes):
+    """GOOGLE_SHEETS_CREDENTIALSを読む。
+    ローカル実行は鍵ファイルのパス、GitHub Actionsはsecretsの中身(JSON文字列)を
+    そのままenvに渡す運用のため、両方を許容する(中身が'{'で始まればJSON、それ以外はパス扱い)。"""
+    raw_value = raw_value.strip()
+    if raw_value.startswith("{"):
+        return Credentials.from_service_account_info(json.loads(raw_value), scopes=scopes)
+    return Credentials.from_service_account_file(raw_value, scopes=scopes)
+
+
 def _open_spreadsheet():
     creds_json = os.environ.get("GOOGLE_SHEETS_CREDENTIALS", "")
     spreadsheet_id = os.environ.get("SPREADSHEET_ID", "")
     if not creds_json or not spreadsheet_id:
         print("⚠️ スプレッドシート設定未完了")
         return None
-    creds_dict = json.loads(creds_json)
-    creds = Credentials.from_service_account_info(
-        creds_dict, scopes=["https://www.googleapis.com/auth/spreadsheets"]
-    )
+    creds = _load_sheets_credentials(creds_json, scopes=["https://www.googleapis.com/auth/spreadsheets"])
     gc = gspread.authorize(creds)
     return gc.open_by_key(spreadsheet_id)
 

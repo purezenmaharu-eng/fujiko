@@ -11,6 +11,16 @@ import gspread
 from google.oauth2.service_account import Credentials
 from datetime import date
 
+
+def _load_sheets_credentials(raw_value, scopes):
+    """GOOGLE_SHEETS_CREDENTIALSを読む。
+    ローカル実行は鍵ファイルのパス、GitHub Actionsはsecretsの中身(JSON文字列)を
+    そのままenvに渡す運用のため、両方を許容する(中身が'{'で始まればJSON、それ以外はパス扱い)。"""
+    raw_value = raw_value.strip()
+    if raw_value.startswith("{"):
+        return Credentials.from_service_account_info(json.loads(raw_value), scopes=scopes)
+    return Credentials.from_service_account_file(raw_value, scopes=scopes)
+
 # ============================================================
 # ラジ株ナビMCP設定 (EDINETベース財務データ・業績予想)
 # ============================================================
@@ -1034,11 +1044,7 @@ def write_to_spreadsheet(today, top_tickers, ticker_name_map, valuations=None, c
         if not creds_json or not spreadsheet_id:
             print("⚠️ スプレッドシート設定未完了")
             return
-        creds_dict = json.loads(creds_json)
-        creds = Credentials.from_service_account_info(
-            creds_dict,
-            scopes=["https://www.googleapis.com/auth/spreadsheets"]
-        )
+        creds = _load_sheets_credentials(creds_json, scopes=["https://www.googleapis.com/auth/spreadsheets"])
         gc = gspread.authorize(creds)
         sh = gc.open_by_key(spreadsheet_id)
         # --- 日付ごとに新しいシートを作成(見やすさ対策) ---
@@ -1360,11 +1366,7 @@ def run_signal_tracking(combined_df, ticker_name_map, valuations=None):
         print("⚠️ スプレッドシート設定未完了 → シグナル的中率トラッキングをスキップ")
         return None
     try:
-        creds_dict = json.loads(creds_json)
-        creds = Credentials.from_service_account_info(
-            creds_dict,
-            scopes=["https://www.googleapis.com/auth/spreadsheets"]
-        )
+        creds = _load_sheets_credentials(creds_json, scopes=["https://www.googleapis.com/auth/spreadsheets"])
         gc = gspread.authorize(creds)
         sh = gc.open_by_key(spreadsheet_id)
 
@@ -1456,10 +1458,7 @@ def get_watchlist_tickers():
         if not creds_json or not spreadsheet_id:
             print("⚠️ スプレッドシート設定未完了 → 監視銘柄リストを取得できません")
             return set()
-        creds_dict = json.loads(creds_json)
-        creds = Credentials.from_service_account_info(
-            creds_dict, scopes=["https://www.googleapis.com/auth/spreadsheets"]
-        )
+        creds = _load_sheets_credentials(creds_json, scopes=["https://www.googleapis.com/auth/spreadsheets"])
         gc = gspread.authorize(creds)
         sh = gc.open_by_key(spreadsheet_id)
         try:

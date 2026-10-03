@@ -9,6 +9,11 @@ import jquantsapi
 import gspread
 from google.oauth2.service_account import Credentials
 from datetime import date
+from pathlib import Path
+from dotenv import load_dotenv
+
+# スクリプトの場所を基準に.envを読み込む(タスクスケジューラ実行時のカレントディレクトリ不定対策)
+load_dotenv(Path(__file__).resolve().parent / ".env")
 
 # ============================================================
 # 131銘柄リスト
@@ -74,6 +79,16 @@ def send_line(message):
 # ============================================================
 # スプレッドシートへの履歴書き込み
 # ============================================================
+def _load_sheets_credentials(raw_value, scopes):
+    """GOOGLE_SHEETS_CREDENTIALSを読む。
+    ローカル実行は鍵ファイルのパス、GitHub Actionsはsecretsの中身(JSON文字列)を
+    そのままenvに渡す運用のため、両方を許容する(中身が'{'で始まればJSON、それ以外はパス扱い)。"""
+    raw_value = raw_value.strip()
+    if raw_value.startswith("{"):
+        return Credentials.from_service_account_info(json.loads(raw_value), scopes=scopes)
+    return Credentials.from_service_account_file(raw_value, scopes=scopes)
+
+
 def write_to_spreadsheet(today, ace_stocks, king_stocks, poly_stocks, bep_stocks):
     try:
         creds_json = os.environ.get("GOOGLE_SHEETS_CREDENTIALS", "")
@@ -81,11 +96,7 @@ def write_to_spreadsheet(today, ace_stocks, king_stocks, poly_stocks, bep_stocks
         if not creds_json or not spreadsheet_id:
             print("⚠️ スプレッドシート設定未完了")
             return
-        creds_dict = json.loads(creds_json)
-        creds = Credentials.from_service_account_info(
-            creds_dict,
-            scopes=["https://www.googleapis.com/auth/spreadsheets"]
-        )
+        creds = _load_sheets_credentials(creds_json, scopes=["https://www.googleapis.com/auth/spreadsheets"])
         gc = gspread.authorize(creds)
         sh = gc.open_by_key(spreadsheet_id)
         ws = sh.sheet1
