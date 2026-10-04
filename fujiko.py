@@ -11,6 +11,8 @@ import gspread
 from google.oauth2.service_account import Credentials
 from datetime import date
 
+import radikabu_usage_logger
+
 
 def _load_sheets_credentials(raw_value, scopes):
     """GOOGLE_SHEETS_CREDENTIALSを読む。
@@ -262,6 +264,7 @@ def radikabunavi_call_tool(tool_name, arguments):
         return cached
     # --- API呼び出し ---
     try:
+        radikabu_usage_logger.log_radikabu_usage(tool_name, arguments)
         _radikabunavi_ensure_session()
         result = _radikabunavi_request("tools/call", {
             "name": tool_name,

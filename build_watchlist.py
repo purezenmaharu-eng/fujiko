@@ -42,6 +42,8 @@ import jquantsapi
 import gspread
 from google.oauth2.service_account import Credentials
 
+import radikabu_usage_logger
+
 # ============================================================
 # ラジ株ナビMCP設定(fujiko.pyと同じ接続パターンを踏襲)
 # ============================================================
@@ -158,6 +160,7 @@ def radikabunavi_call_tool(tool_name, arguments):
     if cached is not None:
         return cached
     try:
+        radikabu_usage_logger.log_radikabu_usage(tool_name, arguments)
         _radikabunavi_ensure_session()
         result = _radikabunavi_request("tools/call", {
             "name": tool_name,
