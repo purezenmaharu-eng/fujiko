@@ -1,0 +1,111 @@
+//@version=6
+// フジコ REVE近似 v2 (+マルチプル・エクスパンション判定)
+indicator("Fujiko REVE近似 v2", shorttitle="REVE近似v2", overlay=false)
+
+costOfCapital = input.float(8.0, "資本コスト(%)", minval=0.0, step=0.5)
+qBars         = input.int(63, "1四半期の足数(日足)", minval=20)
+needStreak    = input.int(4, "REVE連続上昇(四半期)", minval=1)
+showTable     = input.bool(true, "情報テーブル表示")
+
+f_fin(id, per) => request.financial(syminfo.tickerid, id, per, ignore_invalid_symbol=true)
+
+rev   = f_fin("TOTAL_REVENUE", "FQ")
+ni    = f_fin("NET_INCOME", "FQ")
+ocf   = f_fin("CASH_F_OPERATING_ACTIVITIES", "FQ")
+capex = f_fin("CAPITAL_EXPENDITURE", "FQ")
+roe   = f_fin("RETURN_ON_EQUITY", "FQ")
+epsT  = f_fin("EARNINGS_PER_SHARE_DILUTED", "TTM")
+bvps  = f_fin("BOOK_VALUE_PER_SHARE", "FQ")
+
+fcf = ocf - math.abs(capex)
+
+f_prev4(src) =>
+    chg = not na(src) and src != src[1]
+    ta.valuewhen(chg, src, 4)
+
+f_yoy(src) =>
+    p = f_prev4(src)
+    na(p) or p == 0 ? na : (src - p) / math.abs(p)
+
+clip(x) => na(x) ? 0.0 : math.max(-1.0, math.min(2.0, x))
+
+revYoY = f_yoy(rev)
+niYoY  = f_yoy(ni)
+fcfYoY = f_yoy(fcf)
+roePrev = f_prev4(roe)
+roeChg  = na(roePrev) ? na : roe - roePrev
+
+score = 0.35 * clip(fcfYoY) + 0.25 * clip(revYoY) + 0.20 * clip(niYoY) + 0.20 * clip(na(roeChg) ? na : roeChg / 5.0 * 0.2)
+
+var float lastScore = na
+var int   streak    = 0
+finUpdated = not na(rev) and rev != rev[1]
+if finUpdated
+    if not na(lastScore) and score > lastScore
+        streak += 1
+    else
+        streak := 0
+    lastScore := score
+
+reveWeak   = streak >= needStreak and score >= 1.0
+reveStrong = streak >= needStreak and score >= 2.0
+
+per = not na(epsT) and epsT > 0 ? close / epsT : na
+pbr = not na(bvps) and bvps > 0 ? close / bvps : na
+perQ = ta.sma(per, qBars)
+pbrQ = ta.sma(pbr, qBars)
+
+perUp = perQ > perQ[qBars] and perQ[qBars] > perQ[qBars * 2]
+pbrUp = pbrQ > pbrQ[qBars] and pbrQ[qBars] > pbrQ[qBars * 2]
+roeOk = not na(roe) and roe > costOfCapital
+fcfOk = not na(fcf) and fcf > 0 and (na(fcfYoY) or fcfYoY > 0)
+
+meQuality = pbrUp and roeOk
+meSignal  = (perUp or meQuality) and fcfOk
+
+comboStrong = reveStrong and meSignal
+comboWeak   = (reveWeak and meSignal) and not comboStrong
+
+plot(score, "近似REVEスコア", color=color.orange, linewidth=2, style=plot.style_stepline)
+hline(1.0, "有効(1.0)", color=color.gray, linestyle=hline.style_dashed)
+hline(2.0, "強い(2.0)", color=color.green, linestyle=hline.style_dashed)
+hline(0.0, "0", color=color.new(color.gray, 70))
+
+bgcolor(comboStrong ? color.new(color.green, 75) : comboWeak ? color.new(color.teal, 85) : meSignal ? color.new(color.blue, 92) : na, title="シグナル背景")
+plotshape(comboStrong and not comboStrong[1], "総合(強)", shape.triangleup, location.bottom, color.green, size=size.small)
+plotshape(comboWeak and not comboWeak[1], "総合(弱)", shape.triangleup, location.bottom, color.teal, size=size.tiny)
+
+f_pct(x) => na(x) ? "－" : str.tostring(x * 100, "#.0") + "%"
+f_num(x) => na(x) ? "－" : str.tostring(x, "#.00")
+f_ok(b) => b ? "○" : "×"
+
+var table t = table.new(position.top_right, 2, 12, border_width=1)
+if showTable and barstate.islast
+    table.cell(t, 0, 0, "近似REVE", bgcolor=color.new(color.orange, 70))
+    table.cell(t, 1, 0, f_num(score), bgcolor=color.new(color.orange, 70))
+    table.cell(t, 0, 1, "連続上昇(Q)")
+    table.cell(t, 1, 1, str.tostring(streak))
+    table.cell(t, 0, 2, "売上YoY")
+    table.cell(t, 1, 2, f_pct(revYoY))
+    table.cell(t, 0, 3, "純利益YoY")
+    table.cell(t, 1, 3, f_pct(niYoY))
+    table.cell(t, 0, 4, "FCF YoY")
+    table.cell(t, 1, 4, f_pct(fcfYoY))
+    table.cell(t, 0, 5, "ROE / 変化")
+    table.cell(t, 1, 5, (na(roe) ? "－" : str.tostring(roe, "#.0") + "%") + " / " + (na(roeChg) ? "－" : str.tostring(roeChg, "#.0") + "pt"))
+    table.cell(t, 0, 6, "PER / 拡大")
+    table.cell(t, 1, 6, f_num(per) + " / " + f_ok(perUp))
+    table.cell(t, 0, 7, "PBR / 拡大")
+    table.cell(t, 1, 7, f_num(pbr) + " / " + f_ok(pbrUp))
+    table.cell(t, 0, 8, "ROE>資本コスト")
+    table.cell(t, 1, 8, f_ok(roeOk))
+    table.cell(t, 0, 9, "FCFプラス成長")
+    table.cell(t, 1, 9, f_ok(fcfOk))
+    table.cell(t, 0, 10, "マルチプル拡大")
+    table.cell(t, 1, 10, f_ok(meSignal), bgcolor=meSignal ? color.new(color.blue, 70) : na)
+    table.cell(t, 0, 11, "総合判定")
+    table.cell(t, 1, 11, comboStrong ? "強い買い候補" : comboWeak ? "買い候補" : "－", bgcolor=comboStrong ? color.new(color.green, 60) : comboWeak ? color.new(color.teal, 70) : na)
+
+alertcondition(meSignal and not meSignal[1], "マルチプル拡大 点灯", "{{ticker}}: マルチプル拡大シグナル点灯")
+alertcondition(comboWeak and not comboWeak[1], "総合 買い候補", "{{ticker}}: REVE近似+マルチプル拡大 買い候補")
+alertcondition(comboStrong and not comboStrong[1], "総合 強い買い候補", "{{ticker}}: REVE近似(強)+マルチプル拡大")
