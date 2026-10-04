@@ -74,6 +74,7 @@ jobs:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           GAS_URL: ${{ secrets.GAS_URL }}
           GAS_TOKEN: ${{ secrets.GAS_TOKEN }}
+          FUJIKO_CAPITAL: ${{ secrets.FUJIKO_CAPITAL }}
         run: |
           python fujiko.py
       - name: Run Fujiko script (US market)
@@ -85,5 +86,6 @@ jobs:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           GAS_URL: ${{ secrets.GAS_URL }}
           GAS_TOKEN: ${{ secrets.GAS_TOKEN }}
+          FUJIKO_CAPITAL: ${{ secrets.FUJIKO_CAPITAL }}
         run: |
           python fujiko.py

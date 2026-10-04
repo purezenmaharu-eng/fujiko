@@ -12,6 +12,19 @@ from google.oauth2.service_account import Credentials
 from datetime import date
 
 import radikabu_usage_logger
+import sizing
+
+try:  # ローカル実行時は .env を読む(GitHub Actionsでは環境変数/Secretsがそのまま入る)
+    from dotenv import load_dotenv
+    load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
+except ImportError:
+    pass
+
+# DRY_RUN=true: LINE送信・スプレッドシート書き込みをせず、送る内容だけログに出す
+DRY_RUN = os.environ.get("DRY_RUN", "").strip().lower() in ("1", "true", "yes")
+if DRY_RUN:
+    print("🧪 DRY_RUN=true → LINE送信・スプレッドシート書き込みは行いません(内容はログに表示)")
+FUJIKO_CAPITAL = sizing.get_capital()
 
 
 def _load_sheets_credentials(raw_value, scopes):
@@ -153,6 +166,9 @@ GAS_URL = os.environ.get("GAS_URL", "")
 GAS_TOKEN = os.environ.get("GAS_TOKEN", "")
 
 def send_line(message):
+    if DRY_RUN:
+        print("🧪 [DRY_RUN] LINE送信内容 ↓\n" + message + "\n🧪 [DRY_RUN] ここまで")
+        return
     if not GAS_URL:
         print("⚠️ GAS_URL未設定 → LINE通知スキップ")
         return
@@ -1039,7 +1055,7 @@ def yahoo_finance_url(ticker):
     code = ticker.replace(".T", "")
     return f"https://finance.yahoo.co.jp/quote/{code}.T"
 
-def write_to_spreadsheet(today, top_tickers, ticker_name_map, valuations=None, commentaries=None, signal_sets=None):
+def write_to_spreadsheet(today, top_tickers, ticker_name_map, valuations=None, commentaries=None, signal_sets=None, signal_infos=None):
     """監視銘柄の中からファンダメンタルズ評価が高い順に選んだ上位銘柄(通常30件)を、
     日付ごとのシートに書き込む。
     【2026/09 根本改革】以前はAce/King/Polygraph/BEPが点灯した銘柄"だけ"を並べていたため、
@@ -1054,6 +1070,10 @@ def write_to_spreadsheet(today, top_tickers, ticker_name_map, valuations=None, c
     commentaries = commentaries or {}
     valuations = valuations or {}
     signal_sets = signal_sets or {}
+    signal_infos = signal_infos or {}
+    if DRY_RUN:
+        print(f"🧪 [DRY_RUN] スプレッドシート書き込みスキップ(掲載予定{len(top_tickers)}銘柄)")
+        return
     try:
         creds_json = os.environ.get("GOOGLE_SHEETS_CREDENTIALS", "")
         spreadsheet_id = os.environ.get("SPREADSHEET_ID", "")
@@ -1073,7 +1093,8 @@ def write_to_spreadsheet(today, top_tickers, ticker_name_map, valuations=None, c
             is_new_sheet = True
 
         SHEET_HEADERS = ["日付", "銘柄名", "市場", "本日のテクニカル", "Evy式適正価格", "Evy式割安率%",
-                         "株おじさん式理論株価", "株おじさん式割安率%", "株おじさん健全性", "解説", "チャート", "Yahoo!ファイナンス"]
+                         "株おじさん式理論株価", "株おじさん式割安率%", "株おじさん健全性", "解説", "チャート", "Yahoo!ファイナンス",
+                         "推奨株数", "損切り損失額", "根拠・出どころ"]
         if is_new_sheet or ws.row_count == 0 or ws.cell(1, 1).value != "日付":
             _sheets_call_with_retry(ws.append_row, SHEET_HEADERS)
             # 見出し行を固定し、フィルタを設定
@@ -1088,7 +1109,8 @@ def write_to_spreadsheet(today, top_tickers, ticker_name_map, valuations=None, c
                 # 列インデックス(0始まり): 日付0 銘柄名1 市場2 本日のテクニカル3 Evy適正価格4 Evy割安率5
                 #                          株おじさん理論株価6 株おじさん割安率7 株おじさん健全性8 解説9 チャート10 Yahoo!ファイナンス11
                 (COL_DATE, COL_NAME, COL_MARKET, COL_TECH, COL_EVY_PRICE, COL_EVY_PCT,
-                 COL_KABU_PRICE, COL_KABU_PCT, COL_KABU_HEALTH, COL_COMMENT, COL_CHART, COL_YAHOO) = range(12)
+                 COL_KABU_PRICE, COL_KABU_PCT, COL_KABU_HEALTH, COL_COMMENT, COL_CHART, COL_YAHOO,
+                 COL_SHARES, COL_LOSS, COL_REASON) = range(15)
                 requests = []
 
                 # --- 列幅の個別指定(自動リサイズだと解説列が広がりすぎるため固定) ---
@@ -1097,6 +1119,7 @@ def write_to_spreadsheet(today, top_tickers, ticker_name_map, valuations=None, c
                     COL_EVY_PRICE: 110, COL_EVY_PCT: 110,
                     COL_KABU_PRICE: 130, COL_KABU_PCT: 130, COL_KABU_HEALTH: 130,
                     COL_COMMENT: 340, COL_CHART: 110, COL_YAHOO: 110,
+                    COL_SHARES: 110, COL_LOSS: 110, COL_REASON: 420,
                 }
                 for col_idx, width in col_widths.items():
                     requests.append({
@@ -1231,6 +1254,17 @@ def write_to_spreadsheet(today, top_tickers, ticker_name_map, valuations=None, c
         def _comment_cell(ticker):
             return commentaries.get(ticker) or "－"
 
+        def _sizing_cells(ticker):
+            """[推奨株数, 損切り損失額, 根拠・出どころ]。点灯シグナルが無い銘柄は株数のみ(直近終値・2ATR損切りで試算)"""
+            infos = signal_infos.get(ticker) or []
+            if not infos:
+                return ["－", "－", "シグナル非点灯(ファンダメンタルズ上位として掲載)"]
+            pos = infos[0]["pos"]
+            shares = "見送り" if pos["skip"] else pos["shares"]
+            loss = "－" if pos["skip"] else -round(pos["loss"])
+            reason = " / ".join(i["reason"] for i in infos) + f"【出どころ】{infos[0]['source']}"
+            return [shares, loss, reason]
+
         def _technical_tag(ticker):
             hit = [label for label, s in signal_sets.items() if ticker in s]
             return "/".join(hit) if hit else "－"
@@ -1242,6 +1276,7 @@ def write_to_spreadsheet(today, top_tickers, ticker_name_map, valuations=None, c
                 [today, name, get_market_label(ticker), _technical_tag(ticker)]
                 + _valuation_cells(ticker)
                 + [_comment_cell(ticker), _chart_link(ticker), _yahoo_link(ticker)]
+                + _sizing_cells(ticker)
             )
         if rows_to_write:
             _sheets_call_with_retry(ws.append_rows, rows_to_write, value_input_option="USER_ENTERED")
@@ -1268,6 +1303,7 @@ TRACKING_HEADERS = [
     "銘柄名", "ティッカー", "種別", "市場", "点灯日", "点灯日終値",
     "ラジ株判定", "Evy式割安率%",
     "ステータス", "判定日", "判定時終値", "騰落率%", "的中",
+    "推奨株数", "損切り損失額", "根拠・出どころ",  # 後ろに足す(判定結果の書き込み位置=9〜13列目を動かさないため)
 ]
 TRACKING_SIGNAL_COLUMNS = {
     "Ace_Start": "Ace",
@@ -1302,6 +1338,8 @@ def _tracking_register_new_signals(ws, combined_df, ticker_name_map, existing_ke
             evy = v.get("evy") or {}
             radi_label = radi.get("verdict", "")
             evy_discount = evy.get("discountPct", "")
+            info = sizing.build_signal_info(label, last_row, FUJIKO_CAPITAL)
+            pos = info["pos"]
             new_rows.append([
                 ticker_name_map.get(ticker, ticker),
                 ticker,
@@ -1312,6 +1350,9 @@ def _tracking_register_new_signals(ws, combined_df, ticker_name_map, existing_ke
                 radi_label,
                 evy_discount,
                 "追跡中", "", "", "", "",
+                "見送り" if pos["skip"] else pos["shares"],
+                "－" if pos["skip"] else -round(pos["loss"]),
+                f"{info['reason']}【出どころ】{info['source']}",
             ])
             existing_keys.add(key)
     if new_rows:
@@ -1376,6 +1417,9 @@ def _tracking_resolve_pending_signals(ws, combined_df, records):
 def run_signal_tracking(combined_df, ticker_name_map, valuations=None):
     """当日点灯シグナルの「追跡」シートへの新規登録と、10営業日経過分の的中判定確定を行う。
     戻り値: (新規登録件数, 判定確定件数, 的中件数)。スプレッドシート設定が無い場合はNone"""
+    if DRY_RUN:
+        print("🧪 [DRY_RUN] シグナル的中率トラッキング(追跡シート書き込み)をスキップ")
+        return None
     creds_json = os.environ.get("GOOGLE_SHEETS_CREDENTIALS", "")
     spreadsheet_id = os.environ.get("SPREADSHEET_ID", "")
     if not creds_json or not spreadsheet_id:
@@ -1401,6 +1445,15 @@ def run_signal_tracking(combined_df, ticker_name_map, valuations=None):
                 ws.columns_auto_resize(0, len(TRACKING_HEADERS) - 1)
             except Exception as e:
                 print(f"⚠️ 追跡シート書式設定に失敗(処理は継続): {e}")
+
+        elif ws.col_count < len(TRACKING_HEADERS) or ws.cell(1, len(TRACKING_HEADERS)).value != TRACKING_HEADERS[-1]:
+            # 既存の追跡シートに、後から足した列(推奨株数など)の見出しを補う
+            try:
+                if ws.col_count < len(TRACKING_HEADERS):
+                    ws.add_cols(len(TRACKING_HEADERS) - ws.col_count)
+                ws.update(range_name="N1:P1", values=[TRACKING_HEADERS[13:]])
+            except Exception as e:
+                print(f"⚠️ 追跡シートの見出し追加に失敗(処理は継続): {e}")
 
         existing_records = _sheets_call_with_retry(ws.get_all_records)
         existing_keys = {(r["ティッカー"], r["種別"], r["点灯日"]) for r in existing_records}
@@ -1622,9 +1675,12 @@ def calc_signals(combined_df, rsr_momentum_period=3):
     return pd.concat(results)
 
 def backtest(combined_df, signal_col, ticker_name_map,
-             atr_stop_mult=2.0, atr_profit_mult=4.0, max_hold_days=60, txn_cost_pct=0.2):
+             atr_stop_mult=2.0, atr_profit_mult=4.0, max_hold_days=60, txn_cost_pct=0.2,
+             trades_out=None):
+    """trades_out(list)を渡すと、1回ごとの取引(資金管理シミュレーション用)を追記する"""
     all_returns, ticker_stats = [], {}
     for ticker, df in combined_df.groupby("Ticker"):
+        dates = df.index
         df = df.reset_index(drop=True)
         sig_idx = np.where(df[signal_col] == True)[0]
         ticker_returns = []
@@ -1637,13 +1693,21 @@ def backtest(combined_df, signal_col, ticker_name_map,
             stop_loss_pct = -(atr_stop_mult * atr / buy_p) * 100
             take_profit_pct = (atr_profit_mult * atr / buy_p) * 100
             exited = False
+            exit_idx = None
             for i in range(entry_idx, min(entry_idx + max_hold_days, len(df))):
                 pnl = (df.iloc[i]["Close"] - buy_p) / buy_p * 100 - txn_cost_pct
                 if pnl <= stop_loss_pct or pnl >= take_profit_pct:
-                    all_returns.append(pnl); ticker_returns.append(pnl); exited = True; break
+                    all_returns.append(pnl); ticker_returns.append(pnl); exited = True; exit_idx = i; break
             if not exited:
-                pnl = (df.iloc[min(entry_idx + max_hold_days - 1, len(df)-1)]["Close"] - buy_p) / buy_p * 100 - txn_cost_pct
+                exit_idx = min(entry_idx + max_hold_days - 1, len(df)-1)
+                pnl = (df.iloc[exit_idx]["Close"] - buy_p) / buy_p * 100 - txn_cost_pct
                 all_returns.append(pnl); ticker_returns.append(pnl)
+            if trades_out is not None:
+                trades_out.append({
+                    "ticker": ticker, "entry_date": dates[entry_idx], "exit_date": dates[exit_idx],
+                    "entry_price": float(buy_p), "stop_price": float(buy_p - atr_stop_mult * atr),
+                    "pnl_pct": float(pnl),
+                })
         if ticker_returns:
             rets = np.array(ticker_returns)
             ticker_stats[ticker] = {
@@ -1738,9 +1802,23 @@ signal_labels = {
     "Ace_with_BEP_Start": "🅰️🐢 Ace×BEP同時",
 }
 rankings = {}
+bt_trades = {}
 for col, label in signal_labels.items():
     print(f"\n--- {label} ---")
-    rankings[col] = backtest(combined_df, col, TICKER_NAME_MAP)
+    bt_trades[col] = []
+    rankings[col] = backtest(combined_df, col, TICKER_NAME_MAP, trades_out=bt_trades[col])
+
+# --- 資金管理ルール(1%リスク・1銘柄20%上限・100株単位)で資金を動かした場合 ---
+print("\n" + "="*60)
+print(f"💴 資金管理バックテスト(資金{FUJIKO_CAPITAL:,.0f}円、1回の損失=資金の{sizing.RISK_PCT*100:.0f}%、1銘柄上限{sizing.MAX_POSITION_PCT*100:.0f}%)")
+print("="*60)
+_closes = {t: d["Close"] for t, d in combined_df.groupby("Ticker")}
+portfolio_results = {}
+for col, label in signal_labels.items():
+    r = sizing.simulate_portfolio(bt_trades[col], _closes, FUJIKO_CAPITAL)
+    portfolio_results[col] = r
+    print(f"  [{label}] 取引{r['n_trades']}件(見送り{r['n_skipped']}件) / 最終リターン:{r['final_return_pct']:+.2f}% / "
+          f"最大DD:{r['max_drawdown_pct']:.2f}% / シャープ(年率):{r['sharpe']:.2f} / 同時保有最大:{r['max_concurrent']}銘柄")
 
 # --- 優秀銘柄ランキング ---
 print("\n" + "="*60)
@@ -1772,6 +1850,22 @@ today = date.today().strftime("%Y/%m/%d")
 MARKET_LABEL = "🇺🇸 米国株" if MARKET == "US" else "🇯🇵 日本株"
 msg = f"📊 {today} フジコシグナル({MARKET_LABEL})\n"
 msg += "=" * 25 + "\n"
+
+# --- 根拠・推奨株数(シグナルごと。ティッカー→[情報]、ラベル別にも引けるようにする) ---
+signal_infos = {}          # ticker -> [info, ...]
+signal_info_by_label = {}  # (label, ticker) -> info
+for _col, _label in (("Ace_Start", "Ace"), ("King_Start", "King"),
+                     ("Polygraph_Start", "ポリグラフ"), ("Ace_with_BEP_Start", "Ace×BEP")):
+    for _t, _df in combined_df.groupby("Ticker"):
+        _recent = _df[_col].tail(3)
+        if not _recent.any():
+            continue
+        _sig_row = _df.loc[_recent[_recent].index[-1]]
+        if isinstance(_sig_row, pd.DataFrame):
+            _sig_row = _sig_row.iloc[-1]
+        _info = sizing.build_signal_info(_label, _df.iloc[-1], FUJIKO_CAPITAL, reason_row=_sig_row)
+        signal_infos.setdefault(_t, []).append(_info)
+        signal_info_by_label[(_label, _t)] = _info
 
 # --- 全件リスト(Web・スプレッドシート用) ---
 ace_stocks_all  = [(f"・{TICKER_NAME_MAP.get(t, t)} {get_trend(df)}", t) for t, df in combined_df.groupby("Ticker") if df["Ace_Start"].tail(3).any()]
@@ -1900,9 +1994,12 @@ def _valuation_tag(t):
         parts.append(f"健:{kabu_health['label']}{kabu_health['passed']}/{kabu_health['total']}")
     return f" [{'/'.join(parts)}]" if parts else ""
 
-def _line_format(t, df):
+def _line_format(t, df, label):
     base = f"{get_trend(df)} {TICKER_NAME_MAP.get(t, t)} [{get_market_label(t)}]"
     base += _valuation_tag(t)
+    info = signal_info_by_label.get((label, t))
+    if info:
+        base += f"\n   株数: {sizing.position_text(info['pos'])}\n   根拠: {info['reason']}"
     comment = fundamental_commentaries.get(t, "")
     if comment:
         short_comment = comment[:20] + ("…" if len(comment) > 20 else "")
@@ -1910,24 +2007,27 @@ def _line_format(t, df):
     return base
 
 ace_pairs  = [(t, df) for t, df in combined_df.groupby("Ticker") if df["Ace_Start"].tail(3).any()]
-ace_stocks = [_line_format(t, df) for t, df in ace_pairs[:20]]
+ace_stocks = [_line_format(t, df, "Ace") for t, df in ace_pairs[:20]]
 msg += f"\n🅰️ Ace点灯中({len(ace_pairs)}銘柄、上位{len(ace_stocks)}件表示)\n"
 msg += "\n".join(ace_stocks) if ace_stocks else "  (該当なし)"
 
 king_pairs  = [(t, df) for t, df in combined_df.groupby("Ticker") if df["King_Start"].tail(3).any()]
-king_stocks = [_line_format(t, df) for t, df in king_pairs[:20]]
+king_stocks = [_line_format(t, df, "King") for t, df in king_pairs[:20]]
 msg += f"\n\n👑 King点灯中({len(king_pairs)}銘柄、上位{len(king_stocks)}件表示)\n"
 msg += "\n".join(king_stocks) if king_stocks else "  (該当なし)"
 
 poly_pairs  = [(t, df) for t, df in combined_df.groupby("Ticker") if df["Polygraph_Start"].tail(3).any()]
-poly_stocks = [_line_format(t, df) for t, df in poly_pairs[:20]]
+poly_stocks = [_line_format(t, df, "ポリグラフ") for t, df in poly_pairs[:20]]
 msg += f"\n\n🎯 ポリグラフ点灯中({len(poly_pairs)}銘柄、上位{len(poly_stocks)}件表示)\n"
 msg += "\n".join(poly_stocks) if poly_stocks else "  (該当なし)"
 
 bep_pairs  = [(t, df) for t, df in combined_df.groupby("Ticker") if df["Ace_with_BEP_Start"].tail(3).any()]
-bep_stocks = [_line_format(t, df) for t, df in bep_pairs[:10]]
+bep_stocks = [_line_format(t, df, "Ace×BEP") for t, df in bep_pairs[:10]]
 msg += f"\n\n🅰️🐢 Ace×BEP同時({len(bep_pairs)}銘柄、上位{len(bep_stocks)}件表示)\n"
 msg += "\n".join(bep_stocks) if bep_stocks else "  (該当なし)"
+
+msg += f"\n\n💴 資金{FUJIKO_CAPITAL:,.0f}円・1回の損失は資金の1%・1銘柄は資金の20%まで(100株単位)"
+msg += f"\n📎 出どころ: {sizing.DATA_SOURCE_TEXT}"
 
 if tracking_result:
     _new_count, _resolved_count, _hit_count = tracking_result
@@ -1964,4 +2064,14 @@ else:
     # yfinance評価の割安度(discountPct)で並べた_rankedを流用(_rankedは(ticker, valuation)のタプル、tickerは".T"付き)
     top_tickers = [t for t, _ in _ranked[:TOP_FUNDAMENTAL_ROWS]]
 
-write_to_spreadsheet(today, top_tickers, TICKER_NAME_MAP, fundamental_valuations, fundamental_commentaries, signal_sets)
+write_to_spreadsheet(today, top_tickers, TICKER_NAME_MAP, fundamental_valuations, fundamental_commentaries, signal_sets, signal_infos)
+
+# --- docs/ のHTML(GitHub Pages用)。日本株の実行時だけ更新する(米国株の実行で上書きしない) ---
+if MARKET != "US":
+    import report_html
+    _html_path = report_html.write_report(
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), "docs", "backtest.html"),
+        today=today, capital=FUJIKO_CAPITAL, signal_labels=signal_labels,
+        portfolio_results=portfolio_results, rankings=rankings, signal_infos=signal_infos,
+        name_map=TICKER_NAME_MAP)
+    print(f"✅ HTML出力: {_html_path}")
