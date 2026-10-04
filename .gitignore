@@ -14,3 +14,6 @@ venv/
 
 # Claude Code local settings (may contain permission entries with secrets)
 .claude/settings.local.json
+
+# REVE近似のJ-Quantsキャッシュ
+.cache_reve/
