@@ -35,7 +35,10 @@ fcfYoY = f_yoy(fcf)
 roePrev = f_prev4(roe)
 roeChg  = na(roePrev) ? na : roe - roePrev
 
-score = 0.35 * clip(fcfYoY) + 0.25 * clip(revYoY) + 0.20 * clip(niYoY) + 0.20 * clip(na(roeChg) ? na : roeChg / 5.0 * 0.2)
+roeG = na(roeChg) ? na : roeChg / 5.0 * 0.2
+wSum = (na(fcfYoY) ? 0.0 : 0.35) + (na(revYoY) ? 0.0 : 0.25) + (na(niYoY) ? 0.0 : 0.20) + (na(roeG) ? 0.0 : 0.20)
+rawScore = 0.35 * clip(fcfYoY) + 0.25 * clip(revYoY) + 0.20 * clip(niYoY) + 0.20 * clip(roeG)
+score = wSum > 0 ? rawScore / wSum : na
 
 var float lastScore = na
 var int   streak    = 0
@@ -58,7 +61,7 @@ pbrQ = ta.sma(pbr, qBars)
 perUp = perQ > perQ[qBars] and perQ[qBars] > perQ[qBars * 2]
 pbrUp = pbrQ > pbrQ[qBars] and pbrQ[qBars] > pbrQ[qBars * 2]
 roeOk = not na(roe) and roe > costOfCapital
-fcfOk = not na(fcf) and fcf > 0 and (na(fcfYoY) or fcfYoY > 0)
+fcfOk = na(fcf) ? true : (fcf > 0 and (na(fcfYoY) or fcfYoY > 0))
 
 meQuality = pbrUp and roeOk
 meSignal  = (perUp or meQuality) and fcfOk
@@ -81,8 +84,8 @@ f_ok(b) => b ? "○" : "×"
 
 var table t = table.new(position.top_right, 2, 12, border_width=1)
 if showTable and barstate.islast
-    table.cell(t, 0, 0, "近似REVE", bgcolor=color.new(color.orange, 70))
-    table.cell(t, 1, 0, f_num(score), bgcolor=color.new(color.orange, 70))
+    table.cell(t, 0, 0, "近似REVE", bgcolor=color.new(color.orange, 70), text_size=size.normal)
+    table.cell(t, 1, 0, f_num(score), bgcolor=color.new(color.orange, 70), text_size=size.normal)
     table.cell(t, 0, 1, "連続上昇(Q)")
     table.cell(t, 1, 1, str.tostring(streak))
     table.cell(t, 0, 2, "売上YoY")
@@ -100,7 +103,7 @@ if showTable and barstate.islast
     table.cell(t, 0, 8, "ROE>資本コスト")
     table.cell(t, 1, 8, f_ok(roeOk))
     table.cell(t, 0, 9, "FCFプラス成長")
-    table.cell(t, 1, 9, f_ok(fcfOk))
+    table.cell(t, 1, 9, na(fcf) ? "－(除外)" : f_ok(fcfOk))
     table.cell(t, 0, 10, "マルチプル拡大")
     table.cell(t, 1, 10, f_ok(meSignal), bgcolor=meSignal ? color.new(color.blue, 70) : na)
     table.cell(t, 0, 11, "総合判定")
