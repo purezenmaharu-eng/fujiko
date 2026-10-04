@@ -39,7 +39,26 @@ FUNDAMENTAL_SCREEN_ENABLED = True
 FUNDAMENTAL_MIN_SCORE_TOTAL = 60
 FUNDAMENTAL_ACCEPTABLE_VERDICTS = ["超割安", "割安", "適正"]
 FUNDAMENTAL_SCREEN_PAGE_LIMIT = 100
-FUNDAMENTAL_SCREEN_MAX_PAGES = 50  # 100件×50頁=最大5000銘柄まで走査(全上場企業をカバー可能)
+FUNDAMENTAL_SCREEN_MAX_PAGES = 10  # 100件×10頁=最大1000銘柄(scoreTotal降順なので上位を優先)。日次100回の共用枠に収めるため50→10
+# 1回の実行あたりのラジ株ナビ呼び出し合計(窓口A+窓口B、キャッシュ命中は数えない)の上限
+RADIKABUNAVI_RUN_BUDGET = 40
+_radikabunavi_call_count = 0  # 実際にAPIへ送信したtools/call回数
+# キー空などでファンダメンタルズ事前フィルタが適用されない場合の注記(出力に付ける)
+FILTER_UNAPPLIED_NOTE = "※事前フィルタ未適用"
+_filter_unapplied = False
+RADIKABUNAVI_KEY_EMPTY_WARNING = "ラジ株ナビのキーが空です。ファンダメンタルズ事前フィルタは適用されません"
+
+
+def check_radikabu_key_at_start():
+    """実行の最初にキーが空なら目立つ警告を出し、出力用の注記フラグを立てる。判定ロジックは変えない"""
+    global _filter_unapplied
+    if RADIKABUNAVI_API_KEY:
+        return False
+    _filter_unapplied = True
+    print("=" * 60)
+    print(f"🚨🚨 警告: {RADIKABUNAVI_KEY_EMPTY_WARNING} 🚨🚨")
+    print("=" * 60)
+    return True
 
 # Gemini設定 (ファンダメンタルズ解説コメント生成)
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
@@ -253,7 +272,7 @@ def _cache_write(tool_name, arguments, data):
 def radikabunavi_call_tool(tool_name, arguments):
     """ラジ株ナビMCPのツールを呼び出し、結果(dict)を返す。失敗時はNone。
     同日のキャッシュがあればAPIを呼ばずに再利用する。"""
-    global _radikabunavi_disabled
+    global _radikabunavi_disabled, _radikabunavi_call_count
     if SKIP_FUNDAMENTALS:
         return None
     if not RADIKABUNAVI_API_KEY or _radikabunavi_disabled:
@@ -262,8 +281,13 @@ def radikabunavi_call_tool(tool_name, arguments):
     cached = _cache_read(tool_name, arguments)
     if cached is not None:
         return cached
+    # --- 実行あたりの合計予算(窓口A+B) ---
+    if _radikabunavi_call_count >= RADIKABUNAVI_RUN_BUDGET:
+        print(f"⏭️ ラジ株ナビ: 予算上限に達したため省略({tool_name}, 上限{RADIKABUNAVI_RUN_BUDGET}回/実行)")
+        return None
     # --- API呼び出し ---
     try:
+        _radikabunavi_call_count += 1
         radikabu_usage_logger.log_radikabu_usage(tool_name, arguments)
         _radikabunavi_ensure_session()
         result = _radikabunavi_request("tools/call", {
@@ -1242,7 +1266,10 @@ def write_to_spreadsheet(today, top_tickers, ticker_name_map, valuations=None, c
         _king_n = len(signal_sets.get("King", set()))
         _poly_n = len(signal_sets.get("ポリグラフ", set()))
         _bep_n = len(signal_sets.get("Ace×BEP", set()))
-        _sheets_call_with_retry(ws_summary.append_row, [today, _ace_n, _king_n, _poly_n, _bep_n, MARKET])
+        _summary_row = [today, _ace_n, _king_n, _poly_n, _bep_n, MARKET]
+        if _filter_unapplied and MARKET != "US":
+            _summary_row.append(FILTER_UNAPPLIED_NOTE)
+        _sheets_call_with_retry(ws_summary.append_row, _summary_row)
 
         print(f"✅ スプレッドシート書き込み完了({len(rows_to_write)}銘柄)")
     except Exception as e:
@@ -1685,6 +1712,7 @@ else:
     # ファンダメンタルズが良好な銘柄のみ技術シグナル(Ace/King/黒猫法等)の計算対象に絞り込む。
     # 個別深掘り用のget_stock_score/get_ideal_price/get_dcf_valuation(窓口A、150リクエスト制限あり)
     # はここでは使わず、シグナル点灯銘柄の詳細解説(build_fundamental_commentaries)専用に温存する。
+    check_radikabu_key_at_start()
     fundamentals_map = screen_fundamentally_sound_stocks()
     if fundamentals_map:
         _before_count = len(target_stocks)
@@ -1692,6 +1720,7 @@ else:
         print(f"📉 ファンダメンタルズ事前フィルタ適用: {_before_count}銘柄 → {len(target_stocks)}銘柄に絞り込み")
     else:
         print("⚠️ ファンダメンタルズ事前フィルタ未適用(取得失敗またはキー未設定) → 全銘柄で技術シグナル判定")
+        _filter_unapplied = True
 
 print("🚀 データダウンロード開始...")
 df_bench = yf.download(BENCH, start=START, end=END, auto_adjust=True, progress=False)
@@ -1766,6 +1795,8 @@ print("\n📱 LINE通知送信中...")
 today = date.today().strftime("%Y/%m/%d")
 MARKET_LABEL = "🇺🇸 米国株" if MARKET == "US" else "🇯🇵 日本株"
 msg = f"📊 {today} フジコシグナル({MARKET_LABEL})\n"
+if _filter_unapplied and MARKET != "US":
+    msg = f"{FILTER_UNAPPLIED_NOTE}\n" + msg
 msg += "=" * 25 + "\n"
 
 # --- 全件リスト(Web・スプレッドシート用) ---
@@ -1795,7 +1826,7 @@ bep_stocks_all  = [(f"・{TICKER_NAME_MAP.get(t, t)} {get_trend(df)}", t) for t,
 #     取り分として1日30銘柄(60リクエスト)を上限とする(他プロジェクトの分を
 #     圧迫しないよう、日次100件のうち一部だけを使う)。429が出た場合は
 #     即座に打ち切り、ステップ1(yfinance)の結果はそのまま活かす。
-FUJIKO_RADIKABUNAVI_DAILY_BUDGET = 30  # フジコの1日あたり深掘り件数(他プロジェクトとの共用に配慮)
+FUJIKO_RADIKABUNAVI_DAILY_BUDGET = 15  # フジコの1日あたり深掘り件数(他プロジェクトとの共用に配慮)
 TOP_FUNDAMENTAL_ROWS = 30  # メインシートに掲載する、ファンダメンタルズ評価上位の件数
 
 if MARKET == "US":
