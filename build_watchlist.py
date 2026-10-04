@@ -30,6 +30,7 @@
 Polygraph/BEPのスキャン対象をこのリストに限定する(fujiko.py側の対応は別途実施)。
 """
 import os
+import sys
 import json
 import time
 import hashlib
@@ -49,12 +50,17 @@ import radikabu_usage_logger
 # ============================================================
 RADIKABUNAVI_MCP_URL = "https://radikabunavi.com/mcp"
 RADIKABUNAVI_API_KEY = os.environ.get("RADIKABUNAVI_API_KEY", "")
-RADIKABUNAVI_DAILY_LIMIT = 150
+RADIKABUNAVI_DAILY_LIMIT = 50  # 日次枠100回に収めるため、1回の実行で呼ぶ上限は50回
 CALLS_PER_TICKER = 1  # build_watchlistはget_edinet_financial_dataのみ呼ぶ(get_stock_scoreは呼ばない)
 MAX_FSCORE_TICKERS = RADIKABUNAVI_DAILY_LIMIT // CALLS_PER_TICKER
 
 _radikabunavi_session_id = None
 _radikabunavi_disabled = False
+_radikabunavi_call_count = 0  # 実際にAPIへ送信したtools/call回数(キャッシュ命中は数えない)
+
+
+class RadikabuKeyMissingError(RuntimeError):
+    """RADIKABUNAVI_API_KEYが未設定(空)のときに送出する。取得失敗(None)と区別するため。"""
 
 _CACHE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".cache")
 _CACHE_DATE = date.today().strftime("%Y-%m-%d")
@@ -153,13 +159,16 @@ def _cache_write(tool_name, arguments, data):
 
 def radikabunavi_call_tool(tool_name, arguments):
     """ラジ株ナビMCPのツールを呼び出し、結果(dict)を返す。失敗時はNone。"""
-    global _radikabunavi_disabled
-    if not RADIKABUNAVI_API_KEY or _radikabunavi_disabled:
+    global _radikabunavi_disabled, _radikabunavi_call_count
+    if not RADIKABUNAVI_API_KEY:
+        raise RadikabuKeyMissingError("RADIKABUNAVI_API_KEYが未設定(空)です")
+    if _radikabunavi_disabled:
         return None
     cached = _cache_read(tool_name, arguments)
     if cached is not None:
         return cached
     try:
+        _radikabunavi_call_count += 1
         radikabu_usage_logger.log_radikabu_usage(tool_name, arguments)
         _radikabunavi_ensure_session()
         result = _radikabunavi_request("tools/call", {
@@ -382,7 +391,7 @@ def calc_f_score(fin_data):
 # スプレッドシート構成
 # ============================================================
 # 「監視銘柄_作業用」タブ: 流動性+長期トレンドを通過した候補全件を保持する作業台帳。
-#   Fスコア判定はクォータ制約(150件/日)により複数日に分けて進めるため、
+#   Fスコア判定はクォータ制約(50件/回)により複数日に分けて進めるため、
 #   「済み」列で処理状況を管理し、四半期の初回実行で候補を書き込んだ後、
 #   翌日以降の実行では未処理分だけを追加でFスコア判定していく。
 # 「監視銘柄」タブ: 全候補のFスコア判定が完了した時点で、合格銘柄のみを書き出す最終成果物。
@@ -580,9 +589,9 @@ def score_pending_candidates(ws, records):
 
     print(f"📚 Fスコア判定中: 未処理{len(pending_indices)}件のうち最大{MAX_FSCORE_TICKERS}件を処理します")
     updates = {}
-    processed = 0
+    called = 0  # 実際にAPIを呼んだ銘柄数(上限のカウント対象。キャッシュ命中は数えない)
     for idx in pending_indices:
-        if processed >= MAX_FSCORE_TICKERS:
+        if called >= MAX_FSCORE_TICKERS:
             break
         if _radikabunavi_disabled:
             print("⏹️ ラジ株ナビが利用不可のため、残りのFスコア判定を打ち切ります(次回実行で継続)")
@@ -591,13 +600,17 @@ def score_pending_candidates(ws, records):
         code = str(rec.get("銘柄コード", "")).strip()
         if not code:
             continue
+        calls_before = _radikabunavi_call_count
         fin = radikabunavi_call_tool("get_edinet_financial_data", {
             "code": code,
             "metrics": ["roa", "cashFlowFromOperations", "netIncome", "debtToEquityRatio",
                         "currentRatio", "sharesOutstanding", "grossProfitMargin", "assetTurnover"],
         })
+        called += _radikabunavi_call_count - calls_before
+        if fin is None:
+            # 取得失敗(通信エラー・APIエラー・打ち切り等)は未処理のまま残し、次回の実行でやり直す
+            continue
         f_score = calc_f_score(fin)
-        processed += 1
         if not f_score:
             # データ不足で判定不能な銘柄は「済み」にして再処理を避け、不合格扱いにする
             updates[idx] = {"済み": "TRUE", "Fスコア": "－", "Fスコア達成率%": "－", "判定": "不合格(データ不足)"}
@@ -621,6 +634,10 @@ def score_pending_candidates(ws, records):
 # ============================================================
 def main():
     print("🔍 監視銘柄リスト構築を開始します(株おじさん式・四半期実行・複数日分割処理対応)")
+    if not RADIKABUNAVI_API_KEY:
+        # 空キーのまま全候補を「データ不足」で確定してしまうのを防ぐため、シートに触れる前に止める
+        print("❌ RADIKABUNAVI_API_KEYが未設定(空)です。スプレッドシートには何も書き込まずに終了します")
+        sys.exit(1)
     quarter = current_quarter_label()
 
     sh = _open_spreadsheet()
