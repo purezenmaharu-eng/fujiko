@@ -5,6 +5,7 @@ indicator("Fujiko REVE近似 v2", shorttitle="REVE近似v2", overlay=false)
 costOfCapital = input.float(8.0, "資本コスト(%)", minval=0.0, step=0.5)
 qBars         = input.int(63, "1四半期の足数(日足)", minval=20)
 needStreak    = input.int(4, "REVE連続上昇(四半期)", minval=1)
+watchStreak   = input.int(2, "監視候補の連続上昇(四半期)", minval=1)
 showTable     = input.bool(true, "情報テーブル表示")
 
 f_fin(id, per) => request.financial(syminfo.tickerid, id, per, ignore_invalid_symbol=true)
@@ -74,15 +75,18 @@ meSignal  = (perUp or meQuality) and fcfOk
 
 comboStrong = reveStrong and meSignal
 comboWeak   = (reveWeak and meSignal) and not comboStrong
+comboWatch  = streak >= watchStreak and score >= 1.0 and meSignal and not comboWeak and not comboStrong
 
 plot(score, "近似REVEスコア", color=color.orange, linewidth=2, style=plot.style_stepline)
 hline(1.0, "有効(1.0)", color=color.gray, linestyle=hline.style_dashed)
 hline(2.0, "強い(2.0)", color=color.green, linestyle=hline.style_dashed)
 hline(0.0, "0", color=color.new(color.gray, 70))
 
-bgcolor(comboStrong ? color.new(color.green, 75) : comboWeak ? color.new(color.teal, 85) : meSignal ? color.new(color.blue, 92) : na, title="シグナル背景")
+bgcolor(comboStrong ? color.new(color.green, 75) : comboWeak ? color.new(color.teal, 85) : comboWatch ? color.new(color.yellow, 88) : meSignal ? color.new(color.blue, 92) : na, title="シグナル背景")
 plotshape(comboStrong and not comboStrong[1], "総合(強)", shape.triangleup, location.bottom, color.green, size=size.small)
 plotshape(comboWeak and not comboWeak[1], "総合(弱)", shape.triangleup, location.bottom, color.teal, size=size.tiny)
+
+plotshape(comboWatch and not comboWatch[1], "監視候補", shape.circle, location.bottom, color.yellow, size=size.tiny)
 
 f_pct(x) => na(x) ? "－" : str.tostring(x * 100, "#.0") + "%"
 f_num(x) => na(x) ? "－" : str.tostring(x, "#.00")
@@ -113,8 +117,9 @@ if showTable and barstate.islast
     table.cell(t, 0, 10, "マルチプル拡大")
     table.cell(t, 1, 10, f_ok(meSignal), bgcolor=meSignal ? color.new(color.blue, 70) : na)
     table.cell(t, 0, 11, "総合判定")
-    table.cell(t, 1, 11, comboStrong ? "強い買い候補" : comboWeak ? "買い候補" : "－", bgcolor=comboStrong ? color.new(color.green, 60) : comboWeak ? color.new(color.teal, 70) : na)
+    table.cell(t, 1, 11, comboStrong ? "強い買い候補" : comboWeak ? "買い候補" : comboWatch ? "監視候補" : "－", bgcolor=comboStrong ? color.new(color.green, 60) : comboWeak ? color.new(color.teal, 70) : comboWatch ? color.new(color.yellow, 70) : na)
 
 alertcondition(meSignal and not meSignal[1], "マルチプル拡大 点灯", "{{ticker}}: マルチプル拡大シグナル点灯")
 alertcondition(comboWeak and not comboWeak[1], "総合 買い候補", "{{ticker}}: REVE近似+マルチプル拡大 買い候補")
+alertcondition(comboWatch and not comboWatch[1], "監視候補", "{{ticker}}: REVE近似 監視候補（スコア1.0以上・連続上昇途中・マルチプル拡大）")
 alertcondition(comboStrong and not comboStrong[1], "総合 強い買い候補", "{{ticker}}: REVE近似(強)+マルチプル拡大")
