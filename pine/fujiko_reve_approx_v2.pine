@@ -84,8 +84,8 @@ f_ok(b) => b ? "○" : "×"
 
 var table t = table.new(position.top_right, 2, 12, border_width=1)
 if showTable and barstate.islast
-    table.cell(t, 0, 0, "近似REVE", bgcolor=color.new(color.orange, 70), text_size=size.normal)
-    table.cell(t, 1, 0, f_num(score), bgcolor=color.new(color.orange, 70), text_size=size.normal)
+    table.cell(t, 0, 0, "近似REVE", bgcolor=color.new(color.orange, 70), text_color=color.white, text_size=size.normal)
+    table.cell(t, 1, 0, f_num(score), bgcolor=color.new(color.orange, 70), text_color=color.white, text_size=size.normal)
     table.cell(t, 0, 1, "連続上昇(Q)")
     table.cell(t, 1, 1, str.tostring(streak))
     table.cell(t, 0, 2, "売上YoY")
