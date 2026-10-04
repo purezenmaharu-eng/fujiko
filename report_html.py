@@ -44,7 +44,8 @@ def _svg_equity(series_by_label, capital, width=760, height=300):
     return "".join(parts) + f"<div class='legend'>{legend}</div>"
 
 
-def render(today, capital, signal_labels, portfolio_results, rankings, signal_infos, name_map):
+def render(today, capital, signal_labels, portfolio_results, rankings, signal_infos, name_map,
+           bench_result=None, bench_label='1306.T', yearly_results=None):
     rows = []
     for col, label in signal_labels.items():
         r = portfolio_results[col]
@@ -53,6 +54,23 @@ def render(today, capital, signal_labels, portfolio_results, rankings, signal_in
             f"<tr><td>{html.escape(label)}</td><td>{r['n_trades']}</td><td>{r['n_skipped']}</td>"
             f"<td>{r['final_return_pct']:+.2f}%</td><td>{r['max_drawdown_pct']:.2f}%</td>"
             f"<td>{r['sharpe']:.2f}</td><td>{r['max_concurrent']}</td></tr>")
+    if bench_result:
+        a, b = bench_result["period"]
+        rows.append(
+            f"<tr><td>{html.escape(bench_label)}買い持ち(TOPIX連動ETF)<br><small>{a:%Y-%m-%d}〜{b:%Y-%m-%d}</small></td>"
+            f"<td>－</td><td>－</td><td>{bench_result['final_return_pct']:+.2f}%</td>"
+            f"<td>{bench_result['max_drawdown_pct']:.2f}%</td><td>{bench_result['sharpe']:.2f}</td><td>1</td></tr>")
+    yearly_html = ""
+    if yearly_results:
+        yr = []
+        for col, buckets in yearly_results.items():
+            for name, m in buckets.items():
+                cells = ("<td colspan='2'>取引なし</td>" if m is None else
+                         f"<td>{m['final_return_pct']:+.2f}%</td><td>{m['sharpe']:.2f}</td>")
+                yr.append(f"<tr><td>{html.escape(signal_labels[col])}</td><td>{html.escape(name)}</td>{cells}</tr>")
+        yearly_html = ("<h2>年ごとの成績(Ace・King)</h2><div class='wrap'><table><thead><tr><th>シグナル</th><th>期間</th>"
+                       "<th>最終リターン</th><th>シャープレシオ(年率)</th></tr></thead><tbody>" + "".join(yr) +
+                       "</tbody></table></div><p class='muted'>各年の初日直前の資産を基準にした年内の値。</p>")
     curve = _svg_equity({signal_labels[c]: portfolio_results[c]["equity"] for c in signal_labels}, capital)
 
     sig_rows = []
@@ -89,6 +107,7 @@ th:first-child,td:first-child,td.reason,th:last-child{{text-align:left}}.muted,s
 <div class="wrap"><table><thead><tr><th>シグナル</th><th>取引数</th><th>見送り</th><th>最終リターン</th><th>最大ドローダウン</th><th>シャープレシオ(年率)</th><th>同時保有最大</th></tr></thead><tbody>
 {''.join(rows)}
 </tbody></table></div>
+{yearly_html}
 <p class="muted">資金は実現損益で複利に増減。同一銘柄の重複保有・現金不足・100株未満は見送り。シャープは日次資産の変化率×√252。過去の結果であり将来を保証しません。</p>
 <h2>直近3日以内に点灯したシグナルと推奨株数</h2>
 <div class="wrap">{sig_table}</div>

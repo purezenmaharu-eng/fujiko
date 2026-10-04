@@ -160,3 +160,41 @@ reason_row: 点灯日の行(直近3日以内の点灯日が最終日と違う場
     pos = calc_position(close, stop, capital) if stop is not None else calc_position(None, None, capital)
     return {"label": label, "entry": close, "stop": stop, "pos": pos,
             "reason": build_signal_reason(label, row if reason_row is None else reason_row), "source": DATA_SOURCE_TEXT}
+
+
+# ---- 比較用: 買い持ち・期間別の指標 ----
+def equity_metrics(eq, base):
+    """日次資産Series eq と開始時の基準額 base から (最終リターン%, 最大DD%, 年率シャープ)"""
+    if eq is None or len(eq) == 0:
+        return {"final_return_pct": 0.0, "max_drawdown_pct": 0.0, "sharpe": 0.0}
+    full = pd.concat([pd.Series([float(base)]), eq.reset_index(drop=True)], ignore_index=True)
+    rets = eq.pct_change()
+    rets.iloc[0] = eq.iloc[0] / base - 1
+    sharpe = float(rets.mean() / rets.std() * np.sqrt(252)) if len(rets) > 1 and rets.std() > 0 else 0.0
+    return {"final_return_pct": float((eq.iloc[-1] / base - 1) * 100),
+            "max_drawdown_pct": float(((full / full.cummax()) - 1).min() * 100),
+            "sharpe": sharpe}
+
+
+def buy_and_hold(close, capital, start, end):
+    """start〜end の終値で買い持ちした場合の指標(start日の終値で全額買い)"""
+    c = close.loc[start:end].dropna()
+    # データ異常(例: 1306.Tの2026/3/30-31は他の日の約1/10で配信される)を、前後5日の中央値から
+    # 半分未満/2倍超に外れた日として除外する
+    med = c.rolling(5, center=True, min_periods=3).median()
+    c = c[(c / med > 0.5) & (c / med < 2)]
+    if len(c) < 2:
+        return equity_metrics(None, capital)
+    eq = capital * c / c.iloc[0]
+    return equity_metrics(eq.iloc[1:], capital)
+
+
+def period_metrics(eq, year_from, year_to=None):
+    """資産推移を年で区切った指標。区間の直前日の資産を基準にする。取引期間が無ければ None"""
+    year_to = year_to or 9999
+    sel = eq[(eq.index.year >= year_from) & (eq.index.year <= year_to)]
+    if len(sel) < 2:
+        return None
+    prev = eq[eq.index < sel.index[0]]
+    base = float(prev.iloc[-1]) if len(prev) else float(sel.iloc[0])
+    return equity_metrics(sel if len(prev) else sel.iloc[1:], base)

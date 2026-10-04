@@ -113,5 +113,28 @@ class SimulatePortfolioTest(unittest.TestCase):
         self.assertEqual(r["n_trades"], 0)
 
 
+class BenchmarkTest(unittest.TestCase):
+    def test_buy_and_hold(self):
+        idx = pd.bdate_range("2024-01-01", periods=4)
+        close = pd.Series([100, 120, 90, 110], index=idx)
+        m = sizing.buy_and_hold(close, 1_000_000, idx[0], idx[-1])
+        self.assertAlmostEqual(m["final_return_pct"], 10.0)
+        self.assertAlmostEqual(m["max_drawdown_pct"], -25.0)
+
+    def test_buy_and_hold_drops_bad_bars(self):
+        idx = pd.bdate_range("2024-01-01", periods=8)
+        close = pd.Series([100, 101, 102, 10.2, 10.3, 103, 104, 110.0], index=idx)
+        m = sizing.buy_and_hold(close, 1_000_000, idx[0], idx[-1])
+        self.assertAlmostEqual(m["final_return_pct"], 10.0)
+        self.assertGreater(m["max_drawdown_pct"], -5)
+
+    def test_period_metrics_split_by_year(self):
+        idx = pd.to_datetime(["2023-12-28", "2023-12-29", "2024-01-04", "2024-01-05"])
+        eq = pd.Series([100.0, 110.0, 99.0, 121.0], index=idx)
+        m24 = sizing.period_metrics(eq, 2024, 2024)
+        self.assertAlmostEqual(m24["final_return_pct"], 10.0)   # 110 → 121
+        self.assertIsNone(sizing.period_metrics(eq, 2025))
+
+
 if __name__ == "__main__":
     unittest.main()

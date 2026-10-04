@@ -1820,6 +1820,24 @@ for col, label in signal_labels.items():
     print(f"  [{label}] 取引{r['n_trades']}件(見送り{r['n_skipped']}件) / 最終リターン:{r['final_return_pct']:+.2f}% / "
           f"最大DD:{r['max_drawdown_pct']:.2f}% / シャープ(年率):{r['sharpe']:.2f} / 同時保有最大:{r['max_concurrent']}銘柄")
 
+# --- 比較: TOPIX連動ETF(1306)を同じ期間で買い持ちした場合 / 年ごとの成績 ---
+_eqs = [r["equity"] for r in portfolio_results.values() if len(r["equity"])]
+bench_result, yearly_results = None, {}
+if _eqs:
+    _p_start, _p_end = min(e.index[0] for e in _eqs), max(e.index[-1] for e in _eqs)
+    bench_result = sizing.buy_and_hold(bench_close, FUJIKO_CAPITAL, _p_start, _p_end)
+    bench_result["period"] = (_p_start, _p_end)
+    print(f"  [{BENCH}買い持ち {_p_start:%Y-%m-%d}〜{_p_end:%Y-%m-%d}] 最終リターン:{bench_result['final_return_pct']:+.2f}% / "
+          f"最大DD:{bench_result['max_drawdown_pct']:.2f}% / シャープ(年率):{bench_result['sharpe']:.2f}")
+YEAR_BUCKETS = [("2023年", 2023, 2023), ("2024年", 2024, 2024), ("2025年以降", 2025, None)]
+for _col in ("Ace_Start", "King_Start"):
+    yearly_results[_col] = {}
+    for _name, _y0, _y1 in YEAR_BUCKETS:
+        _m = sizing.period_metrics(portfolio_results[_col]["equity"], _y0, _y1)
+        yearly_results[_col][_name] = _m
+        _txt = "取引なし" if _m is None else f"最終リターン:{_m['final_return_pct']:+.2f}% / シャープ(年率):{_m['sharpe']:.2f}"
+        print(f"  [{signal_labels[_col]} {_name}] {_txt}")
+
 # --- 優秀銘柄ランキング ---
 print("\n" + "="*60)
 print("🏆 優秀銘柄ランキング TOP10 (Ace_Start基準)")
@@ -2072,6 +2090,7 @@ if MARKET != "US":
     _html_path = report_html.write_report(
         os.path.join(os.path.dirname(os.path.abspath(__file__)), "docs", "backtest.html"),
         today=today, capital=FUJIKO_CAPITAL, signal_labels=signal_labels,
-        portfolio_results=portfolio_results, rankings=rankings, signal_infos=signal_infos,
+        portfolio_results=portfolio_results, bench_result=bench_result, bench_label=BENCH,
+        yearly_results=yearly_results, rankings=rankings, signal_infos=signal_infos,
         name_map=TICKER_NAME_MAP)
     print(f"✅ HTML出力: {_html_path}")
