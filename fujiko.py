@@ -1823,6 +1823,13 @@ else:
             fundamental_valuations[_t] = _v
     print(f"✅ yfinance評価完了({len(fundamental_valuations)}/{len(_eval_tickers)}銘柄)")
 
+    # --- REVE近似(フェーズ1: ログのみ。LINE/シートには出さない) ---
+    try:
+        from reve import run_reve_phase1
+        reve_results = run_reve_phase1(_eval_tickers, TICKER_NAME_MAP)
+    except Exception as e:
+        print(f"⚠️ REVE近似の評価をスキップ: {e}")
+
     # --- ステップ2: yfinance評価の割安度(discountPct)が高い上位銘柄だけ、ラジ株ナビで補助深掘り ---
     def _discount_pct(v):
         evy = v.get("evy") or {}
