@@ -7,7 +7,8 @@ dexter-kabu-jp・investor-agent・fujikoはRADIKABUNAVI_API_KEYを共用して�
 両方から共用する。
 
 出力先:
-  - ローカル実行: C:\\Users\\admin\\radikabu-usage.log に追記
+  - ローカル実行: C:\\Users\\admin\\hub\\logs\\radikabu-usage.log に追記
+    (環境変数 RADIKABU_USAGE_LOG が設定されていればそのパスを優先)
   - GitHub Actions / Cloud Run: 標準出力に `[RADIKABU]` から始まる1行
 """
 from __future__ import annotations
@@ -16,7 +17,7 @@ import os
 from datetime import datetime, timedelta, timezone
 
 PROJECT_NAME = "fujiko"
-LOCAL_LOG_PATH = r"C:\Users\admin\radikabu-usage.log"
+LOCAL_LOG_PATH = os.environ.get("RADIKABU_USAGE_LOG") or r"C:\Users\admin\hub\logs\radikabu-usage.log"
 _JST = timezone(timedelta(hours=9))
 
 
