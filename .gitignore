@@ -15,5 +15,8 @@ venv/
 # Claude Code local settings (may contain permission entries with secrets)
 .claude/settings.local.json
 
+# MCP config (contains API keys)
+.mcp.json
+
 # REVE近似のJ-Quantsキャッシュ
 .cache_reve/
