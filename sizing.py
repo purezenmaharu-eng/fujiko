@@ -110,6 +110,9 @@ def simulate_portfolio(trades, closes, capital, lot=LOT_SIZE):
         value = cash
         for p in open_pos:
             s = closes[p["ticker"]]
+            if not s.index.is_unique or not s.index.is_monotonic_increasing:
+                s = s[~s.index.duplicated(keep="last")].sort_index()   # 重複日付で落ちないよう念のため
+                closes[p["ticker"]] = s
             c = s.loc[:day].iloc[-1] if day >= s.index[0] else p["entry_price"]
             value += p["cost"] * (float(c) / p["entry_price"])
         equity.append(value)

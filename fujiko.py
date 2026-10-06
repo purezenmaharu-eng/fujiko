@@ -1766,12 +1766,19 @@ print("🚀 データダウンロード開始...")
 df_bench = yf.download(BENCH, start=START, end=END, auto_adjust=True, progress=False)
 if isinstance(df_bench.columns, pd.MultiIndex):
     df_bench.columns = df_bench.columns.get_level_values(0)
+df_bench = df_bench[~df_bench.index.duplicated(keep="last")].sort_index()
 bench_close = df_bench["Close"]
 
 all_results, failed = [], []
 for ticker in target_stocks:
     try:
         df_s = yf.download(ticker, start=START, end=END, auto_adjust=True, progress=False)
+        if isinstance(df_s.columns, pd.MultiIndex):
+            df_s.columns = df_s.columns.get_level_values(0)
+        # yfinanceが同じ日付を2行返すことがある(2026/10/05に資金管理バックテストがKeyErrorで停止)。
+        # 重複日付は最後の行を残し、終値が欠けた行も除く(平均リターンがnan%になる原因にもなる)
+        df_s = df_s[~df_s.index.duplicated(keep="last")].sort_index()
+        df_s = df_s.dropna(subset=["Close"])
         if len(df_s) < 250:
             failed.append((ticker, "データ不足")); continue
         df_c = calculate_base_indicators(df_s)
