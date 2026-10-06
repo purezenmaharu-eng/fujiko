@@ -1169,7 +1169,7 @@ def write_to_spreadsheet(today, top_tickers, ticker_name_map, valuations=None, c
                 evy_pct_range = {"sheetId": sheet_id, "startRowIndex": 1, "startColumnIndex": COL_EVY_PCT, "endColumnIndex": COL_EVY_PCT + 1}
                 for condition_type, threshold, color in [
                     ("NUMBER_GREATER_THAN_EQ", 20, {"red": 0.85, "green": 0.94, "blue": 0.85}),
-                    ("NUMBER_LESS_THAN", -10, {"red": 0.98, "green": 0.85, "blue": 0.85}),
+                    ("NUMBER_LESS", -10, {"red": 0.98, "green": 0.85, "blue": 0.85}),
                 ]:
                     requests.append({
                         "addConditionalFormatRule": {
@@ -1188,7 +1188,7 @@ def write_to_spreadsheet(today, top_tickers, ticker_name_map, valuations=None, c
                 kabu_pct_range = {"sheetId": sheet_id, "startRowIndex": 1, "startColumnIndex": COL_KABU_PCT, "endColumnIndex": COL_KABU_PCT + 1}
                 for condition_type, threshold, color in [
                     ("NUMBER_GREATER_THAN_EQ", 20, {"red": 0.85, "green": 0.94, "blue": 0.85}),
-                    ("NUMBER_LESS_THAN", -10, {"red": 0.98, "green": 0.85, "blue": 0.85}),
+                    ("NUMBER_LESS", -10, {"red": 0.98, "green": 0.85, "blue": 0.85}),
                 ]:
                     requests.append({
                         "addConditionalFormatRule": {
