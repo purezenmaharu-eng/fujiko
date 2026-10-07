@@ -1724,380 +1724,384 @@ def backtest(combined_df, signal_col, ticker_name_map,
         print(f"  [{signal_col}] シグナル発生なし")
     return pd.DataFrame.from_dict(ticker_stats, orient="index")
 
-# ============================================================
-# メイン実行
-# ============================================================
-START = "2023-01-01"
-END   = (date.today() + pd.Timedelta(days=1)).strftime("%Y-%m-%d")
-BENCH = "^GSPC" if MARKET == "US" else "1306.T"
-
-_watchlist_tickers = set()
-if MARKET == "US":
-    target_stocks, TICKER_NAME_MAP = get_us_tickers()
-else:
-    target_stocks, TICKER_NAME_MAP = get_all_tickers(TICKER_NAME_MAP)
-    # --- 監視銘柄リストによる絞り込み(株おじさん式: フジコはタイミング計測のみに使う) ---
-    # 米国株は対象外(株おじさんの記事は日本株の銘柄選定手法のため、米国株は従来通り全銘柄スキャン)
-    # 【2026/09 根本改革】以前は監視銘柄が100銘柄未満の間、絞り込みを見送って全銘柄
-    # スキャンにフォールバックしていた。しかしこれは「ファンダメンタルズで選ばれた
-    # 会社だけをタイミング判定の対象にする」という株おじさん式の原則を、監視銘柄数
-    # 次第で日によって有効/無効が入れ替わる不安定な状態にしてしまっていた。
-    # 常に監視銘柄だけを対象にする(監視銘柄が少ない日は、対象が少ないままでよい)。
-    _watchlist_tickers = get_watchlist_tickers()
-    if _watchlist_tickers:
-        _before_count = len(target_stocks)
-        target_stocks = [t for t in target_stocks if t in _watchlist_tickers]
-        print(f"🎯 監視銘柄リストで絞り込み: {_before_count}銘柄 → {len(target_stocks)}銘柄"
-              f"(build_watchlist.pyが選別した株おじさん式監視銘柄のみを対象にスキャン。"
-              f"全銘柄へのフォールバックは廃止済み)")
-        if not target_stocks:
-            print("⚠️ 監視銘柄リストとJ-Quantsティッカー一覧の突合結果が0件です。"
-                  "本日のシグナルは0件になります(quarterly_watchlist.ymlの進捗を確認してください)")
-    else:
-        print("⚠️ 監視銘柄リストが空/未構築のため、本日のシグナルは0件になります"
-              "(build_watchlist.pyを四半期ワークフローで実行すると監視銘柄が構築されます)")
-
-    # --- ファンダメンタルズ事前フィルタ(screen_stocks=窓口B)は廃止 ---
-    # ラジ株ナビは日次100回の共用枠で、キーが空・429のときにサインの対象銘柄が日によって変わってしまうため、
-    # 監視銘柄の全銘柄でサインを判定する。ラジ株ナビはサインが出た銘柄の補助表示(ラジ判定・メモ)にだけ使う。
-    # (screen_fundamentally_sound_stocks 関数は残してあるが、ここでは呼ばない)
-
-print("🚀 データダウンロード開始...")
-df_bench = yf.download(BENCH, start=START, end=END, auto_adjust=True, progress=False)
-if isinstance(df_bench.columns, pd.MultiIndex):
-    df_bench.columns = df_bench.columns.get_level_values(0)
-df_bench = df_bench[~df_bench.index.duplicated(keep="last")].sort_index()
-bench_close = df_bench["Close"]
-
-all_results, failed = [], []
-for ticker in target_stocks:
-    try:
-        df_s = yf.download(ticker, start=START, end=END, auto_adjust=True, progress=False)
-        if isinstance(df_s.columns, pd.MultiIndex):
-            df_s.columns = df_s.columns.get_level_values(0)
-        # yfinanceが同じ日付を2行返すことがある(2026/10/05に資金管理バックテストがKeyErrorで停止)。
-        # 重複日付は最後の行を残し、終値が欠けた行も除く(平均リターンがnan%になる原因にもなる)
-        df_s = df_s[~df_s.index.duplicated(keep="last")].sort_index()
-        df_s = df_s.dropna(subset=["Close"])
-        if len(df_s) < 250:
-            failed.append((ticker, "データ不足")); continue
-        df_c = calculate_base_indicators(df_s)
-        df_c["Ticker"] = ticker
-        all_results.append(df_c)
-    except Exception as e:
-        failed.append((ticker, str(e)))
-
-if failed:
-    print(f"\n⚠️ 取得失敗/データ不足 {len(failed)}件")
-
-print(f"\n✅ 有効銘柄: {len(all_results)}件")
-print("📊 RSR算出中(全銘柄横断パーセンタイルランク)...")
-combined_df = pd.concat(all_results)
-combined_df = calc_cross_sectional_rsr(combined_df, bench_close)
-
-print("📊 シグナル計算中...")
-combined_df = calc_signals(combined_df)
-
-# --- バックテスト ---
-print("\n" + "="*60)
-print("📈 バックテスト結果")
-print("="*60)
-signal_labels = {
-    "Ace_Start":          "🅰️  Ace開始",
-    "King_Start":         "👑 King開始",
-    "Polygraph_Start":    "🎯 ポリグラフ開始",
-    "Ace_with_BEP_Start": "🅰️🐢 Ace×BEP同時",
-}
-rankings = {}
-bt_trades = {}
-for col, label in signal_labels.items():
-    print(f"\n--- {label} ---")
-    bt_trades[col] = []
-    rankings[col] = backtest(combined_df, col, TICKER_NAME_MAP, trades_out=bt_trades[col])
-
-# --- 資金管理ルール(1%リスク・1銘柄20%上限・100株単位)で資金を動かした場合 ---
-print("\n" + "="*60)
-print(f"💴 資金管理バックテスト(資金{FUJIKO_CAPITAL:,.0f}円、1回の損失=資金の{sizing.RISK_PCT*100:.0f}%、1銘柄上限{sizing.MAX_POSITION_PCT*100:.0f}%)")
-print("="*60)
-_closes = {t: d["Close"] for t, d in combined_df.groupby("Ticker")}
-portfolio_results = {}
-for col, label in signal_labels.items():
-    r = sizing.simulate_portfolio(bt_trades[col], _closes, FUJIKO_CAPITAL)
-    portfolio_results[col] = r
-    print(f"  [{label}] 取引{r['n_trades']}件(見送り{r['n_skipped']}件) / 最終リターン:{r['final_return_pct']:+.2f}% / "
-          f"最大DD:{r['max_drawdown_pct']:.2f}% / シャープ(年率):{r['sharpe']:.2f} / 同時保有最大:{r['max_concurrent']}銘柄")
-
-# --- 比較: TOPIX連動ETF(1306)を同じ期間で買い持ちした場合 / 年ごとの成績 ---
-_eqs = [r["equity"] for r in portfolio_results.values() if len(r["equity"])]
-bench_result, yearly_results = None, {}
-if _eqs:
-    _p_start, _p_end = min(e.index[0] for e in _eqs), max(e.index[-1] for e in _eqs)
-    bench_result = sizing.buy_and_hold(bench_close, FUJIKO_CAPITAL, _p_start, _p_end)
-    bench_result["period"] = (_p_start, _p_end)
-    print(f"  [{BENCH}買い持ち {_p_start:%Y-%m-%d}〜{_p_end:%Y-%m-%d}] 最終リターン:{bench_result['final_return_pct']:+.2f}% / "
-          f"最大DD:{bench_result['max_drawdown_pct']:.2f}% / シャープ(年率):{bench_result['sharpe']:.2f}")
-YEAR_BUCKETS = [("2023年", 2023, 2023), ("2024年", 2024, 2024), ("2025年以降", 2025, None)]
-for _col in ("Ace_Start", "King_Start"):
-    yearly_results[_col] = {}
-    for _name, _y0, _y1 in YEAR_BUCKETS:
-        _m = sizing.period_metrics(portfolio_results[_col]["equity"], _y0, _y1)
-        yearly_results[_col][_name] = _m
-        _txt = "取引なし" if _m is None else f"最終リターン:{_m['final_return_pct']:+.2f}% / シャープ(年率):{_m['sharpe']:.2f}"
-        print(f"  [{signal_labels[_col]} {_name}] {_txt}")
-
-# --- 優秀銘柄ランキング ---
-print("\n" + "="*60)
-print("🏆 優秀銘柄ランキング TOP10 (Ace_Start基準)")
-print("="*60)
-if not rankings["Ace_Start"].empty:
-    top10 = rankings["Ace_Start"].sort_values("_sort", ascending=False).head(10)
-    print(top10[["会社名","シグナル回数","勝率","平均リターン"]].to_string())
-
-# --- 現在シグナル点灯中 ---
-print("\n" + "="*60)
-print("🎯 直近3日以内にシグナル点灯中の銘柄")
-print("="*60)
-for col, label in signal_labels.items():
-    print(f"\n{label}:")
-    found = False
-    for ticker, df in combined_df.groupby("Ticker"):
-        if df[col].tail(3).any():
-            print(f"  ・{TICKER_NAME_MAP.get(ticker, ticker)} ({ticker}) {get_trend(df)}")
-            found = True
-    if not found:
-        print("  (該当なし)")
-
-# ============================================================
-# LINE通知送信
-# ============================================================
-print("\n📱 LINE通知送信中...")
-today = date.today().strftime("%Y/%m/%d")
-MARKET_LABEL = "🇺🇸 米国株" if MARKET == "US" else "🇯🇵 日本株"
-msg = f"📊 {today} フジコシグナル({MARKET_LABEL})\n"
-msg += "=" * 25 + "\n"
-
-# --- 根拠・推奨株数(シグナルごと。ティッカー→[情報]、ラベル別にも引けるようにする) ---
-signal_infos = {}          # ticker -> [info, ...]
-signal_info_by_label = {}  # (label, ticker) -> info
-for _col, _label in (("Ace_Start", "Ace"), ("King_Start", "King"),
-                     ("Polygraph_Start", "ポリグラフ"), ("Ace_with_BEP_Start", "Ace×BEP")):
-    for _t, _df in combined_df.groupby("Ticker"):
-        _recent = _df[_col].tail(3)
-        if not _recent.any():
-            continue
-        _sig_row = _df.loc[_recent[_recent].index[-1]]
-        if isinstance(_sig_row, pd.DataFrame):
-            _sig_row = _sig_row.iloc[-1]
-        _info = sizing.build_signal_info(_label, _df.iloc[-1], FUJIKO_CAPITAL, reason_row=_sig_row)
-        signal_infos.setdefault(_t, []).append(_info)
-        signal_info_by_label[(_label, _t)] = _info
-
-# --- 全件リスト(Web・スプレッドシート用) ---
-ace_stocks_all  = [(f"・{TICKER_NAME_MAP.get(t, t)} {get_trend(df)}", t) for t, df in combined_df.groupby("Ticker") if df["Ace_Start"].tail(3).any()]
-king_stocks_all = [(f"・{TICKER_NAME_MAP.get(t, t)} {get_trend(df)}", t) for t, df in combined_df.groupby("Ticker") if df["King_Start"].tail(3).any()]
-poly_stocks_all = [(f"・{TICKER_NAME_MAP.get(t, t)} {get_trend(df)}", t) for t, df in combined_df.groupby("Ticker") if df["Polygraph_Start"].tail(3).any()]
-bep_stocks_all  = [(f"・{TICKER_NAME_MAP.get(t, t)} {get_trend(df)}", t) for t, df in combined_df.groupby("Ticker") if df["Ace_with_BEP_Start"].tail(3).any()]
-
-# ============================================================
-# ファンダメンタルズ評価(yfinance財務 + ラジ株スコア[補助] + Evy式)
-# ============================================================
-# 【2026/09 依存削減】2026/09の「根本改革」時点では、screen_stocks(窓口B)を
-# 「クォータを消費しない一括取得」として監視銘柄全体に毎日使う設計にしていた。
-# しかし実際の日次実行(9/5)で、その screen_stocks 自体が429(クォータ超過)を
-# 起こし、監視銘柄18件のうち0件しか評価できないという不具合が発生した。
-# 加えて、ラジ株ナビは他プロジェクトとも共用の日次100件までのAPIであることが
-# 判明したため、「フジコが監視銘柄全体をラジ株ナビで一括評価する」という設計自体を
-# 撤回する。
-#
-# 新しい設計:
-#   ステップ1(yfinance、無料・上限なし): 監視銘柄"全体"に対して、evy_valuation・
-#     kabuojisan_valuation・kabuojisan_health_scoreをyfinanceデータだけで計算する
-#     (get_fundamental_data_yfinance)。ラジ株ナビは一切使わない。
-#   ステップ2(ラジ株ナビ、日次上限あり・他プロジェクトと共用): ステップ1の
-#     割安度(discountPct)が高い順の上位銘柄だけ、ラジ株ナビ固有の6軸スコア・
-#     理想株価判定(radi)で補助的に深掘りする。1銘柄2リクエスト消費、フジコの
-#     取り分として1日30銘柄(60リクエスト)を上限とする(他プロジェクトの分を
-#     圧迫しないよう、日次100件のうち一部だけを使う)。429が出た場合は
-#     即座に打ち切り、ステップ1(yfinance)の結果はそのまま活かす。
+# ファンダメンタルズ評価の件数上限(説明はメイン実行内の「ファンダメンタルズ評価」の節を参照)
 FUJIKO_RADIKABUNAVI_DAILY_BUDGET = 5  # フジコの1日あたり深掘り件数(他プロジェクトとの共用に配慮)
 TOP_FUNDAMENTAL_ROWS = 30  # メインシートに掲載する、ファンダメンタルズ評価上位の件数
 
-if MARKET == "US":
-    print("⏭️ 米国株はEvy式/株おじさん式バリュエーションの対象外のためスキップします")
-    fundamental_commentaries, fundamental_valuations = {}, {}
-else:
-    # --- ステップ1: 監視銘柄全体をyfinanceで評価(ラジ株ナビ不使用、無料・上限なし) ---
-    _watchlist_codes = {t.replace(".T", "") for t in _watchlist_tickers} if _watchlist_tickers else set()
-    _eval_tickers = [f"{code}.T" for code in _watchlist_codes] if _watchlist_codes else list(target_stocks)
-    print(f"📐 監視銘柄全体をyfinanceで評価中({len(_eval_tickers)}銘柄、ラジ株ナビ不使用)...")
-    fundamental_valuations = {}
-    for _t in _eval_tickers:
-        _fin, _score = get_fundamental_data_yfinance(_t)
-        _v = {}
-        _evy = evy_valuation(_fin, _score)
-        if _evy:
-            _v["evy"] = _evy
-        _kabuojisan = kabuojisan_valuation(_fin, _score)
-        if _kabuojisan:
-            _v["kabuojisan"] = _kabuojisan
-        _kabu_health = kabuojisan_health_score(_fin, _score)
-        if _kabu_health:
-            _v["kabuHealth"] = _kabu_health
-        if _v:
-            fundamental_valuations[_t] = _v
-    print(f"✅ yfinance評価完了({len(fundamental_valuations)}/{len(_eval_tickers)}銘柄)")
-
-    # --- REVE近似(フェーズ1: ログのみ。LINE/シートには出さない) ---
-    try:
-        from reve import run_reve_phase1
-        reve_results = run_reve_phase1(_eval_tickers, TICKER_NAME_MAP)
-    except Exception as e:
-        print(f"⚠️ REVE近似の評価をスキップ: {e}")
-
-    # --- ステップ2: yfinance評価の割安度(discountPct)が高い上位銘柄だけ、ラジ株ナビで補助深掘り ---
-    def _discount_pct(v):
-        evy = v.get("evy") or {}
-        kabuojisan = v.get("kabuojisan") or {}
-        vals = [x.get("discountPct") for x in (evy, kabuojisan) if x.get("discountPct") is not None]
-        return max(vals) if vals else -9999
-
-    _ranked = sorted(fundamental_valuations.items(), key=lambda kv: _discount_pct(kv[1]), reverse=True)
-    # サインが出た銘柄(Ace/King/ポリグラフ/Ace×BEP)だけが対象。キー空・401/403/429なら補助表示を空にして続行する
-    _signal_tickers = {t for lst in (ace_stocks_all, king_stocks_all, poly_stocks_all, bep_stocks_all) for _, t in lst}
-    _deep_dive_tickers = select_deep_dive_tickers(_ranked, _signal_tickers, FUJIKO_RADIKABUNAVI_DAILY_BUDGET)
-    if _deep_dive_tickers and RADIKABUNAVI_API_KEY and not _radikabunavi_disabled:
-        print(f"🔎 サイン点灯銘柄のうち割安度上位{len(_deep_dive_tickers)}銘柄をラジ株ナビで補助深掘り"
-              f"(1日{FUJIKO_RADIKABUNAVI_DAILY_BUDGET}銘柄まで、他プロジェクトとの共用に配慮)")
-    elif not RADIKABUNAVI_API_KEY or _radikabunavi_disabled:
-        print("⏭️ ラジ株ナビ未設定/利用不可のため、補助深掘りをスキップ(yfinance評価のみで続行)")
-        _deep_dive_tickers = []
-    fundamental_commentaries, _deep_valuations = build_fundamental_commentaries(_deep_dive_tickers, TICKER_NAME_MAP)
-    # 深掘り結果(radi/scores/evy/kabuojisan/kabuHealthの再計算)を、ステップ1の結果にマージ(上書き)
-    for _t, _v in _deep_valuations.items():
-        fundamental_valuations.setdefault(_t, {}).update(_v)
-
-    # --- ステップ3: EDINET DB(補助、ラジ株ナビとは別サービス・日次100件の無料枠) ---
-    # 絞り込み済みのディープダイブ候補(_deep_dive_tickers)のみ対象。全銘柄ループでは呼ばない。
-    if _deep_dive_tickers and EDINETDB_API_KEY and not _edinetdb_disabled:
-        print(f"🔎 深掘り候補{len(_deep_dive_tickers)}銘柄をEDINET DBで補助確認"
-              f"(信用格付/信用スコア、日次{EDINETDB_DAILY_SAFE_MARGIN}回まで)")
-        for _t in _deep_dive_tickers:
-            _edinetdb_hint = get_edinetdb_screening_hint(_t)
-            if not _edinetdb_hint:
-                continue
-            fundamental_valuations.setdefault(_t, {})["edinetdb"] = _edinetdb_hint
-            _hint_text = f"EDINET DB信用:{_edinetdb_hint.get('credit_rating', '-')}({_edinetdb_hint.get('credit_score', '-')}点)"
-            if fundamental_commentaries.get(_t):
-                fundamental_commentaries[_t] += f" / {_hint_text}"
-            else:
-                fundamental_commentaries[_t] = _hint_text
-    elif not EDINETDB_API_KEY or _edinetdb_disabled:
-        print("⏭️ EDINET DB未設定/利用不可のため、補助確認をスキップ")
-
-# --- シグナル的中率トラッキング(バリュエーション情報付きで登録) ---
-print("\n📊 シグナル的中率トラッキング処理中...")
-tracking_result = run_signal_tracking(combined_df, TICKER_NAME_MAP, fundamental_valuations)
-
-# --- LINE通知用(文字数制限があるため上位20件のみ、ヘッダーには正しい総数を表示) ---
-def _valuation_tag(t):
-    """バリュエーション情報から短いタグを生成(LINE表示用)"""
-    v = fundamental_valuations.get(t)
-    if not v:
-        return ""
-    parts = []
-    radi = v.get("radi") or {}
-    if radi.get("verdict"):
-        parts.append(f"ラジ:{radi['verdict']}")
-    evy = v.get("evy") or {}
-    if evy.get("label"):
-        parts.append(f"Evy:{evy['label']}({evy['discountPct']:+.0f}%)")
-    kabuojisan = v.get("kabuojisan") or {}
-    if kabuojisan.get("label"):
-        parts.append(f"株:{kabuojisan['label']}({kabuojisan['discountPct']:+.0f}%)")
-    kabu_health = v.get("kabuHealth") or {}
-    if kabu_health.get("label"):
-        parts.append(f"健:{kabu_health['label']}{kabu_health['passed']}/{kabu_health['total']}")
-    return f" [{'/'.join(parts)}]" if parts else ""
-
-def _line_format(t, df, label):
-    base = f"{get_trend(df)} {TICKER_NAME_MAP.get(t, t)} [{get_market_label(t)}]"
-    base += _valuation_tag(t)
-    info = signal_info_by_label.get((label, t))
-    if info:
-        base += f"\n   株数: {sizing.position_text(info['pos'])}\n   根拠: {info['reason']}"
-    comment = fundamental_commentaries.get(t, "")
-    if comment:
-        short_comment = comment[:20] + ("…" if len(comment) > 20 else "")
-        base += f"\n   {short_comment}"
-    return base
-
-ace_pairs  = [(t, df) for t, df in combined_df.groupby("Ticker") if df["Ace_Start"].tail(3).any()]
-ace_stocks = [_line_format(t, df, "Ace") for t, df in ace_pairs[:20]]
-msg += f"\n🅰️ Ace点灯中({len(ace_pairs)}銘柄、上位{len(ace_stocks)}件表示)\n"
-msg += "\n".join(ace_stocks) if ace_stocks else "  (該当なし)"
-
-king_pairs  = [(t, df) for t, df in combined_df.groupby("Ticker") if df["King_Start"].tail(3).any()]
-king_stocks = [_line_format(t, df, "King") for t, df in king_pairs[:20]]
-msg += f"\n\n👑 King点灯中({len(king_pairs)}銘柄、上位{len(king_stocks)}件表示)\n"
-msg += "\n".join(king_stocks) if king_stocks else "  (該当なし)"
-
-poly_pairs  = [(t, df) for t, df in combined_df.groupby("Ticker") if df["Polygraph_Start"].tail(3).any()]
-poly_stocks = [_line_format(t, df, "ポリグラフ") for t, df in poly_pairs[:20]]
-msg += f"\n\n🎯 ポリグラフ点灯中({len(poly_pairs)}銘柄、上位{len(poly_stocks)}件表示)\n"
-msg += "\n".join(poly_stocks) if poly_stocks else "  (該当なし)"
-
-bep_pairs  = [(t, df) for t, df in combined_df.groupby("Ticker") if df["Ace_with_BEP_Start"].tail(3).any()]
-bep_stocks = [_line_format(t, df, "Ace×BEP") for t, df in bep_pairs[:10]]
-msg += f"\n\n🅰️🐢 Ace×BEP同時({len(bep_pairs)}銘柄、上位{len(bep_stocks)}件表示)\n"
-msg += "\n".join(bep_stocks) if bep_stocks else "  (該当なし)"
-
-msg += f"\n\n💴 資金{FUJIKO_CAPITAL:,.0f}円・1回の損失は資金の1%・1銘柄は資金の20%まで(100株単位)"
-msg += f"\n📎 出どころ: {sizing.DATA_SOURCE_TEXT}"
-
-if tracking_result:
-    _new_count, _resolved_count, _hit_count = tracking_result
-    if _resolved_count > 0:
-        _hit_rate = _hit_count / _resolved_count * 100
-        msg += f"\n\n📊 シグナル的中率({TRACKING_HOLD_DAYS}営業日後+{TRACKING_HIT_THRESHOLD_PCT:.1f}%以上): {_hit_count}/{_resolved_count}件 ({_hit_rate:.1f}%)"
-
-send_line(msg)
-
-# スプレッドシートに履歴を書き込む
 # ============================================================
-# 【2026/09 根本改革】掲載する行は「Ace/King等が点灯した銘柄」ではなく、
-# 「監視銘柄の中でファンダメンタルズ評価が高い上位30件」に変更。テクニカル
-# シグナルは行を増やす基準ではなく、1列の参考情報(本日のテクニカル)として添える。
-signal_sets = {
-    "Ace": {t for _, t in ace_stocks_all},
-    "King": {t for _, t in king_stocks_all},
-    "ポリグラフ": {t for _, t in poly_stocks_all},
-    "Ace×BEP": {t for _, t in bep_stocks_all},
-}
+# メイン実行
+# ============================================================
+# import時(テスト・他プロジェクトからの関数利用)に取得・通知・シート書き込みが走らないようにする
+if __name__ == "__main__":
+    START = "2023-01-01"
+    END   = (date.today() + pd.Timedelta(days=1)).strftime("%Y-%m-%d")
+    BENCH = "^GSPC" if MARKET == "US" else "1306.T"
 
-if MARKET == "US":
-    # 米国株はラジ株ナビ/Evy式の対象外のため、ファンダメンタルズ順位が作れない。
-    # 従来通りテクニカル点灯銘柄(重複除去)を上位30件まで掲載する。
-    _seen = set()
-    top_tickers = []
-    for _, _t in ace_stocks_all + king_stocks_all + poly_stocks_all + bep_stocks_all:
-        if _t not in _seen:
-            _seen.add(_t)
-            top_tickers.append(_t)
-        if len(top_tickers) >= TOP_FUNDAMENTAL_ROWS:
-            break
-else:
-    # yfinance評価の割安度(discountPct)で並べた_rankedを流用(_rankedは(ticker, valuation)のタプル、tickerは".T"付き)
-    top_tickers = [t for t, _ in _ranked[:TOP_FUNDAMENTAL_ROWS]]
+    _watchlist_tickers = set()
+    if MARKET == "US":
+        target_stocks, TICKER_NAME_MAP = get_us_tickers()
+    else:
+        target_stocks, TICKER_NAME_MAP = get_all_tickers(TICKER_NAME_MAP)
+        # --- 監視銘柄リストによる絞り込み(株おじさん式: フジコはタイミング計測のみに使う) ---
+        # 米国株は対象外(株おじさんの記事は日本株の銘柄選定手法のため、米国株は従来通り全銘柄スキャン)
+        # 【2026/09 根本改革】以前は監視銘柄が100銘柄未満の間、絞り込みを見送って全銘柄
+        # スキャンにフォールバックしていた。しかしこれは「ファンダメンタルズで選ばれた
+        # 会社だけをタイミング判定の対象にする」という株おじさん式の原則を、監視銘柄数
+        # 次第で日によって有効/無効が入れ替わる不安定な状態にしてしまっていた。
+        # 常に監視銘柄だけを対象にする(監視銘柄が少ない日は、対象が少ないままでよい)。
+        _watchlist_tickers = get_watchlist_tickers()
+        if _watchlist_tickers:
+            _before_count = len(target_stocks)
+            target_stocks = [t for t in target_stocks if t in _watchlist_tickers]
+            print(f"🎯 監視銘柄リストで絞り込み: {_before_count}銘柄 → {len(target_stocks)}銘柄"
+                  f"(build_watchlist.pyが選別した株おじさん式監視銘柄のみを対象にスキャン。"
+                  f"全銘柄へのフォールバックは廃止済み)")
+            if not target_stocks:
+                print("⚠️ 監視銘柄リストとJ-Quantsティッカー一覧の突合結果が0件です。"
+                      "本日のシグナルは0件になります(quarterly_watchlist.ymlの進捗を確認してください)")
+        else:
+            print("⚠️ 監視銘柄リストが空/未構築のため、本日のシグナルは0件になります"
+                  "(build_watchlist.pyを四半期ワークフローで実行すると監視銘柄が構築されます)")
 
-write_to_spreadsheet(today, top_tickers, TICKER_NAME_MAP, fundamental_valuations, fundamental_commentaries, signal_sets, signal_infos)
+        # --- ファンダメンタルズ事前フィルタ(screen_stocks=窓口B)は廃止 ---
+        # ラジ株ナビは日次100回の共用枠で、キーが空・429のときにサインの対象銘柄が日によって変わってしまうため、
+        # 監視銘柄の全銘柄でサインを判定する。ラジ株ナビはサインが出た銘柄の補助表示(ラジ判定・メモ)にだけ使う。
+        # (screen_fundamentally_sound_stocks 関数は残してあるが、ここでは呼ばない)
 
-# --- docs/ のHTML(GitHub Pages用)。日本株の実行時だけ更新する(米国株の実行で上書きしない) ---
-if MARKET != "US":
-    import report_html
-    _html_path = report_html.write_report(
-        os.path.join(os.path.dirname(os.path.abspath(__file__)), "docs", "backtest.html"),
-        today=today, capital=FUJIKO_CAPITAL, signal_labels=signal_labels,
-        portfolio_results=portfolio_results, bench_result=bench_result, bench_label=BENCH,
-        yearly_results=yearly_results, rankings=rankings, signal_infos=signal_infos,
-        name_map=TICKER_NAME_MAP)
-    print(f"✅ HTML出力: {_html_path}")
+    print("🚀 データダウンロード開始...")
+    df_bench = yf.download(BENCH, start=START, end=END, auto_adjust=True, progress=False)
+    if isinstance(df_bench.columns, pd.MultiIndex):
+        df_bench.columns = df_bench.columns.get_level_values(0)
+    df_bench = df_bench[~df_bench.index.duplicated(keep="last")].sort_index()
+    bench_close = df_bench["Close"]
+
+    all_results, failed = [], []
+    for ticker in target_stocks:
+        try:
+            df_s = yf.download(ticker, start=START, end=END, auto_adjust=True, progress=False)
+            if isinstance(df_s.columns, pd.MultiIndex):
+                df_s.columns = df_s.columns.get_level_values(0)
+            # yfinanceが同じ日付を2行返すことがある(2026/10/05に資金管理バックテストがKeyErrorで停止)。
+            # 重複日付は最後の行を残し、終値が欠けた行も除く(平均リターンがnan%になる原因にもなる)
+            df_s = df_s[~df_s.index.duplicated(keep="last")].sort_index()
+            df_s = df_s.dropna(subset=["Close"])
+            if len(df_s) < 250:
+                failed.append((ticker, "データ不足")); continue
+            df_c = calculate_base_indicators(df_s)
+            df_c["Ticker"] = ticker
+            all_results.append(df_c)
+        except Exception as e:
+            failed.append((ticker, str(e)))
+
+    if failed:
+        print(f"\n⚠️ 取得失敗/データ不足 {len(failed)}件")
+
+    print(f"\n✅ 有効銘柄: {len(all_results)}件")
+    print("📊 RSR算出中(全銘柄横断パーセンタイルランク)...")
+    combined_df = pd.concat(all_results)
+    combined_df = calc_cross_sectional_rsr(combined_df, bench_close)
+
+    print("📊 シグナル計算中...")
+    combined_df = calc_signals(combined_df)
+
+    # --- バックテスト ---
+    print("\n" + "="*60)
+    print("📈 バックテスト結果")
+    print("="*60)
+    signal_labels = {
+        "Ace_Start":          "🅰️  Ace開始",
+        "King_Start":         "👑 King開始",
+        "Polygraph_Start":    "🎯 ポリグラフ開始",
+        "Ace_with_BEP_Start": "🅰️🐢 Ace×BEP同時",
+    }
+    rankings = {}
+    bt_trades = {}
+    for col, label in signal_labels.items():
+        print(f"\n--- {label} ---")
+        bt_trades[col] = []
+        rankings[col] = backtest(combined_df, col, TICKER_NAME_MAP, trades_out=bt_trades[col])
+
+    # --- 資金管理ルール(1%リスク・1銘柄20%上限・100株単位)で資金を動かした場合 ---
+    print("\n" + "="*60)
+    print(f"💴 資金管理バックテスト(資金{FUJIKO_CAPITAL:,.0f}円、1回の損失=資金の{sizing.RISK_PCT*100:.0f}%、1銘柄上限{sizing.MAX_POSITION_PCT*100:.0f}%)")
+    print("="*60)
+    _closes = {t: d["Close"] for t, d in combined_df.groupby("Ticker")}
+    portfolio_results = {}
+    for col, label in signal_labels.items():
+        r = sizing.simulate_portfolio(bt_trades[col], _closes, FUJIKO_CAPITAL)
+        portfolio_results[col] = r
+        print(f"  [{label}] 取引{r['n_trades']}件(見送り{r['n_skipped']}件) / 最終リターン:{r['final_return_pct']:+.2f}% / "
+              f"最大DD:{r['max_drawdown_pct']:.2f}% / シャープ(年率):{r['sharpe']:.2f} / 同時保有最大:{r['max_concurrent']}銘柄")
+
+    # --- 比較: TOPIX連動ETF(1306)を同じ期間で買い持ちした場合 / 年ごとの成績 ---
+    _eqs = [r["equity"] for r in portfolio_results.values() if len(r["equity"])]
+    bench_result, yearly_results = None, {}
+    if _eqs:
+        _p_start, _p_end = min(e.index[0] for e in _eqs), max(e.index[-1] for e in _eqs)
+        bench_result = sizing.buy_and_hold(bench_close, FUJIKO_CAPITAL, _p_start, _p_end)
+        bench_result["period"] = (_p_start, _p_end)
+        print(f"  [{BENCH}買い持ち {_p_start:%Y-%m-%d}〜{_p_end:%Y-%m-%d}] 最終リターン:{bench_result['final_return_pct']:+.2f}% / "
+              f"最大DD:{bench_result['max_drawdown_pct']:.2f}% / シャープ(年率):{bench_result['sharpe']:.2f}")
+    YEAR_BUCKETS = [("2023年", 2023, 2023), ("2024年", 2024, 2024), ("2025年以降", 2025, None)]
+    for _col in ("Ace_Start", "King_Start"):
+        yearly_results[_col] = {}
+        for _name, _y0, _y1 in YEAR_BUCKETS:
+            _m = sizing.period_metrics(portfolio_results[_col]["equity"], _y0, _y1)
+            yearly_results[_col][_name] = _m
+            _txt = "取引なし" if _m is None else f"最終リターン:{_m['final_return_pct']:+.2f}% / シャープ(年率):{_m['sharpe']:.2f}"
+            print(f"  [{signal_labels[_col]} {_name}] {_txt}")
+
+    # --- 優秀銘柄ランキング ---
+    print("\n" + "="*60)
+    print("🏆 優秀銘柄ランキング TOP10 (Ace_Start基準)")
+    print("="*60)
+    if not rankings["Ace_Start"].empty:
+        top10 = rankings["Ace_Start"].sort_values("_sort", ascending=False).head(10)
+        print(top10[["会社名","シグナル回数","勝率","平均リターン"]].to_string())
+
+    # --- 現在シグナル点灯中 ---
+    print("\n" + "="*60)
+    print("🎯 直近3日以内にシグナル点灯中の銘柄")
+    print("="*60)
+    for col, label in signal_labels.items():
+        print(f"\n{label}:")
+        found = False
+        for ticker, df in combined_df.groupby("Ticker"):
+            if df[col].tail(3).any():
+                print(f"  ・{TICKER_NAME_MAP.get(ticker, ticker)} ({ticker}) {get_trend(df)}")
+                found = True
+        if not found:
+            print("  (該当なし)")
+
+    # ============================================================
+    # LINE通知送信
+    # ============================================================
+    print("\n📱 LINE通知送信中...")
+    today = date.today().strftime("%Y/%m/%d")
+    MARKET_LABEL = "🇺🇸 米国株" if MARKET == "US" else "🇯🇵 日本株"
+    msg = f"📊 {today} フジコシグナル({MARKET_LABEL})\n"
+    msg += "=" * 25 + "\n"
+
+    # --- 根拠・推奨株数(シグナルごと。ティッカー→[情報]、ラベル別にも引けるようにする) ---
+    signal_infos = {}          # ticker -> [info, ...]
+    signal_info_by_label = {}  # (label, ticker) -> info
+    for _col, _label in (("Ace_Start", "Ace"), ("King_Start", "King"),
+                         ("Polygraph_Start", "ポリグラフ"), ("Ace_with_BEP_Start", "Ace×BEP")):
+        for _t, _df in combined_df.groupby("Ticker"):
+            _recent = _df[_col].tail(3)
+            if not _recent.any():
+                continue
+            _sig_row = _df.loc[_recent[_recent].index[-1]]
+            if isinstance(_sig_row, pd.DataFrame):
+                _sig_row = _sig_row.iloc[-1]
+            _info = sizing.build_signal_info(_label, _df.iloc[-1], FUJIKO_CAPITAL, reason_row=_sig_row)
+            signal_infos.setdefault(_t, []).append(_info)
+            signal_info_by_label[(_label, _t)] = _info
+
+    # --- 全件リスト(Web・スプレッドシート用) ---
+    ace_stocks_all  = [(f"・{TICKER_NAME_MAP.get(t, t)} {get_trend(df)}", t) for t, df in combined_df.groupby("Ticker") if df["Ace_Start"].tail(3).any()]
+    king_stocks_all = [(f"・{TICKER_NAME_MAP.get(t, t)} {get_trend(df)}", t) for t, df in combined_df.groupby("Ticker") if df["King_Start"].tail(3).any()]
+    poly_stocks_all = [(f"・{TICKER_NAME_MAP.get(t, t)} {get_trend(df)}", t) for t, df in combined_df.groupby("Ticker") if df["Polygraph_Start"].tail(3).any()]
+    bep_stocks_all  = [(f"・{TICKER_NAME_MAP.get(t, t)} {get_trend(df)}", t) for t, df in combined_df.groupby("Ticker") if df["Ace_with_BEP_Start"].tail(3).any()]
+
+    # ============================================================
+    # ファンダメンタルズ評価(yfinance財務 + ラジ株スコア[補助] + Evy式)
+    # ============================================================
+    # 【2026/09 依存削減】2026/09の「根本改革」時点では、screen_stocks(窓口B)を
+    # 「クォータを消費しない一括取得」として監視銘柄全体に毎日使う設計にしていた。
+    # しかし実際の日次実行(9/5)で、その screen_stocks 自体が429(クォータ超過)を
+    # 起こし、監視銘柄18件のうち0件しか評価できないという不具合が発生した。
+    # 加えて、ラジ株ナビは他プロジェクトとも共用の日次100件までのAPIであることが
+    # 判明したため、「フジコが監視銘柄全体をラジ株ナビで一括評価する」という設計自体を
+    # 撤回する。
+    #
+    # 新しい設計:
+    #   ステップ1(yfinance、無料・上限なし): 監視銘柄"全体"に対して、evy_valuation・
+    #     kabuojisan_valuation・kabuojisan_health_scoreをyfinanceデータだけで計算する
+    #     (get_fundamental_data_yfinance)。ラジ株ナビは一切使わない。
+    #   ステップ2(ラジ株ナビ、日次上限あり・他プロジェクトと共用): ステップ1の
+    #     割安度(discountPct)が高い順の上位銘柄だけ、ラジ株ナビ固有の6軸スコア・
+    #     理想株価判定(radi)で補助的に深掘りする。1銘柄2リクエスト消費、フジコの
+    #     取り分として1日30銘柄(60リクエスト)を上限とする(他プロジェクトの分を
+    #     圧迫しないよう、日次100件のうち一部だけを使う)。429が出た場合は
+    #     即座に打ち切り、ステップ1(yfinance)の結果はそのまま活かす。
+
+    if MARKET == "US":
+        print("⏭️ 米国株はEvy式/株おじさん式バリュエーションの対象外のためスキップします")
+        fundamental_commentaries, fundamental_valuations = {}, {}
+    else:
+        # --- ステップ1: 監視銘柄全体をyfinanceで評価(ラジ株ナビ不使用、無料・上限なし) ---
+        _watchlist_codes = {t.replace(".T", "") for t in _watchlist_tickers} if _watchlist_tickers else set()
+        _eval_tickers = [f"{code}.T" for code in _watchlist_codes] if _watchlist_codes else list(target_stocks)
+        print(f"📐 監視銘柄全体をyfinanceで評価中({len(_eval_tickers)}銘柄、ラジ株ナビ不使用)...")
+        fundamental_valuations = {}
+        for _t in _eval_tickers:
+            _fin, _score = get_fundamental_data_yfinance(_t)
+            _v = {}
+            _evy = evy_valuation(_fin, _score)
+            if _evy:
+                _v["evy"] = _evy
+            _kabuojisan = kabuojisan_valuation(_fin, _score)
+            if _kabuojisan:
+                _v["kabuojisan"] = _kabuojisan
+            _kabu_health = kabuojisan_health_score(_fin, _score)
+            if _kabu_health:
+                _v["kabuHealth"] = _kabu_health
+            if _v:
+                fundamental_valuations[_t] = _v
+        print(f"✅ yfinance評価完了({len(fundamental_valuations)}/{len(_eval_tickers)}銘柄)")
+
+        # --- REVE近似(フェーズ1: ログのみ。LINE/シートには出さない) ---
+        try:
+            from reve import run_reve_phase1
+            reve_results = run_reve_phase1(_eval_tickers, TICKER_NAME_MAP)
+        except Exception as e:
+            print(f"⚠️ REVE近似の評価をスキップ: {e}")
+
+        # --- ステップ2: yfinance評価の割安度(discountPct)が高い上位銘柄だけ、ラジ株ナビで補助深掘り ---
+        def _discount_pct(v):
+            evy = v.get("evy") or {}
+            kabuojisan = v.get("kabuojisan") or {}
+            vals = [x.get("discountPct") for x in (evy, kabuojisan) if x.get("discountPct") is not None]
+            return max(vals) if vals else -9999
+
+        _ranked = sorted(fundamental_valuations.items(), key=lambda kv: _discount_pct(kv[1]), reverse=True)
+        # サインが出た銘柄(Ace/King/ポリグラフ/Ace×BEP)だけが対象。キー空・401/403/429なら補助表示を空にして続行する
+        _signal_tickers = {t for lst in (ace_stocks_all, king_stocks_all, poly_stocks_all, bep_stocks_all) for _, t in lst}
+        _deep_dive_tickers = select_deep_dive_tickers(_ranked, _signal_tickers, FUJIKO_RADIKABUNAVI_DAILY_BUDGET)
+        if _deep_dive_tickers and RADIKABUNAVI_API_KEY and not _radikabunavi_disabled:
+            print(f"🔎 サイン点灯銘柄のうち割安度上位{len(_deep_dive_tickers)}銘柄をラジ株ナビで補助深掘り"
+                  f"(1日{FUJIKO_RADIKABUNAVI_DAILY_BUDGET}銘柄まで、他プロジェクトとの共用に配慮)")
+        elif not RADIKABUNAVI_API_KEY or _radikabunavi_disabled:
+            print("⏭️ ラジ株ナビ未設定/利用不可のため、補助深掘りをスキップ(yfinance評価のみで続行)")
+            _deep_dive_tickers = []
+        fundamental_commentaries, _deep_valuations = build_fundamental_commentaries(_deep_dive_tickers, TICKER_NAME_MAP)
+        # 深掘り結果(radi/scores/evy/kabuojisan/kabuHealthの再計算)を、ステップ1の結果にマージ(上書き)
+        for _t, _v in _deep_valuations.items():
+            fundamental_valuations.setdefault(_t, {}).update(_v)
+
+        # --- ステップ3: EDINET DB(補助、ラジ株ナビとは別サービス・日次100件の無料枠) ---
+        # 絞り込み済みのディープダイブ候補(_deep_dive_tickers)のみ対象。全銘柄ループでは呼ばない。
+        if _deep_dive_tickers and EDINETDB_API_KEY and not _edinetdb_disabled:
+            print(f"🔎 深掘り候補{len(_deep_dive_tickers)}銘柄をEDINET DBで補助確認"
+                  f"(信用格付/信用スコア、日次{EDINETDB_DAILY_SAFE_MARGIN}回まで)")
+            for _t in _deep_dive_tickers:
+                _edinetdb_hint = get_edinetdb_screening_hint(_t)
+                if not _edinetdb_hint:
+                    continue
+                fundamental_valuations.setdefault(_t, {})["edinetdb"] = _edinetdb_hint
+                _hint_text = f"EDINET DB信用:{_edinetdb_hint.get('credit_rating', '-')}({_edinetdb_hint.get('credit_score', '-')}点)"
+                if fundamental_commentaries.get(_t):
+                    fundamental_commentaries[_t] += f" / {_hint_text}"
+                else:
+                    fundamental_commentaries[_t] = _hint_text
+        elif not EDINETDB_API_KEY or _edinetdb_disabled:
+            print("⏭️ EDINET DB未設定/利用不可のため、補助確認をスキップ")
+
+    # --- シグナル的中率トラッキング(バリュエーション情報付きで登録) ---
+    print("\n📊 シグナル的中率トラッキング処理中...")
+    tracking_result = run_signal_tracking(combined_df, TICKER_NAME_MAP, fundamental_valuations)
+
+    # --- LINE通知用(文字数制限があるため上位20件のみ、ヘッダーには正しい総数を表示) ---
+    def _valuation_tag(t):
+        """バリュエーション情報から短いタグを生成(LINE表示用)"""
+        v = fundamental_valuations.get(t)
+        if not v:
+            return ""
+        parts = []
+        radi = v.get("radi") or {}
+        if radi.get("verdict"):
+            parts.append(f"ラジ:{radi['verdict']}")
+        evy = v.get("evy") or {}
+        if evy.get("label"):
+            parts.append(f"Evy:{evy['label']}({evy['discountPct']:+.0f}%)")
+        kabuojisan = v.get("kabuojisan") or {}
+        if kabuojisan.get("label"):
+            parts.append(f"株:{kabuojisan['label']}({kabuojisan['discountPct']:+.0f}%)")
+        kabu_health = v.get("kabuHealth") or {}
+        if kabu_health.get("label"):
+            parts.append(f"健:{kabu_health['label']}{kabu_health['passed']}/{kabu_health['total']}")
+        return f" [{'/'.join(parts)}]" if parts else ""
+
+    def _line_format(t, df, label):
+        base = f"{get_trend(df)} {TICKER_NAME_MAP.get(t, t)} [{get_market_label(t)}]"
+        base += _valuation_tag(t)
+        info = signal_info_by_label.get((label, t))
+        if info:
+            base += f"\n   株数: {sizing.position_text(info['pos'])}\n   根拠: {info['reason']}"
+        comment = fundamental_commentaries.get(t, "")
+        if comment:
+            short_comment = comment[:20] + ("…" if len(comment) > 20 else "")
+            base += f"\n   {short_comment}"
+        return base
+
+    ace_pairs  = [(t, df) for t, df in combined_df.groupby("Ticker") if df["Ace_Start"].tail(3).any()]
+    ace_stocks = [_line_format(t, df, "Ace") for t, df in ace_pairs[:20]]
+    msg += f"\n🅰️ Ace点灯中({len(ace_pairs)}銘柄、上位{len(ace_stocks)}件表示)\n"
+    msg += "\n".join(ace_stocks) if ace_stocks else "  (該当なし)"
+
+    king_pairs  = [(t, df) for t, df in combined_df.groupby("Ticker") if df["King_Start"].tail(3).any()]
+    king_stocks = [_line_format(t, df, "King") for t, df in king_pairs[:20]]
+    msg += f"\n\n👑 King点灯中({len(king_pairs)}銘柄、上位{len(king_stocks)}件表示)\n"
+    msg += "\n".join(king_stocks) if king_stocks else "  (該当なし)"
+
+    poly_pairs  = [(t, df) for t, df in combined_df.groupby("Ticker") if df["Polygraph_Start"].tail(3).any()]
+    poly_stocks = [_line_format(t, df, "ポリグラフ") for t, df in poly_pairs[:20]]
+    msg += f"\n\n🎯 ポリグラフ点灯中({len(poly_pairs)}銘柄、上位{len(poly_stocks)}件表示)\n"
+    msg += "\n".join(poly_stocks) if poly_stocks else "  (該当なし)"
+
+    bep_pairs  = [(t, df) for t, df in combined_df.groupby("Ticker") if df["Ace_with_BEP_Start"].tail(3).any()]
+    bep_stocks = [_line_format(t, df, "Ace×BEP") for t, df in bep_pairs[:10]]
+    msg += f"\n\n🅰️🐢 Ace×BEP同時({len(bep_pairs)}銘柄、上位{len(bep_stocks)}件表示)\n"
+    msg += "\n".join(bep_stocks) if bep_stocks else "  (該当なし)"
+
+    msg += f"\n\n💴 資金{FUJIKO_CAPITAL:,.0f}円・1回の損失は資金の1%・1銘柄は資金の20%まで(100株単位)"
+    msg += f"\n📎 出どころ: {sizing.DATA_SOURCE_TEXT}"
+
+    if tracking_result:
+        _new_count, _resolved_count, _hit_count = tracking_result
+        if _resolved_count > 0:
+            _hit_rate = _hit_count / _resolved_count * 100
+            msg += f"\n\n📊 シグナル的中率({TRACKING_HOLD_DAYS}営業日後+{TRACKING_HIT_THRESHOLD_PCT:.1f}%以上): {_hit_count}/{_resolved_count}件 ({_hit_rate:.1f}%)"
+
+    send_line(msg)
+
+    # スプレッドシートに履歴を書き込む
+    # ============================================================
+    # 【2026/09 根本改革】掲載する行は「Ace/King等が点灯した銘柄」ではなく、
+    # 「監視銘柄の中でファンダメンタルズ評価が高い上位30件」に変更。テクニカル
+    # シグナルは行を増やす基準ではなく、1列の参考情報(本日のテクニカル)として添える。
+    signal_sets = {
+        "Ace": {t for _, t in ace_stocks_all},
+        "King": {t for _, t in king_stocks_all},
+        "ポリグラフ": {t for _, t in poly_stocks_all},
+        "Ace×BEP": {t for _, t in bep_stocks_all},
+    }
+
+    if MARKET == "US":
+        # 米国株はラジ株ナビ/Evy式の対象外のため、ファンダメンタルズ順位が作れない。
+        # 従来通りテクニカル点灯銘柄(重複除去)を上位30件まで掲載する。
+        _seen = set()
+        top_tickers = []
+        for _, _t in ace_stocks_all + king_stocks_all + poly_stocks_all + bep_stocks_all:
+            if _t not in _seen:
+                _seen.add(_t)
+                top_tickers.append(_t)
+            if len(top_tickers) >= TOP_FUNDAMENTAL_ROWS:
+                break
+    else:
+        # yfinance評価の割安度(discountPct)で並べた_rankedを流用(_rankedは(ticker, valuation)のタプル、tickerは".T"付き)
+        top_tickers = [t for t, _ in _ranked[:TOP_FUNDAMENTAL_ROWS]]
+
+    write_to_spreadsheet(today, top_tickers, TICKER_NAME_MAP, fundamental_valuations, fundamental_commentaries, signal_sets, signal_infos)
+
+    # --- docs/ のHTML(GitHub Pages用)。日本株の実行時だけ更新する(米国株の実行で上書きしない) ---
+    if MARKET != "US":
+        import report_html
+        _html_path = report_html.write_report(
+            os.path.join(os.path.dirname(os.path.abspath(__file__)), "docs", "backtest.html"),
+            today=today, capital=FUJIKO_CAPITAL, signal_labels=signal_labels,
+            portfolio_results=portfolio_results, bench_result=bench_result, bench_label=BENCH,
+            yearly_results=yearly_results, rankings=rankings, signal_infos=signal_infos,
+            name_map=TICKER_NAME_MAP)
+        print(f"✅ HTML出力: {_html_path}")
