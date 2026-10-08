@@ -20,7 +20,7 @@ tools: Bash, Read, Write, mcp__radikabunavi__*
 
 ## レート制限・共有クォータ（重要）
 
-- `RADIKABUNAVI_API_KEY` は **dexter-kabu-jp / investor-agent / fujiko の3プロジェクトで共用**しており、日次150回の上限がある。`radikabu_usage_logger.py`で呼び出しログを残す既存方式を踏襲し、無駄打ちしない。
+- `RADIKABUNAVI_API_KEY` は **dexter-kabu-jp / investor-agent / fujiko の3プロジェクトで共用**しており、日次100回の上限がある（2026-10-07にサーバーのエラーで確認）。`radikabu_usage_logger.py`で呼び出しログを残す既存方式を踏襲し、無駄打ちしない。
 - EDINET DBは独自の日次リクエスト数制限があるため、`.cache/edinetdb_request_count_*.json`のカウントを確認してから呼ぶ。
 - J-Quants/yfinanceともに短時間の連打を避け、既存のキャッシュ（`.cache_reve/`等）を優先する。
 - レート制限エラー（429等）は指数バックオフで数回まで再試行し、失敗したら諦めて報告する（無限リトライしない）。
