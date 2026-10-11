@@ -72,8 +72,9 @@ jobs:
           GOOGLE_SHEETS_CREDENTIALS: ${{ secrets.GOOGLE_SHEETS_CREDENTIALS }}
           SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-          GAS_URL: ${{ secrets.GAS_URL }}
-          GAS_TOKEN: ${{ secrets.GAS_TOKEN }}
+          # LINE通知は2026-10-11に停止(GAS_URL未設定→fujiko.pyがスキップ。シート記録は継続)。再開は下の2行のコメントを外す
+          # GAS_URL: ${{ secrets.GAS_URL }}
+          # GAS_TOKEN: ${{ secrets.GAS_TOKEN }}
           FUJIKO_CAPITAL: ${{ secrets.FUJIKO_CAPITAL }}
         run: |
           python fujiko.py
@@ -84,8 +85,9 @@ jobs:
           GOOGLE_SHEETS_CREDENTIALS: ${{ secrets.GOOGLE_SHEETS_CREDENTIALS }}
           SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-          GAS_URL: ${{ secrets.GAS_URL }}
-          GAS_TOKEN: ${{ secrets.GAS_TOKEN }}
+          # LINE通知は2026-10-11に停止(GAS_URL未設定→fujiko.pyがスキップ。シート記録は継続)。再開は下の2行のコメントを外す
+          # GAS_URL: ${{ secrets.GAS_URL }}
+          # GAS_TOKEN: ${{ secrets.GAS_TOKEN }}
           FUJIKO_CAPITAL: ${{ secrets.FUJIKO_CAPITAL }}
         run: |
           python fujiko.py
