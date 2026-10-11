@@ -20,7 +20,15 @@
      (記事の「週足対数10年チャート+月足RSIで数年スパンの右肩上がり確認」をシンプルなルールで代用)
   3. Fスコア判定(EDINET、ラジ株ナビAPI経由、クォータ制約あり、1・2の通過銘柄だけに適用)
      ピオトロスキー式9項目のうち達成率6/9以上(記事の「Fスコア6点以上が目安」を採用)
-  4. 結果をスプレッドシートの「監視銘柄」タブに書き込み
+     ・当期純利益が0以下(赤字)の銘柄は、Fスコアに関係なく不合格
+     ・達成率が5/9以上6/9未満の銘柄は「次点」として別タブに記録(「監視銘柄」には含めない)
+  4. 結果をスプレッドシートの「監視銘柄」タブ(合格)・「監視銘柄_次点」タブ(次点)に書き込み
+
+ユニバースからは金融・不動産の5業種(銀行業・証券商品先物取引業・保険業・その他金融業・
+不動産業。J-QuantsのS33コード)を除外する(業種ごとに財務の見方が異なるため。EXCLUDED_S33)。
+
+出典(基準は本スクリプト側で自分の言葉で実装している。原文の転載はしない):
+  株おじさん note「銘柄選定シリーズ」 https://note.com/kabu_ojisan/m/mc23358defefb
 
 実行頻度: 四半期(年4回)を想定。株おじさんの記事の「四半期指標:年4回見直し」「本格見直し:
 年1〜2回」に合わせ、日次のdaily.ymlとは別の専用ワークフロー(quarterly_watchlist.yml)から
@@ -205,8 +213,12 @@ def radikabunavi_call_tool(tool_name, arguments):
 
 
 # ============================================================
-# 日本株ティッカー一覧取得(fujiko.pyのget_all_tickersと同じロジック)
+# 日本株ティッカー一覧取得(fujiko.pyのget_all_tickersと同じロジック+業種除外)
 # ============================================================
+# 除外する東証33業種コード: 銀行業・証券商品先物取引業・保険業・その他金融業・不動産業
+EXCLUDED_S33 = {"7050", "7100", "7150", "7200", "8050"}
+
+
 def get_all_tickers():
     try:
         api_key = os.environ.get("JQUANTS_API_KEY", "")
@@ -215,6 +227,8 @@ def get_all_tickers():
         cli = jquantsapi.ClientV2(api_key=api_key)
         df_list = cli.get_list()
         df_stocks = df_list[df_list['S33'] != '9999'].copy()
+        # 金融・不動産の5業種を除外(S33は文字列の4桁。数値で来た場合に備えて文字列化して比較)
+        df_stocks = df_stocks[~df_stocks['S33'].astype(str).str.strip().isin(EXCLUDED_S33)].copy()
         tickers = [str(code)[:-1] + ".T" for code in df_stocks['Code'].astype(str)]
         names = df_stocks['CoName'].tolist()
         name_map = dict(zip(tickers, names))
@@ -302,12 +316,33 @@ def check_long_term_trend(daily_df):
 # ============================================================
 # Stage A-3: Fスコア(ピオトロスキー式9項目、EDINETデータの直近2期から算出)
 # ============================================================
-F_SCORE_RATIO_THRESHOLD = 6 / 9  # 記事の「6点以上」を9項目換算の達成率として採用
+F_SCORE_RATIO_THRESHOLD = 6 / 9  # 記事の「6点以上」を9項目換算の達成率として採用(参考値。判定は整数比較)
+F_SCORE_DENOMINATOR = 9
+F_SCORE_PASS_POINTS = 6   # 達成率 6/9 以上 → 合格
+F_SCORE_NEXT_POINTS = 5   # 達成率 5/9 以上 6/9 未満 → 次点
+
+VERDICT_PASS = "合格"
+VERDICT_NEXT = "次点"
+VERDICT_FAIL = "不合格"
+VERDICT_FAIL_LOSS = "不合格(赤字)"
+
+
+def classify_f_score(score, max_score):
+    """Fスコアの判定(合格/次点/不合格)。丸め済みratioは使わず整数の比較で境界を決める。
+    項目欠損で分母(max_score)が9未満のときも、達成率 score/max_score で同じ基準を当てる。"""
+    if not max_score or max_score <= 0:
+        return VERDICT_FAIL
+    if score * F_SCORE_DENOMINATOR >= F_SCORE_PASS_POINTS * max_score:
+        return VERDICT_PASS
+    if score * F_SCORE_DENOMINATOR >= F_SCORE_NEXT_POINTS * max_score:
+        return VERDICT_NEXT
+    return VERDICT_FAIL
 
 
 def calc_f_score(fin_data):
     """ピオトロスキー式Fスコアを算出する。
-    戻り値: dict(score, maxScore, ratio) or None(データ不足時)"""
+    戻り値: dict(score, maxScore, ratio, net_income) or None(データ不足時)
+    net_income: 最新期の当期純利益(float)。データが無い場合はNone。"""
     if not fin_data:
         return None
     try:
@@ -341,8 +376,9 @@ def calc_f_score(fin_data):
 
         # 4. 営業CF > 当期純利益(利益の質)
         ni = latest.get("netIncome")
-        if cfo is not None and ni is not None:
-            add_check(float(cfo) > float(ni))
+        net_income = float(ni) if ni is not None else None
+        if cfo is not None and net_income is not None:
+            add_check(float(cfo) > net_income)
 
         # 5. DEレシオ低下(レバレッジ改善)
         de = latest.get("debtToEquityRatio")
@@ -379,7 +415,7 @@ def calc_f_score(fin_data):
         score = sum(1 for c in checks if c)
         max_score = len(checks)
         ratio = score / max_score
-        return {"score": score, "maxScore": max_score, "ratio": round(ratio, 3)}
+        return {"score": score, "maxScore": max_score, "ratio": round(ratio, 3), "net_income": net_income}
     except Exception as e:
         print(f"⚠️ Fスコア算出失敗: {e}")
         return None
@@ -516,6 +552,43 @@ def write_final_watchlist(sh, records):
     print(f"✅ 「{FINAL_SHEET_NAME}」タブに{len(rows)}銘柄を書き込みました(全候補の判定完了)")
 
 
+SECONDARY_SHEET_NAME = "監視銘柄_次点"
+
+
+def write_secondary_watchlist(sh, records):
+    """判定が「次点」の銘柄だけを「監視銘柄_次点」タブに書き出す(「監視銘柄」タブには影響しない)"""
+    today_str = date.today().strftime("%Y/%m/%d")
+    rows = []
+    for rec in records:
+        if str(rec.get("判定", "")).strip() != VERDICT_NEXT:
+            continue
+        rows.append([
+            today_str,
+            rec.get("銘柄コード", ""),
+            rec.get("銘柄名", ""),
+            rec.get("市場", ""),
+            rec.get("平均売買代金(百万円/日)", ""),
+            rec.get("現在値", ""),
+            rec.get("40週MA", ""),
+            rec.get("3年前値", ""),
+            rec.get("Fスコア", ""),
+            rec.get("Fスコア達成率%", ""),
+        ])
+    try:
+        ws = sh.worksheet(SECONDARY_SHEET_NAME)
+        ws.clear()
+    except gspread.exceptions.WorksheetNotFound:
+        ws = sh.add_worksheet(title=SECONDARY_SHEET_NAME, rows=max(len(rows) + 10, 100), cols=len(FINAL_HEADERS))
+    ws.append_row(FINAL_HEADERS)
+    try:
+        ws.freeze(rows=1)
+    except Exception as e:
+        print(f"⚠️ 見出し固定に失敗(処理は継続): {e}")
+    if rows:
+        ws.append_rows(rows, value_input_option="USER_ENTERED")
+    print(f"✅ 「{SECONDARY_SHEET_NAME}」タブに{len(rows)}銘柄を書き込みました")
+
+
 # ============================================================
 # Phase 1: 流動性+長期トレンドのスクリーニング(四半期の初回実行時のみ)
 # ============================================================
@@ -615,7 +688,11 @@ def score_pending_candidates(ws, records):
             # データ不足で判定不能な銘柄は「済み」にして再処理を避け、不合格扱いにする
             updates[idx] = {"済み": "TRUE", "Fスコア": "－", "Fスコア達成率%": "－", "判定": "不合格(データ不足)"}
             continue
-        verdict = "合格" if f_score["ratio"] >= F_SCORE_RATIO_THRESHOLD else "不合格"
+        net_income = f_score.get("net_income")
+        if net_income is not None and net_income <= 0:
+            verdict = VERDICT_FAIL_LOSS  # 赤字(当期純利益0以下)はFスコアに関係なく不合格。純利益が不明(None)なら不合格にしない
+        else:
+            verdict = classify_f_score(f_score["score"], f_score["maxScore"])
         updates[idx] = {
             "済み": "TRUE",
             "Fスコア": f"{f_score['score']}/{f_score['maxScore']}",
@@ -666,6 +743,7 @@ def main():
     _, records_after = read_work_sheet(sh)
     if records_after and all(str(r.get("済み", "")).strip().upper() == "TRUE" for r in records_after):
         write_final_watchlist(sh, records_after)
+        write_secondary_watchlist(sh, records_after)
     else:
         remaining = sum(1 for r in (records_after or []) if str(r.get("済み", "")).strip().upper() != "TRUE")
         print(f"⏳ 未処理が{remaining}件残っています。翌日以降の実行で継続します"
