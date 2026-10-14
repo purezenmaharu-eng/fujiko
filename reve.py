@@ -1,6 +1,11 @@
 # -*- coding: utf-8 -*-
 """
-REVE近似 + マルチプル拡大 判定(フェーズ1: 計算してログに出すだけ) v1.1
+REVE近似 + マルチプル拡大 判定(フェーズ2: LINE・スプレッドシート出力+履歴の蓄積) v1.2
+
+v1.2 変更点(フェーズ2):
+- 評価結果を「REVE履歴」シートに蓄積し、J-Quants無料版(過去2年)で足りない過去のスコアを補って連続上昇を数える
+- 連続上昇は、点と点の間が約4か月を超えて空いたら途切れ扱い(抜けた四半期をまたいで数えない)
+- LINE用のタグ/候補欄、スプレッドシート用の3列(REVE判定・REVEスコア・REVE連続Q)を作る関数を追加
 
 v1.1 変更点:
 - 売上・純利益・ROEを「四半期単独」の前年同期比に変更(累計の差し引きで算出。TradingView版と同じ見方)
@@ -251,11 +256,34 @@ def latest_point_from_yfinance(ticker, jq_df, fcf_yoy_carry=None, roe_chg_carry=
         return None
 
 
+MAX_GAP_DAYS = 130  # 四半期(約91日)+決算期のずれの余裕。これより空いたら連続とみなさない
+
+
 def count_streak(points):
     streak = 0
     for i in range(1, len(points)):
-        streak = streak + 1 if points[i]["score"] > points[i - 1]["score"] else 0
+        gap_ok = True
+        a, b = points[i - 1].get("per_end"), points[i].get("per_end")
+        if a is not None and b is not None:
+            gap_ok = (pd.Timestamp(b) - pd.Timestamp(a)).days <= MAX_GAP_DAYS
+        rising = points[i]["score"] > points[i - 1]["score"]
+        streak = streak + 1 if (rising and gap_ok) else 0
     return streak
+
+
+def merge_points(points, stored):
+    """今回計算できた点に、過去に蓄積したスコア(stored: {"YYYY-MM-DD": score})を足して古い順に並べる。
+    同じ期は今回の計算値を優先(蓄積値は穴埋めにだけ使う)"""
+    have = {p["per_end"].strftime("%Y-%m-%d") for p in points}
+    extra = []
+    for k, v in (stored or {}).items():
+        if k in have:
+            continue
+        try:
+            extra.append({"per_end": pd.Timestamp(k), "score": float(v), "source": "履歴"})
+        except (TypeError, ValueError):
+            continue
+    return sorted(extra + points, key=lambda p: p["per_end"])
 
 
 # ------------------------------------------------------------
@@ -305,7 +333,7 @@ def multiple_expansion(close, fund):
 # ------------------------------------------------------------
 # 1銘柄の判定
 # ------------------------------------------------------------
-def evaluate_reve(ticker, api_key, close=None):
+def evaluate_reve(ticker, api_key, close=None, stored_history=None):
     code = ticker.replace(".T", "")
     df = fetch_jquants_statements(code, api_key)
     if df.empty:
@@ -331,7 +359,8 @@ def evaluate_reve(ticker, api_key, close=None):
     fcf = cur["fcf"] if cur["fcf"] is not None else jq_last["fcf"]
     fcf_yoy = cur["fcf_yoy"] if cur["fcf_yoy"] is not None else jq_last["fcf_yoy"]
 
-    streak = count_streak(points)
+    merged = merge_points(points, stored_history)
+    streak = count_streak(merged)
     score = cur["score"]
     per_up = bool(per_up) and cur["ni_yoy"] is not None and cur["ni_yoy"] > 0
     roe_ok = roe is not None and roe > COST_OF_CAPITAL
@@ -348,9 +377,9 @@ def evaluate_reve(ticker, api_key, close=None):
         label = None
 
     return {
-        "score": round(score, 2), "streak": streak, "points": len(points),
-        # 無料版は過去2年分のみ → 計算できる点が少なく、連続上昇は最大でも(点数-1)回
-        "streak_provisional": len(points) - 1 < NEED_STREAK,
+        "score": round(score, 2), "streak": streak, "points": len(merged),
+        # 無料版は過去2年分のみ → 計算できる点が少なく、連続上昇は最大でも(点数-1)回。履歴が貯まるほど暫定が外れる
+        "streak_provisional": len(merged) - 1 < NEED_STREAK,
         "rev_yoy": cur["rev_yoy"], "ni_yoy": cur["ni_yoy"], "fcf_yoy": fcf_yoy,
         "roe": roe, "roe_chg": cur["roe_chg"],
         "per": per, "pbr": pbr, "per_up": per_up, "pbr_up": bool(pbr_up),
@@ -364,16 +393,16 @@ def evaluate_reve(ticker, api_key, close=None):
 # ------------------------------------------------------------
 # フェーズ1: ログ出力だけ
 # ------------------------------------------------------------
-def run_reve_phase1(tickers, ticker_name_map, close_map=None):
+def run_reve_phase1(tickers, ticker_name_map, close_map=None, stored_history=None):
     api_key = os.environ.get("JQUANTS_API_KEY", "")
     if not api_key:
         print("⏭️ REVE: JQUANTS_API_KEY未設定のためスキップ")
         return {}
-    print(f"\n📈 REVE近似(フェーズ1・ログのみ v1.1) {len(tickers)}銘柄を評価中...")
+    print(f"\n📈 REVE近似(フェーズ2 v1.2) {len(tickers)}銘柄を評価中...")
     results = {}
     for t in tickers:
         try:
-            r = evaluate_reve(t, api_key, (close_map or {}).get(t))
+            r = evaluate_reve(t, api_key, (close_map or {}).get(t), (stored_history or {}).get(t))
         except Exception as e:
             print(f"⚠️ REVE: {t} 評価失敗: {e}")
             continue
@@ -390,7 +419,96 @@ def run_reve_phase1(tickers, ticker_name_map, close_map=None):
               f"{pct(r['fcf_yoy']):>6} {num(r['roe'])}/{num(r['roe_chg'])}pt "
               f"{num(r['per'])}/{ok(r['per_up'])} {num(r['pbr'])}/{ok(r['pbr_up'])} {ok(r['me'])} "
               f"{r['label'] or '－'}  [{r['latest_period']} {r['latest_source']}]")
-    print("※連続の*印: 無料版J-Quantsは過去2年分のみのため暫定(履歴の蓄積はフェーズ2で対応)")
+    print("※連続の*印: 無料版J-Quantsは過去2年分のみのため暫定(「REVE履歴」シートに蓄積され、四半期ごとに外れていく)")
     counts = pd.Series([r["label"] for r in results.values() if r["label"]]).value_counts().to_dict()
     print(f"✅ REVE評価完了 {len(results)}/{len(tickers)}銘柄  判定内訳: {counts or 'なし'}")
     return results
+
+
+
+# ------------------------------------------------------------
+# フェーズ2: 履歴シート・LINE・スプレッドシート用の整形
+# ------------------------------------------------------------
+HISTORY_SHEET_NAME = "REVE履歴"
+HISTORY_HEADERS = ["銘柄", "決算期末", "スコア", "ソース", "記録日"]
+LABEL_ORDER = {"強い買い候補": 0, "買い候補": 1, "監視候補": 2}
+
+
+def load_history(sh):
+    """「REVE履歴」シートを {ticker: {決算期末: スコア}} で返す。シートが無い/読めないときは空dict"""
+    try:
+        ws = sh.worksheet(HISTORY_SHEET_NAME)
+    except Exception:
+        return {}
+    out = {}
+    try:
+        for rec in ws.get_all_records():
+            t, d, sc = str(rec.get("銘柄", "")).strip(), str(rec.get("決算期末", "")).strip(), rec.get("スコア")
+            if not t or not d or sc in ("", None):
+                continue
+            try:
+                out.setdefault(t, {})[d] = float(sc)
+            except (TypeError, ValueError):
+                continue
+    except Exception as e:
+        print(f"⚠️ REVE履歴の読み込み失敗(履歴なしで続行): {e}")
+        return {}
+    return out
+
+
+def new_history_rows(results, stored, today_str):
+    """まだ履歴シートに無い (銘柄, 決算期末) だけを行にする"""
+    rows = []
+    for t, r in results.items():
+        have = (stored or {}).get(t, {})
+        for h in r.get("history", []):
+            if h["per_end"] in have:
+                continue
+            rows.append([t, h["per_end"], h["score"], h["source"], today_str])
+    return rows
+
+
+def save_history(sh, results, stored, today_str, append_rows=None):
+    """新しい点だけを「REVE履歴」シートに追記する。戻り値: 追記した行数。
+    append_rows: 書き込み関数(クォータ超過リトライ付きのものを渡す想定。省略時は ws.append_rows を直接呼ぶ)"""
+    rows = new_history_rows(results, stored, today_str)
+    if not rows:
+        return 0
+    try:
+        ws = sh.worksheet(HISTORY_SHEET_NAME)
+    except Exception:
+        ws = sh.add_worksheet(title=HISTORY_SHEET_NAME, rows=5000, cols=len(HISTORY_HEADERS))
+        ws.append_row(HISTORY_HEADERS)
+    if append_rows is None:
+        ws.append_rows(rows)
+    else:
+        append_rows(ws.append_rows, rows)  # _sheets_call_with_retry(func, *args) の形
+    return len(rows)
+
+
+def line_tag(r):
+    """LINEの銘柄行に足す短いタグ。判定が付かない銘柄は空文字(ノイズを増やさない)"""
+    if not r or not r.get("label"):
+        return ""
+    mark = "*" if r.get("streak_provisional") else ""
+    return f"REVE:{r['label']}({r['streak']}Q{mark})"
+
+
+def line_section(results, ticker_name_map, limit=10):
+    """LINEの「📈 REVE候補」欄。判定が付いた銘柄を強い順に最大limit件"""
+    hits = [(t, r) for t, r in results.items() if r.get("label")]
+    hits.sort(key=lambda kv: (LABEL_ORDER.get(kv[1]["label"], 9), -kv[1]["score"]))
+    lines = [f"{r['label']} {ticker_name_map.get(t, t)} (スコア{r['score']:.2f}・連続{r['streak']}Q"
+             f"{'*' if r.get('streak_provisional') else ''})" for t, r in hits[:limit]]
+    head = f"📈 REVE候補({len(hits)}銘柄、上位{len(lines)}件表示)"
+    return head + "\n" + ("\n".join(lines) if lines else "  (該当なし)")
+
+
+def sheet_cells(r):
+    """スプレッドシートの3列 [REVE判定, REVEスコア, REVE連続Q]。結果が無い銘柄は「－」"""
+    if not r:
+        return ["－", "－", "－"]
+    label = r.get("label") or "－"
+    if r.get("label") and r.get("streak_provisional"):
+        label += "(暫定)"
+    return [label, r["score"], r["streak"]]
