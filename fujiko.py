@@ -12,7 +12,13 @@ from google.oauth2.service_account import Credentials
 from datetime import date
 
 import radikabu_usage_logger
+import sheet_format
 import sizing
+try:
+    import reve  # REVE近似(壊れていても日次実行を止めない)
+except Exception as _e:  # noqa: BLE001
+    reve = None
+    print(f"⚠️ reve.py を読み込めません(REVE近似なしで続行): {_e}")
 
 try:  # ローカル実行時は .env を読む(GitHub Actionsでは環境変数/Secretsがそのまま入る)
     from dotenv import load_dotenv
@@ -1055,7 +1061,23 @@ def yahoo_finance_url(ticker):
     code = ticker.replace(".T", "")
     return f"https://finance.yahoo.co.jp/quote/{code}.T"
 
-def write_to_spreadsheet(today, top_tickers, ticker_name_map, valuations=None, commentaries=None, signal_sets=None, signal_infos=None):
+def _open_spreadsheet_or_none():
+    """スプレッドシートを開く。設定が無い/DRY_RUN/接続失敗のときは None(呼び出し側で履歴なしで続行)"""
+    if DRY_RUN:
+        return None
+    creds_json = os.environ.get("GOOGLE_SHEETS_CREDENTIALS", "")
+    spreadsheet_id = os.environ.get("SPREADSHEET_ID", "")
+    if not creds_json or not spreadsheet_id:
+        return None
+    try:
+        creds = _load_sheets_credentials(creds_json, scopes=["https://www.googleapis.com/auth/spreadsheets"])
+        return gspread.authorize(creds).open_by_key(spreadsheet_id)
+    except Exception as e:
+        print(f"⚠️ スプレッドシートに接続できません: {e}")
+        return None
+
+
+def write_to_spreadsheet(today, top_tickers, ticker_name_map, valuations=None, commentaries=None, signal_sets=None, signal_infos=None, reve_results=None):
     """監視銘柄の中からファンダメンタルズ評価が高い順に選んだ上位銘柄(通常30件)を、
     日付ごとのシートに書き込む。
     【2026/09 根本改革】以前はAce/King/Polygraph/BEPが点灯した銘柄"だけ"を並べていたため、
@@ -1071,6 +1093,7 @@ def write_to_spreadsheet(today, top_tickers, ticker_name_map, valuations=None, c
     valuations = valuations or {}
     signal_sets = signal_sets or {}
     signal_infos = signal_infos or {}
+    reve_results = reve_results or {}
     if DRY_RUN:
         print(f"🧪 [DRY_RUN] スプレッドシート書き込みスキップ(掲載予定{len(top_tickers)}銘柄)")
         return
@@ -1089,12 +1112,13 @@ def write_to_spreadsheet(today, top_tickers, ticker_name_map, valuations=None, c
             ws = sh.worksheet(sheet_name)
             is_new_sheet = False
         except gspread.exceptions.WorksheetNotFound:
-            ws = sh.add_worksheet(title=sheet_name, rows=500, cols=10)
+            ws = sh.add_worksheet(title=sheet_name, rows=500, cols=20)  # 列は15以上使う(10だとグリッド外になる)
             is_new_sheet = True
 
         SHEET_HEADERS = ["日付", "銘柄名", "市場", "本日のテクニカル", "Evy式適正価格", "Evy式割安率%",
                          "株おじさん式理論株価", "株おじさん式割安率%", "株おじさん健全性", "解説", "チャート", "Yahoo!ファイナンス",
-                         "推奨株数", "損切り損失額", "根拠・出どころ"]
+                         "推奨株数", "損切り損失額", "根拠・出どころ",
+                         "REVE判定", "REVEスコア", "REVE連続Q"]  # REVEは既存列の位置を動かさないよう末尾に足す
         if is_new_sheet or ws.row_count == 0 or ws.cell(1, 1).value != "日付":
             _sheets_call_with_retry(ws.append_row, SHEET_HEADERS)
             # 見出し行を固定し、フィルタを設定
@@ -1103,128 +1127,18 @@ def write_to_spreadsheet(today, top_tickers, ticker_name_map, valuations=None, c
                 ws.set_basic_filter()
             except Exception as e:
                 print(f"⚠️ 見出し固定/フィルタ設定に失敗(処理は継続): {e}")
-            # 列幅・折り返し・色分け・縞模様を一括設定(視認性向上)
+        elif ws.row_values(1) != SHEET_HEADERS:
+            # 同じ日の2回目の実行で、列が増えている場合(古い見出し)は見出し行だけ更新する
             try:
-                sheet_id = ws.id
-                # 列インデックス(0始まり): 日付0 銘柄名1 市場2 本日のテクニカル3 Evy適正価格4 Evy割安率5
-                #                          株おじさん理論株価6 株おじさん割安率7 株おじさん健全性8 解説9 チャート10 Yahoo!ファイナンス11
-                (COL_DATE, COL_NAME, COL_MARKET, COL_TECH, COL_EVY_PRICE, COL_EVY_PCT,
-                 COL_KABU_PRICE, COL_KABU_PCT, COL_KABU_HEALTH, COL_COMMENT, COL_CHART, COL_YAHOO,
-                 COL_SHARES, COL_LOSS, COL_REASON) = range(15)
-                requests = []
-
-                # --- 列幅の個別指定(自動リサイズだと解説列が広がりすぎるため固定) ---
-                col_widths = {
-                    COL_DATE: 95, COL_NAME: 160, COL_MARKET: 90, COL_TECH: 130,
-                    COL_EVY_PRICE: 110, COL_EVY_PCT: 110,
-                    COL_KABU_PRICE: 130, COL_KABU_PCT: 130, COL_KABU_HEALTH: 130,
-                    COL_COMMENT: 340, COL_CHART: 110, COL_YAHOO: 110,
-                    COL_SHARES: 110, COL_LOSS: 110, COL_REASON: 420,
-                }
-                for col_idx, width in col_widths.items():
-                    requests.append({
-                        "updateDimensionProperties": {
-                            "range": {"sheetId": sheet_id, "dimension": "COLUMNS", "startIndex": col_idx, "endIndex": col_idx + 1},
-                            "properties": {"pixelSize": width},
-                            "fields": "pixelSize",
-                        }
-                    })
-
-                # --- 解説列はテキスト折り返し+上揃え、行の高さも自動調整 ---
-                requests.append({
-                    "repeatCell": {
-                        "range": {"sheetId": sheet_id, "startColumnIndex": COL_COMMENT, "endColumnIndex": COL_COMMENT + 1},
-                        "cell": {"userEnteredFormat": {"wrapStrategy": "WRAP", "verticalAlignment": "TOP"}},
-                        "fields": "userEnteredFormat.wrapStrategy,userEnteredFormat.verticalAlignment",
-                    }
-                })
-
-                # --- 見出し行を太字+背景色で強調 ---
-                requests.append({
-                    "repeatCell": {
-                        "range": {"sheetId": sheet_id, "startRowIndex": 0, "endRowIndex": 1},
-                        "cell": {"userEnteredFormat": {
-                            "textFormat": {"bold": True},
-                            "backgroundColor": {"red": 0.85, "green": 0.89, "blue": 0.96},
-                        }},
-                        "fields": "userEnteredFormat.textFormat.bold,userEnteredFormat.backgroundColor",
-                    }
-                })
-
-                # --- 縞模様(1行おきの背景色)でデータ行を見やすく ---
-                requests.append({
-                    "addBanding": {
-                        "bandedRange": {
-                            "range": {"sheetId": sheet_id, "startRowIndex": 1, "startColumnIndex": 0, "endColumnIndex": len(SHEET_HEADERS)},
-                            "rowProperties": {
-                                "headerColor": {"red": 0.85, "green": 0.89, "blue": 0.96},
-                                "firstBandColor": {"red": 1, "green": 1, "blue": 1},
-                                "secondBandColor": {"red": 0.96, "green": 0.96, "blue": 0.96},
-                            },
-                        }
-                    }
-                })
-
-                # --- 条件付き書式: Evy式割安率%列(数値の正負で色分け) ---
-                evy_pct_range = {"sheetId": sheet_id, "startRowIndex": 1, "startColumnIndex": COL_EVY_PCT, "endColumnIndex": COL_EVY_PCT + 1}
-                for condition_type, threshold, color in [
-                    ("NUMBER_GREATER_THAN_EQ", 20, {"red": 0.85, "green": 0.94, "blue": 0.85}),
-                    ("NUMBER_LESS", -10, {"red": 0.98, "green": 0.85, "blue": 0.85}),
-                ]:
-                    requests.append({
-                        "addConditionalFormatRule": {
-                            "rule": {
-                                "ranges": [evy_pct_range],
-                                "booleanRule": {
-                                    "condition": {"type": condition_type, "values": [{"userEnteredValue": str(threshold)}]},
-                                    "format": {"backgroundColor": color},
-                                },
-                            },
-                            "index": 0,
-                        }
-                    })
-
-                # --- 条件付き書式: 株おじさん式割安率%列(数値の正負で色分け) ---
-                kabu_pct_range = {"sheetId": sheet_id, "startRowIndex": 1, "startColumnIndex": COL_KABU_PCT, "endColumnIndex": COL_KABU_PCT + 1}
-                for condition_type, threshold, color in [
-                    ("NUMBER_GREATER_THAN_EQ", 20, {"red": 0.85, "green": 0.94, "blue": 0.85}),
-                    ("NUMBER_LESS", -10, {"red": 0.98, "green": 0.85, "blue": 0.85}),
-                ]:
-                    requests.append({
-                        "addConditionalFormatRule": {
-                            "rule": {
-                                "ranges": [kabu_pct_range],
-                                "booleanRule": {
-                                    "condition": {"type": condition_type, "values": [{"userEnteredValue": str(threshold)}]},
-                                    "format": {"backgroundColor": color},
-                                },
-                            },
-                            "index": 0,
-                        }
-                    })
-
-                # --- 条件付き書式: 株おじさん健全性列(テキストに応じて色分け) ---
-                kabu_health_range = {"sheetId": sheet_id, "startRowIndex": 1, "startColumnIndex": COL_KABU_HEALTH, "endColumnIndex": COL_KABU_HEALTH + 1}
-                for keyword, color in [
-                    ("健全", {"red": 0.85, "green": 0.94, "blue": 0.85}),
-                    ("注意", {"red": 0.98, "green": 0.85, "blue": 0.85}),
-                ]:
-                    requests.append({
-                        "addConditionalFormatRule": {
-                            "rule": {
-                                "ranges": [kabu_health_range],
-                                "booleanRule": {
-                                    "condition": {"type": "TEXT_CONTAINS", "values": [{"userEnteredValue": keyword}]},
-                                    "format": {"backgroundColor": color},
-                                },
-                            },
-                            "index": 0,
-                        }
-                    })
-
-                _sheets_call_with_retry(sh.batch_update, {"requests": requests})
+                _sheets_call_with_retry(ws.update, values=[SHEET_HEADERS], range_name="A1")
             except Exception as e:
-                print(f"⚠️ シート装飾設定に失敗(処理は継続): {e}")
+                print(f"⚠️ 見出し行の更新に失敗(処理は継続): {e}")
+        # 装飾(列幅・折り返し・縞模様・色分け)は、新規シートだけでなく「未適用の既存シート」にもかける。
+        # 以前は新規シートの最初の1回だけで、失敗した日は直らなかった。詳細は sheet_format.py
+        try:
+            sheet_format.ensure_decoration(sh, ws, SHEET_HEADERS, call=_sheets_call_with_retry)
+        except Exception as e:
+            print(f"⚠️ シート装飾設定に失敗(処理は継続): {e}")
 
         def _chart_link(ticker):
             return f'=HYPERLINK("{chart_url(ticker)}", "チャートを見る")'
@@ -1265,6 +1179,11 @@ def write_to_spreadsheet(today, top_tickers, ticker_name_map, valuations=None, c
             reason = " / ".join(i["reason"] for i in infos) + f"【出どころ】{infos[0]['source']}"
             return [shares, loss, reason]
 
+        def _reve_cells(ticker):
+            if reve is None:
+                return ["－", "－", "－"]
+            return reve.sheet_cells(reve_results.get(ticker))
+
         def _technical_tag(ticker):
             hit = [label for label, s in signal_sets.items() if ticker in s]
             return "/".join(hit) if hit else "－"
@@ -1277,6 +1196,7 @@ def write_to_spreadsheet(today, top_tickers, ticker_name_map, valuations=None, c
                 + _valuation_cells(ticker)
                 + [_comment_cell(ticker), _chart_link(ticker), _yahoo_link(ticker)]
                 + _sizing_cells(ticker)
+                + _reve_cells(ticker)
             )
         if rows_to_write:
             _sheets_call_with_retry(ws.append_rows, rows_to_write, value_input_option="USER_ENTERED")
@@ -1926,6 +1846,7 @@ if __name__ == "__main__":
     #     圧迫しないよう、日次100件のうち一部だけを使う)。429が出た場合は
     #     即座に打ち切り、ステップ1(yfinance)の結果はそのまま活かす。
 
+    reve_results = {}  # REVE近似の結果 {ticker: dict}。米国株・失敗時は空のまま
     if MARKET == "US":
         print("⏭️ 米国株はEvy式/株おじさん式バリュエーションの対象外のためスキップします")
         fundamental_commentaries, fundamental_valuations = {}, {}
@@ -1951,10 +1872,17 @@ if __name__ == "__main__":
                 fundamental_valuations[_t] = _v
         print(f"✅ yfinance評価完了({len(fundamental_valuations)}/{len(_eval_tickers)}銘柄)")
 
-        # --- REVE近似(フェーズ1: ログのみ。LINE/シートには出さない) ---
+        # --- REVE近似(フェーズ2: 履歴を貯め、LINE・シートにも出す) ---
         try:
-            from reve import run_reve_phase1
-            reve_results = run_reve_phase1(_eval_tickers, TICKER_NAME_MAP)
+            if reve is None:
+                raise RuntimeError("reve.py 未読み込み")
+            _reve_sh = _open_spreadsheet_or_none()
+            _reve_stored = reve.load_history(_reve_sh) if _reve_sh else {}
+            reve_results = reve.run_reve_phase1(_eval_tickers, TICKER_NAME_MAP, stored_history=_reve_stored)
+            if _reve_sh and reve_results:
+                _saved = reve.save_history(_reve_sh, reve_results, _reve_stored, today,
+                                           append_rows=_sheets_call_with_retry)
+                print(f"🗂️ REVE履歴: 新規{_saved}行を追記")
         except Exception as e:
             print(f"⚠️ REVE近似の評価をスキップ: {e}")
 
@@ -2005,9 +1933,7 @@ if __name__ == "__main__":
     # --- LINE通知用(文字数制限があるため上位20件のみ、ヘッダーには正しい総数を表示) ---
     def _valuation_tag(t):
         """バリュエーション情報から短いタグを生成(LINE表示用)"""
-        v = fundamental_valuations.get(t)
-        if not v:
-            return ""
+        v = fundamental_valuations.get(t) or {}
         parts = []
         radi = v.get("radi") or {}
         if radi.get("verdict"):
@@ -2021,6 +1947,9 @@ if __name__ == "__main__":
         kabu_health = v.get("kabuHealth") or {}
         if kabu_health.get("label"):
             parts.append(f"健:{kabu_health['label']}{kabu_health['passed']}/{kabu_health['total']}")
+        _reve_tag = reve.line_tag(reve_results.get(t)) if reve is not None else ""
+        if _reve_tag:
+            parts.append(_reve_tag)
         return f" [{'/'.join(parts)}]" if parts else ""
 
     def _line_format(t, df, label):
@@ -2054,6 +1983,9 @@ if __name__ == "__main__":
     bep_stocks = [_line_format(t, df, "Ace×BEP") for t, df in bep_pairs[:10]]
     msg += f"\n\n🅰️🐢 Ace×BEP同時({len(bep_pairs)}銘柄、上位{len(bep_stocks)}件表示)\n"
     msg += "\n".join(bep_stocks) if bep_stocks else "  (該当なし)"
+
+    if reve is not None and any(r.get("label") for r in reve_results.values()):
+        msg += "\n\n" + reve.line_section(reve_results, TICKER_NAME_MAP)
 
     msg += f"\n\n💴 資金{FUJIKO_CAPITAL:,.0f}円・1回の損失は資金の1%・1銘柄は資金の20%まで(100株単位)"
     msg += f"\n📎 出どころ: {sizing.DATA_SOURCE_TEXT}"
@@ -2093,7 +2025,8 @@ if __name__ == "__main__":
         # yfinance評価の割安度(discountPct)で並べた_rankedを流用(_rankedは(ticker, valuation)のタプル、tickerは".T"付き)
         top_tickers = [t for t, _ in _ranked[:TOP_FUNDAMENTAL_ROWS]]
 
-    write_to_spreadsheet(today, top_tickers, TICKER_NAME_MAP, fundamental_valuations, fundamental_commentaries, signal_sets, signal_infos)
+    write_to_spreadsheet(today, top_tickers, TICKER_NAME_MAP, fundamental_valuations, fundamental_commentaries, signal_sets, signal_infos,
+                         reve_results=reve_results)
 
     # --- docs/ のHTML(GitHub Pages用)。日本株の実行時だけ更新する(米国株の実行で上書きしない) ---
     if MARKET != "US":
