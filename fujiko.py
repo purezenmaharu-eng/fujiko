@@ -1313,6 +1313,17 @@ TRACKING_SIGNAL_COLUMNS = {
 }
 TRACKING_HOLD_DAYS = 10
 TRACKING_HIT_THRESHOLD_PCT = 2.0
+# 追跡処理がレコードから読む列名(_tracking_resolve_pending_signals と existing_keys で使うもの)。
+# 見出し行に空欄の列があっても get_all_records が止まらないよう、これだけを expected_headers に渡す
+TRACKING_REQUIRED_HEADERS = ["ティッカー", "種別", "点灯日", "点灯日終値", "ステータス"]
+
+def _tracking_get_records(ws):
+    """「追跡」シートのレコードを読む。見出し行に TRACKING_REQUIRED_HEADERS が揃っていなければ、不足を示して止まる"""
+    header_row = _sheets_call_with_retry(ws.row_values, 1)
+    missing = [h for h in TRACKING_REQUIRED_HEADERS if h not in header_row]
+    if missing:
+        raise RuntimeError(f"「追跡」シートの見出し行に必要な列がありません: {missing}(見出し行: {header_row})")
+    return _sheets_call_with_retry(ws.get_all_records, expected_headers=TRACKING_REQUIRED_HEADERS)
 
 def _tracking_register_new_signals(ws, combined_df, ticker_name_map, existing_keys, valuations=None):
     """当日点灯したシグナルを「追跡」シートに新規登録する"""
@@ -1455,18 +1466,18 @@ def run_signal_tracking(combined_df, ticker_name_map, valuations=None):
             except Exception as e:
                 print(f"⚠️ 追跡シートの見出し追加に失敗(処理は継続): {e}")
 
-        existing_records = _sheets_call_with_retry(ws.get_all_records)
+        existing_records = _tracking_get_records(ws)
         existing_keys = {(r["ティッカー"], r["種別"], r["点灯日"]) for r in existing_records}
 
         new_count = _tracking_register_new_signals(ws, combined_df, ticker_name_map, existing_keys, valuations)
 
-        records = _sheets_call_with_retry(ws.get_all_records) if new_count else existing_records
+        records = _tracking_get_records(ws) if new_count else existing_records
         resolved_count, hit_count = _tracking_resolve_pending_signals(ws, combined_df, records)
 
         print(f"✅ シグナル的中率トラッキング: 新規登録{new_count}件 / 判定確定{resolved_count}件 / 的中{hit_count}件")
         return new_count, resolved_count, hit_count
     except Exception as e:
-        print(f"❌ シグナル的中率トラッキング失敗: {e}")
+        print(f"❌ シグナル的中率トラッキング失敗: {type(e).__name__}: {e}")
         return None
 
 # ============================================================
