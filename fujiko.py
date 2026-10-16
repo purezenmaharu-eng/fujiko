@@ -1,4 +1,5 @@
 import os
+import sys
 import json
 import time
 import io
@@ -1312,6 +1313,10 @@ TRACKING_SIGNAL_COLUMNS = {
     "Ace_with_BEP_Start": "Ace×BEP",
 }
 TRACKING_HOLD_DAYS = 10
+# 新規登録で各銘柄の直近何行(営業日)まで遡って点灯を拾うか。実行が失敗した日の点灯分を後から拾うための余裕
+TRACKING_LOOKBACK_DAYS = 5
+# 追跡処理が例外で失敗したら True。日次の他の出力を終えたあと __main__ の最後で見て、エラー終了する
+_tracking_failed = False
 TRACKING_HIT_THRESHOLD_PCT = 2.0
 # 追跡処理がレコードから読む列名(_tracking_resolve_pending_signals と existing_keys で使うもの)。
 # 見出し行に空欄の列があっても get_all_records が止まらないよう、これだけを expected_headers に渡す
@@ -1326,49 +1331,56 @@ def _tracking_get_records(ws):
     return _sheets_call_with_retry(ws.get_all_records, expected_headers=TRACKING_REQUIRED_HEADERS)
 
 def _tracking_register_new_signals(ws, combined_df, ticker_name_map, existing_keys, valuations=None):
-    """当日点灯したシグナルを「追跡」シートに新規登録する"""
+    """直近 TRACKING_LOOKBACK_DAYS 行の点灯シグナルを「追跡」シートに新規登録する(古い順)。
+    戻り値: (新規登録件数, うち過去日分の件数)。過去日の行には登録時点のバリュエーションを付けない"""
     valuations = valuations or {}
     new_rows = []
+    past_count = 0
     for ticker, df in combined_df.groupby("Ticker"):
         if df.empty:
             continue
-        last_row = df.iloc[-1]
-        lit_date_str = df.index[-1].strftime("%Y/%m/%d")
-        close_price = last_row.get("Close")
-        if pd.isna(close_price):
-            continue
-        for col, label in TRACKING_SIGNAL_COLUMNS.items():
-            if col not in df.columns or not bool(last_row.get(col, False)):
+        last_pos = len(df) - 1
+        for pos_i in range(max(0, len(df) - TRACKING_LOOKBACK_DAYS), len(df)):
+            row = df.iloc[pos_i]
+            is_latest = pos_i == last_pos
+            lit_date_str = df.index[pos_i].strftime("%Y/%m/%d")
+            close_price = row.get("Close")
+            if pd.isna(close_price):
                 continue
-            key = (ticker, label, lit_date_str)
-            if key in existing_keys:
-                continue
-            # バリュエーション情報を取得
-            v = valuations.get(ticker, {})
-            radi = v.get("radi") or {}
-            evy = v.get("evy") or {}
-            radi_label = radi.get("verdict", "")
-            evy_discount = evy.get("discountPct", "")
-            info = sizing.build_signal_info(label, last_row, FUJIKO_CAPITAL)
-            pos = info["pos"]
-            new_rows.append([
-                ticker_name_map.get(ticker, ticker),
-                ticker,
-                label,
-                get_market_label(ticker),
-                lit_date_str,
-                round(float(close_price), 2),
-                radi_label,
-                evy_discount,
-                "追跡中", "", "", "", "",
-                "見送り" if pos["skip"] else pos["shares"],
-                "－" if pos["skip"] else -round(pos["loss"]),
-                f"{info['reason']}【出どころ】{info['source']}",
-            ])
-            existing_keys.add(key)
+            for col, label in TRACKING_SIGNAL_COLUMNS.items():
+                if col not in df.columns or not bool(row.get(col, False)):
+                    continue
+                key = (ticker, label, lit_date_str)
+                if key in existing_keys:
+                    continue
+                # バリュエーション情報は最新行のみ(今日の値を過去日に付けると誤解を招くため)
+                v = valuations.get(ticker, {}) if is_latest else {}
+                radi = v.get("radi") or {}
+                evy = v.get("evy") or {}
+                radi_label = radi.get("verdict", "")
+                evy_discount = evy.get("discountPct", "")
+                info = sizing.build_signal_info(label, row, FUJIKO_CAPITAL)
+                pos = info["pos"]
+                new_rows.append([
+                    ticker_name_map.get(ticker, ticker),
+                    ticker,
+                    label,
+                    get_market_label(ticker),
+                    lit_date_str,
+                    round(float(close_price), 2),
+                    radi_label,
+                    evy_discount,
+                    "追跡中", "", "", "", "",
+                    "見送り" if pos["skip"] else pos["shares"],
+                    "－" if pos["skip"] else -round(pos["loss"]),
+                    f"{info['reason']}【出どころ】{info['source']}",
+                ])
+                existing_keys.add(key)
+                if not is_latest:
+                    past_count += 1
     if new_rows:
         _sheets_call_with_retry(ws.append_rows, new_rows, value_input_option="RAW")
-    return len(new_rows)
+    return len(new_rows), past_count
 
 def _tracking_resolve_pending_signals(ws, combined_df, records):
     """10営業日経過した「追跡中」行の的中判定を確定する"""
@@ -1469,15 +1481,17 @@ def run_signal_tracking(combined_df, ticker_name_map, valuations=None):
         existing_records = _tracking_get_records(ws)
         existing_keys = {(r["ティッカー"], r["種別"], r["点灯日"]) for r in existing_records}
 
-        new_count = _tracking_register_new_signals(ws, combined_df, ticker_name_map, existing_keys, valuations)
+        new_count, past_count = _tracking_register_new_signals(ws, combined_df, ticker_name_map, existing_keys, valuations)
 
         records = _tracking_get_records(ws) if new_count else existing_records
         resolved_count, hit_count = _tracking_resolve_pending_signals(ws, combined_df, records)
 
-        print(f"✅ シグナル的中率トラッキング: 新規登録{new_count}件 / 判定確定{resolved_count}件 / 的中{hit_count}件")
+        print(f"✅ シグナル的中率トラッキング: 新規登録{new_count}件 / 判定確定{resolved_count}件 / 的中{hit_count}件(うち過去日{past_count}件)")
         return new_count, resolved_count, hit_count
     except Exception as e:
         print(f"❌ シグナル的中率トラッキング失敗: {type(e).__name__}: {e}")
+        global _tracking_failed
+        _tracking_failed = True
         return None
 
 # ============================================================
@@ -2116,3 +2130,8 @@ if __name__ == "__main__":
             yearly_results=yearly_results, rankings=rankings, signal_infos=signal_infos,
             name_map=TICKER_NAME_MAP)
         print(f"✅ HTML出力: {_html_path}")
+
+    # --- 追跡が失敗していたら、他の出力をすべて終えたあとでエラー終了する(日次がsuccessのまま見落とされるのを防ぐ) ---
+    if _tracking_failed:
+        print("::error::シグナル的中率トラッキングが失敗しました")
+        sys.exit(1)
