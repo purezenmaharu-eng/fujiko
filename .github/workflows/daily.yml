@@ -79,7 +79,7 @@ jobs:
         run: |
           python fujiko.py
       - name: Run Fujiko script (US market)
-        if: steps.bizday.outputs.skip != 'true'
+        if: ${{ !cancelled() && steps.bizday.outputs.skip != 'true' }}
         env:
           MARKET: US
           GOOGLE_SHEETS_CREDENTIALS: ${{ secrets.GOOGLE_SHEETS_CREDENTIALS }}
