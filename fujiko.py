@@ -187,6 +187,98 @@ def send_line(message):
 _radikabunavi_session_id = None
 _radikabunavi_disabled = False  # 認証エラー等で使用不可と判定したら以降スキップ
 
+# --- 実行をまたぐ停止フラグ(Google Sheetsの専用タブに保存) ---
+# 429が解消しない呼び出しが実行をまたいで連続3回に達したら、その日(JST)の以降のラジ株ナビ呼び出しをスキップする。
+# Sheetsが読めない・書けないときは例外を出さず、従来どおり動かす(停止フラグが本番を止めてはならない)。
+RADIKABU_STOP_SHEET = "ラジ株ナビ停止状態"
+RADIKABU_STOP_HEADERS = ["日付(JST)", "連続429回数", "停止フラグ", "最終更新"]
+RADIKABU_STOP_THRESHOLD = 3
+_radikabu_stop_state = None  # {"date","count","stopped"}。実行内で1回だけSheetsから読む
+
+def _radikabu_stop_now_jst():
+    from datetime import datetime, timedelta, timezone
+    return datetime.now(timezone(timedelta(hours=9)))
+
+def _radikabu_stop_fresh_state(today):
+    return {"date": today, "count": 0, "stopped": False}
+
+def _radikabu_stop_get_ws(create=False):
+    """停止状態タブを返す。設定なし・失敗・(create=Falseでタブなし)はNone。例外は出さない。"""
+    try:
+        creds_json = os.environ.get("GOOGLE_SHEETS_CREDENTIALS", "")
+        spreadsheet_id = os.environ.get("SPREADSHEET_ID", "")
+        if not creds_json or not spreadsheet_id:
+            return None
+        creds = _load_sheets_credentials(creds_json, scopes=["https://www.googleapis.com/auth/spreadsheets"])
+        sh = gspread.authorize(creds).open_by_key(spreadsheet_id)
+        try:
+            return sh.worksheet(RADIKABU_STOP_SHEET)
+        except gspread.exceptions.WorksheetNotFound:
+            if not create:
+                return None
+            ws = sh.add_worksheet(title=RADIKABU_STOP_SHEET, rows=5, cols=len(RADIKABU_STOP_HEADERS))
+            ws.append_row(RADIKABU_STOP_HEADERS)
+            return ws
+    except Exception as e:
+        print(f"⚠️ ラジ株ナビ停止状態: シートを開けませんでした(従来どおり動作します): {e}")
+        return None
+
+def _radikabu_stop_load():
+    """現在の状態を返す(実行内キャッシュ)。読めない・日付が変わったときは未停止の初期状態。"""
+    global _radikabu_stop_state
+    today = _radikabu_stop_now_jst().strftime("%Y-%m-%d")
+    if _radikabu_stop_state is not None and _radikabu_stop_state["date"] == today:
+        return _radikabu_stop_state
+    state = _radikabu_stop_fresh_state(today)
+    ws = _radikabu_stop_get_ws(create=False)
+    if ws is not None:
+        try:
+            row = ws.row_values(2)
+            if len(row) >= 3 and str(row[0]).strip() == today:
+                state = {
+                    "date": today,
+                    "count": int(str(row[1]).strip() or 0),
+                    "stopped": str(row[2]).strip().upper() in ("TRUE", "1", "停止"),
+                }
+        except Exception as e:
+            print(f"⚠️ ラジ株ナビ停止状態: 読み取り失敗(従来どおり動作します): {e}")
+    _radikabu_stop_state = state
+    return state
+
+def _radikabu_stop_is_active():
+    """停止フラグが立っていればTrue。何があっても例外は出さない。"""
+    try:
+        return bool(_radikabu_stop_load()["stopped"])
+    except Exception:
+        return False
+
+def _radikabu_stop_record(outcome):
+    """outcome='429'(リトライしても解消せず) / 'ok'(成功)。連続回数を更新し、変化があればSheetsへ書く。"""
+    try:
+        state = _radikabu_stop_load()
+        before = dict(state)
+        if outcome == "429":
+            state["count"] += 1
+            if state["count"] >= RADIKABU_STOP_THRESHOLD:
+                state["stopped"] = True
+                print(f"🛑 ラジ株ナビ: 429が連続{state['count']}回に達したため、本日(JST)の以降の呼び出しを停止します")
+        elif outcome == "ok":
+            state["count"] = 0
+        if state == before:
+            return
+        if DRY_RUN:
+            print(f"🧪 [DRY_RUN] ラジ株ナビ停止状態の書き込みスキップ(連続429={state['count']}, 停止={state['stopped']})")
+            return
+        ws = _radikabu_stop_get_ws(create=True)
+        if ws is None:
+            return
+        ws.batch_update([{"range": "A2:D2", "values": [[
+            state["date"], state["count"], "TRUE" if state["stopped"] else "FALSE",
+            _radikabu_stop_now_jst().strftime("%Y-%m-%d %H:%M:%S"),
+        ]]}], value_input_option="RAW")
+    except Exception as e:
+        print(f"⚠️ ラジ株ナビ停止状態: 書き込み失敗(従来どおり動作します): {e}")
+
 def _radikabunavi_request(method, params=None, request_id=1):
     global _radikabunavi_session_id
     headers = {
@@ -282,6 +374,10 @@ def radikabunavi_call_tool(tool_name, arguments):
     cached = _cache_read(tool_name, arguments)
     if cached is not None:
         return cached
+    # --- 実行をまたぐ停止フラグ(429が連続3回に達した日は呼ばない) ---
+    if _radikabu_stop_is_active():
+        print(f"⏭️ ラジ株ナビ: 429連続で停止中のため省略({tool_name})")
+        return None
     # --- 実行あたりの合計予算(窓口A+B) ---
     if _radikabunavi_call_count >= RADIKABUNAVI_RUN_BUDGET:
         print(f"⏭️ ラジ株ナビ: 予算上限に達したため省略({tool_name}, 上限{RADIKABUNAVI_RUN_BUDGET}回/実行)")
@@ -298,6 +394,7 @@ def radikabunavi_call_tool(tool_name, arguments):
         if "error" in result:
             print(f"⚠️ ラジ株ナビAPIエラー({tool_name}, {arguments}): {result['error']}")
             return None
+        _radikabu_stop_record("ok")
         content = result.get("result", {}).get("content", [])
         for block in content:
             if block.get("type") == "text":
@@ -316,6 +413,7 @@ def radikabunavi_call_tool(tool_name, arguments):
         elif status == 429:
             print("❌ ラジ株ナビ: 429が解消しないため日次/月次クォータ超過と判断 → 以降のEDINET取得をスキップします")
             _radikabunavi_disabled = True
+            _radikabu_stop_record("429")
         else:
             print(f"⚠️ ラジ株ナビ呼び出し失敗({tool_name}, {arguments}): {e}")
         return None
