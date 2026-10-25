@@ -54,6 +54,8 @@ class _Base(unittest.TestCase):
             _radikabunavi_ensure_session=mock.Mock(),
             _radikabunavi_request=self.request,
             radikabu_usage_logger=mock.Mock(),
+            _radikabu_stop_is_active=mock.Mock(return_value=False),
+            _radikabu_stop_record=mock.Mock(),
         )
 
     def call(self, tool="get_stock_score", args=None):
