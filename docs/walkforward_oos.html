@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="ja"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>フジコ ウォークフォワード: 期間分割と改善案の試験</title>
+<style>
+:root{--bg:#fff;--fg:#1f2937;--muted:#6b7280;--line:#e5e7eb;--warn:#fef3c7}
+@media (prefers-color-scheme:dark){:root{--bg:#111827;--fg:#e5e7eb;--muted:#9ca3af;--line:#374151;--warn:#422006}}
+body{background:var(--bg);color:var(--fg);font:15px/1.6 system-ui,"Hiragino Sans","Yu Gothic",sans-serif;margin:0;padding:16px;max-width:1100px;margin-inline:auto}
+h1{font-size:1.4rem}h2{font-size:1.1rem;margin-top:2rem}
+table{border-collapse:collapse;width:100%;font-size:.85rem}th,td{border-bottom:1px solid var(--line);padding:5px 6px;text-align:right;vertical-align:top}
+th:first-child,td:first-child{text-align:left}.muted,small{color:var(--muted)}
+.warn{background:var(--warn);padding:8px 12px;border-radius:6px}.wrap{overflow-x:auto}
+</style></head><body>
+<h1>フジコ ウォークフォワード: 日経平均との比較と期間分割(改善案の試験)</h1>
+<div class="warn"><ul>
+<li>銘柄一覧は今の上場銘柄のため生き残りバイアスがあり、成績は良めに出る。</li>
+<li>採用の判断は人間が行う(試す期間で、騰落率とシャープが baseline 以上かつ最大DDが悪化しない案だけを候補にする)。</li>
+</ul></div>
+<p class="muted">更新: 2026/10/28 / 資金 1,000,000円 / 選定は四半期ごと(2022-01-04〜2026-10-09) / 出口ルール(baseline): 損切り2×ATR / 利確4×ATR / 最大保有60営業日</p>
+<p class="muted">選ぶ期間=2022-01〜2024-12、試す期間=2025-01〜データの最後。各期間は直前日の資産を基準にした値(試す期間は2024年末の資産が基準)。
+案は1つずつ変えて baseline と比べ、組み合わせは試していない。日経平均は比較表示のみで、シグナル判定には使わない。</p>
+<h2>Ace</h2><div class='wrap'><table><thead><tr><th rowspan='2'>案</th><th colspan='3'>全体(2022-01〜)</th><th colspan='3'>選ぶ期間(2022-01〜2024-12)</th><th colspan='3'>試す期間(2025-01〜)</th><th rowspan='2'>試す期間の判定</th></tr><tr><th>騰落</th><th>最大DD</th><th>シャープ</th><th>騰落</th><th>最大DD</th><th>シャープ</th><th>騰落</th><th>最大DD</th><th>シャープ</th></tr></thead><tbody><tr><td>1306買い持ち</td><td>+127.3%</td><td>-22.8%</td><td>1.01</td><td>+47.0%</td><td>-22.8%</td><td>0.81</td><td>+54.7%</td><td>-17.7%</td><td>1.33</td><td>－</td></tr><tr><td>日経平均(^N225)買い持ち</td><td>+135.6%</td><td>-26.3%</td><td>0.91</td><td>+36.2%</td><td>-25.5%</td><td>0.61</td><td>+73.0%</td><td>-22.3%</td><td>1.35</td><td>－</td></tr><tr><td>baseline<br><small>今のルール</small><br><small>約定372件</small></td><td>+217.7%</td><td>-14.8%</td><td>1.50</td><td>+100.6%</td><td>-14.8%</td><td>1.63</td><td>+58.4%</td><td>-14.1%</td><td>1.38</td><td>－</td></tr><tr><td>A<br><small>地合いフィルタ: 1306の終値が200日線より下の日はシグナルを見送る</small><br><small>約定291件</small></td><td>+86.6%</td><td>-19.6%</td><td>1.02</td><td>+39.2%</td><td>-19.6%</td><td>0.87</td><td>+34.0%</td><td>-10.6%</td><td>1.26</td><td>満たさない</td></tr><tr><td>C1<br><small>損切り2×ATR・利確6×ATR</small><br><small>約定302件</small></td><td>+187.6%</td><td>-17.5%</td><td>1.39</td><td>+66.7%</td><td>-17.5%</td><td>1.22</td><td>+72.5%</td><td>-14.3%</td><td>1.63</td><td>満たさない</td></tr><tr><td>C2<br><small>損切り3×ATR・利確6×ATR</small><br><small>約定191件</small></td><td>+65.1%</td><td>-16.6%</td><td>0.97</td><td>+49.6%</td><td>-16.6%</td><td>1.16</td><td>+10.4%</td><td>-10.9%</td><td>0.59</td><td>満たさない</td></tr></tbody></table></div><h2>King</h2><div class='wrap'><table><thead><tr><th rowspan='2'>案</th><th colspan='3'>全体(2022-01〜)</th><th colspan='3'>選ぶ期間(2022-01〜2024-12)</th><th colspan='3'>試す期間(2025-01〜)</th><th rowspan='2'>試す期間の判定</th></tr><tr><th>騰落</th><th>最大DD</th><th>シャープ</th><th>騰落</th><th>最大DD</th><th>シャープ</th><th>騰落</th><th>最大DD</th><th>シャープ</th></tr></thead><tbody><tr><td>1306買い持ち</td><td>+127.3%</td><td>-22.8%</td><td>1.01</td><td>+47.0%</td><td>-22.8%</td><td>0.81</td><td>+54.7%</td><td>-17.7%</td><td>1.33</td><td>－</td></tr><tr><td>日経平均(^N225)買い持ち</td><td>+135.6%</td><td>-26.3%</td><td>0.91</td><td>+36.2%</td><td>-25.5%</td><td>0.61</td><td>+73.0%</td><td>-22.3%</td><td>1.35</td><td>－</td></tr><tr><td>baseline<br><small>今のルール</small><br><small>約定358件</small></td><td>+105.5%</td><td>-19.6%</td><td>1.04</td><td>+33.9%</td><td>-18.6%</td><td>0.73</td><td>+53.5%</td><td>-15.6%</td><td>1.51</td><td>－</td></tr><tr><td>A<br><small>地合いフィルタ: 1306の終値が200日線より下の日はシグナルを見送る</small><br><small>約定338件</small></td><td>+81.2%</td><td>-21.9%</td><td>0.89</td><td>+24.7%</td><td>-18.4%</td><td>0.58</td><td>+45.3%</td><td>-14.9%</td><td>1.34</td><td>満たさない</td></tr><tr><td>B<br><small>KingにFスコア5点以上の関門(Aceは対象外)</small><br><small>約定345件</small></td><td>+163.5%</td><td>-15.1%</td><td>1.42</td><td>+43.5%</td><td>-12.8%</td><td>0.99</td><td>+83.6%</td><td>-15.1%</td><td>1.99</td><td>候補条件を満たす</td></tr><tr><td>C1<br><small>損切り2×ATR・利確6×ATR</small><br><small>約定268件</small></td><td>+86.0%</td><td>-19.5%</td><td>0.90</td><td>+24.3%</td><td>-15.8%</td><td>0.56</td><td>+49.6%</td><td>-15.1%</td><td>1.43</td><td>満たさない</td></tr><tr><td>C2<br><small>損切り3×ATR・利確6×ATR</small><br><small>約定219件</small></td><td>+43.0%</td><td>-16.9%</td><td>0.64</td><td>+29.2%</td><td>-16.9%</td><td>0.72</td><td>+10.7%</td><td>-13.9%</td><td>0.51</td><td>満たさない</td></tr></tbody></table></div>
+<h2>案の内容</h2><ul>
+<li>A 地合いフィルタ: シグナル日に1306の終値が200日線より下なら、Ace・Kingのシグナルを見送る(その日までのデータだけを使用)。</li>
+<li>B: KingにFスコア5点以上の関門(既存の関門機能)。Aceには付けない。</li>
+<li>C1: 損切り2×ATR・利確6×ATR。 C2: 損切り3×ATR・利確6×ATR(最大保有は baseline と同じ)。</li>
+<li>対象は株価キャッシュにある171銘柄。取引コスト往復0.2%控除後。1%リスク・20%上限・100株単位の資金管理後の日次資産から算出。シャープ=日次リターンの平均÷標準偏差×√252(無リスク金利0)。</li>
+<li>期間を分けても、同じ銘柄一覧・同じ期間のデータを見て案を決めているため、試す期間は完全な未見データではない。件数が少なく差は偶然の影響を受けやすい。</li></ul>
+</body></html>
