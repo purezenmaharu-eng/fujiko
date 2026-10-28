@@ -1154,6 +1154,23 @@ def yahoo_finance_url(ticker):
     code = ticker.replace(".T", "")
     return f"https://finance.yahoo.co.jp/quote/{code}.T"
 
+def radi_record_cells(valuations, ticker):
+    """[6軸スコア, 理想株価判定]。ラジ株ナビから取得済みの値(valuations[ticker]["scores"/"radi"])を
+    書くだけで追加の呼び出しはしない。取れていない項目は「－」"""
+    v = (valuations or {}).get(ticker) or {}
+    axes = v.get("scores") or {}
+    radi = v.get("radi") or {}
+    axes_cell = "－"
+    if axes:
+        labels = [("valuation", "割安度"), ("profitability", "稼ぐ力"), ("growth", "成長性"),
+                  ("safety", "安全性"), ("shareholderReturn", "還元力"), ("moat", "事業独占力")]
+        axes_cell = "/".join(f"{lb}{'－' if axes.get(k) is None else axes[k]}" for k, lb in labels)
+    ideal_cell = "－"
+    if radi.get("verdict"):
+        alpha = radi.get("alphaPct")
+        ideal_cell = f"{radi['verdict']}({alpha}%)" if alpha is not None else str(radi["verdict"])
+    return [axes_cell, ideal_cell]
+
 def write_to_spreadsheet(today, top_tickers, ticker_name_map, valuations=None, commentaries=None, signal_sets=None, signal_infos=None):
     """監視銘柄の中からファンダメンタルズ評価が高い順に選んだ上位銘柄(通常30件)を、
     日付ごとのシートに書き込む。
@@ -1172,6 +1189,8 @@ def write_to_spreadsheet(today, top_tickers, ticker_name_map, valuations=None, c
     signal_infos = signal_infos or {}
     if DRY_RUN:
         print(f"🧪 [DRY_RUN] スプレッドシート書き込みスキップ(掲載予定{len(top_tickers)}銘柄)")
+        for t in top_tickers:
+            print(f"🧪 [DRY_RUN] 6軸/理想株価: {t} {radi_record_cells(valuations, t)}")
         return
     try:
         creds_json = os.environ.get("GOOGLE_SHEETS_CREDENTIALS", "")
@@ -1193,7 +1212,7 @@ def write_to_spreadsheet(today, top_tickers, ticker_name_map, valuations=None, c
 
         SHEET_HEADERS = ["日付", "銘柄名", "市場", "本日のテクニカル", "Evy式適正価格", "Evy式割安率%",
                          "株おじさん式理論株価", "株おじさん式割安率%", "株おじさん健全性", "解説", "チャート", "Yahoo!ファイナンス",
-                         "推奨株数", "損切り損失額", "根拠・出どころ"]
+                         "推奨株数", "損切り損失額", "根拠・出どころ", "6軸スコア", "理想株価判定"]
         if is_new_sheet or ws.row_count == 0 or ws.cell(1, 1).value != "日付":
             _sheets_call_with_retry(ws.append_row, SHEET_HEADERS)
             # 見出し行を固定し、フィルタを設定
@@ -1209,7 +1228,7 @@ def write_to_spreadsheet(today, top_tickers, ticker_name_map, valuations=None, c
                 #                          株おじさん理論株価6 株おじさん割安率7 株おじさん健全性8 解説9 チャート10 Yahoo!ファイナンス11
                 (COL_DATE, COL_NAME, COL_MARKET, COL_TECH, COL_EVY_PRICE, COL_EVY_PCT,
                  COL_KABU_PRICE, COL_KABU_PCT, COL_KABU_HEALTH, COL_COMMENT, COL_CHART, COL_YAHOO,
-                 COL_SHARES, COL_LOSS, COL_REASON) = range(15)
+                 COL_SHARES, COL_LOSS, COL_REASON, COL_AXES, COL_IDEAL) = range(17)
                 requests = []
 
                 # --- 列幅の個別指定(自動リサイズだと解説列が広がりすぎるため固定) ---
@@ -1219,6 +1238,7 @@ def write_to_spreadsheet(today, top_tickers, ticker_name_map, valuations=None, c
                     COL_KABU_PRICE: 130, COL_KABU_PCT: 130, COL_KABU_HEALTH: 130,
                     COL_COMMENT: 340, COL_CHART: 110, COL_YAHOO: 110,
                     COL_SHARES: 110, COL_LOSS: 110, COL_REASON: 420,
+                    COL_AXES: 330, COL_IDEAL: 130,
                 }
                 for col_idx, width in col_widths.items():
                     requests.append({
@@ -1376,6 +1396,7 @@ def write_to_spreadsheet(today, top_tickers, ticker_name_map, valuations=None, c
                 + _valuation_cells(ticker)
                 + [_comment_cell(ticker), _chart_link(ticker), _yahoo_link(ticker)]
                 + _sizing_cells(ticker)
+                + radi_record_cells(valuations, ticker)
             )
         if rows_to_write:
             _sheets_call_with_retry(ws.append_rows, rows_to_write, value_input_option="USER_ENTERED")
