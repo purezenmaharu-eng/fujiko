@@ -1171,6 +1171,34 @@ def radi_record_cells(valuations, ticker):
         ideal_cell = f"{radi['verdict']}({alpha}%)" if alpha is not None else str(radi["verdict"])
     return [axes_cell, ideal_cell]
 
+YEAR_BUCKETS = [("2023年", 2023, 2023), ("2024年", 2024, 2024), ("2025年以降", 2025, None)]
+# 年別成績の対象。Ace×BEPは評価表への掲載のみ(売買判断・株数計算には影響しない)
+YEARLY_SIGNAL_COLS = ("Ace_Start", "King_Start", "Ace_with_BEP_Start")
+
+
+def build_yearly_results(portfolio_results):
+    """{シグナル列: {期間名: 指標 or None}}。資金管理後の日次資産(portfolio_results[col]["equity"])から出す"""
+    return {col: {name: sizing.period_metrics(portfolio_results[col]["equity"], y0, y1) for name, y0, y1 in YEAR_BUCKETS}
+            for col in YEARLY_SIGNAL_COLS if col in portfolio_results}
+
+
+ACE_BEP_NOTE = "Ace×BEPも点灯(回数少なめ29回)"
+
+
+def sizing_cells(infos):
+    """[推奨株数, 損切り損失額, 根拠・出どころ]。点灯シグナルが無い銘柄は株数のみ(直近終値・2ATR損切りで試算)。
+    株数・損切り損失額は先頭のシグナルの分だけ。他のシグナルと一緒にAce×BEPも点灯しているときだけ、根拠の列に注記を足す"""
+    if not infos:
+        return ["－", "－", "シグナル非点灯(ファンダメンタルズ上位として掲載)"]
+    pos = infos[0]["pos"]
+    shares = "見送り" if pos["skip"] else pos["shares"]
+    loss = "－" if pos["skip"] else -round(pos["loss"])
+    reason = " / ".join(i["reason"] for i in infos)
+    if len(infos) > 1 and any(i["label"] == "Ace×BEP" for i in infos):
+        reason += f" / {ACE_BEP_NOTE}"
+    return [shares, loss, reason + f"【出どころ】{infos[0]['source']}"]
+
+
 def write_to_spreadsheet(today, top_tickers, ticker_name_map, valuations=None, commentaries=None, signal_sets=None, signal_infos=None):
     """監視銘柄の中からファンダメンタルズ評価が高い順に選んだ上位銘柄(通常30件)を、
     日付ごとのシートに書き込む。
@@ -1189,6 +1217,9 @@ def write_to_spreadsheet(today, top_tickers, ticker_name_map, valuations=None, c
     signal_infos = signal_infos or {}
     if DRY_RUN:
         print(f"🧪 [DRY_RUN] スプレッドシート書き込みスキップ(掲載予定{len(top_tickers)}銘柄)")
+        for t in top_tickers:
+            if any(i["label"] == "Ace×BEP" for i in signal_infos.get(t) or []):
+                print(f"🧪 [DRY_RUN] Ace×BEP点灯の根拠列: {t} {sizing_cells(signal_infos[t])}")
         for t in top_tickers:
             print(f"🧪 [DRY_RUN] 6軸/理想株価: {t} {radi_record_cells(valuations, t)}")
         return
@@ -1374,15 +1405,7 @@ def write_to_spreadsheet(today, top_tickers, ticker_name_map, valuations=None, c
             return commentaries.get(ticker) or "－"
 
         def _sizing_cells(ticker):
-            """[推奨株数, 損切り損失額, 根拠・出どころ]。点灯シグナルが無い銘柄は株数のみ(直近終値・2ATR損切りで試算)"""
-            infos = signal_infos.get(ticker) or []
-            if not infos:
-                return ["－", "－", "シグナル非点灯(ファンダメンタルズ上位として掲載)"]
-            pos = infos[0]["pos"]
-            shares = "見送り" if pos["skip"] else pos["shares"]
-            loss = "－" if pos["skip"] else -round(pos["loss"])
-            reason = " / ".join(i["reason"] for i in infos) + f"【出どころ】{infos[0]['source']}"
-            return [shares, loss, reason]
+            return sizing_cells(signal_infos.get(ticker) or [])
 
         def _technical_tag(ticker):
             hit = [label for label, s in signal_sets.items() if ticker in s]
@@ -1986,12 +2009,9 @@ if __name__ == "__main__":
         bench_result["period"] = (_p_start, _p_end)
         print(f"  [{BENCH}買い持ち {_p_start:%Y-%m-%d}〜{_p_end:%Y-%m-%d}] 最終リターン:{bench_result['final_return_pct']:+.2f}% / "
               f"最大DD:{bench_result['max_drawdown_pct']:.2f}% / シャープ(年率):{bench_result['sharpe']:.2f}")
-    YEAR_BUCKETS = [("2023年", 2023, 2023), ("2024年", 2024, 2024), ("2025年以降", 2025, None)]
-    for _col in ("Ace_Start", "King_Start"):
-        yearly_results[_col] = {}
-        for _name, _y0, _y1 in YEAR_BUCKETS:
-            _m = sizing.period_metrics(portfolio_results[_col]["equity"], _y0, _y1)
-            yearly_results[_col][_name] = _m
+    yearly_results = build_yearly_results(portfolio_results)
+    for _col, _buckets in yearly_results.items():
+        for _name, _m in _buckets.items():
             _txt = "取引なし" if _m is None else f"最終リターン:{_m['final_return_pct']:+.2f}% / シャープ(年率):{_m['sharpe']:.2f}"
             print(f"  [{signal_labels[_col]} {_name}] {_txt}")
 
