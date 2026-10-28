@@ -179,16 +179,23 @@ def equity_metrics(eq, base):
             "sharpe": sharpe}
 
 
-def buy_and_hold(close, capital, start, end):
-    """start〜end の終値で買い持ちした場合の指標(start日の終値で全額買い)"""
+def bench_equity(close, capital, start, end):
+    """start〜end の終値で買い持ちした場合の日次資産Series(start日の終値で全額買い)。足りなければ空"""
     c = close.loc[start:end].dropna()
     # データ異常(例: 1306.Tの2026/3/30-31は他の日の約1/10で配信される)を、前後5日の中央値から
     # 半分未満/2倍超に外れた日として除外する
     med = c.rolling(5, center=True, min_periods=3).median()
     c = c[(c / med > 0.5) & (c / med < 2)]
     if len(c) < 2:
+        return pd.Series(dtype=float)
+    return capital * c / c.iloc[0]
+
+
+def buy_and_hold(close, capital, start, end):
+    """start〜end の終値で買い持ちした場合の指標(start日の終値で全額買い)"""
+    eq = bench_equity(close, capital, start, end)
+    if len(eq) < 2:
         return equity_metrics(None, capital)
-    eq = capital * c / c.iloc[0]
     return equity_metrics(eq.iloc[1:], capital)
 
 

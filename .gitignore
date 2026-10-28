@@ -20,3 +20,6 @@ venv/
 
 # REVE近似のJ-Quantsキャッシュ
 .cache_reve/
+
+# ウォークフォワード検証の株価・決算キャッシュ
+.cache_wf/
