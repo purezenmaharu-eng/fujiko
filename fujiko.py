@@ -1880,6 +1880,10 @@ TOP_FUNDAMENTAL_ROWS = 30  # メインシートに掲載する、ファンダメ
 # ============================================================
 # import時(テスト・他プロジェクトからの関数利用)に取得・通知・シート書き込みが走らないようにする
 if __name__ == "__main__":
+    # リダイレクト時(cp932)に絵文字で落ちないよう、出力できない文字は置き換える
+    import sys as _sys
+    _sys.stdout.reconfigure(errors="replace")
+    _sys.stderr.reconfigure(errors="replace")
     START = "2023-01-01"
     END   = (date.today() + pd.Timedelta(days=1)).strftime("%Y-%m-%d")
     BENCH = "^GSPC" if MARKET == "US" else "1306.T"

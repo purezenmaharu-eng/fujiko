@@ -48,7 +48,7 @@ def main(argv=None):
         return
     by_title = {w.title: w for w in worksheets}
     sh.reorder_worksheets([by_title[t] for t in order])
-    print("✅ 並べ替え完了")
+    print("[OK] reorder done")
 
 
 if __name__ == "__main__":
