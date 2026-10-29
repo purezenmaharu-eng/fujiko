@@ -1,5 +1,5 @@
 """日次シートの日付タブ(2026-10-29 形式)を、新しい日付が左になるように並べ替える。
-日付以外のタブ(追跡・サマリーなど)は今の位置のまま動かさない。既定は dry-run、--apply で実際に並べ替える。
+日付以外のタブ(追跡・サマリーなど)は今の相対順のまま左端にまとめ、その右に日付タブを並べる。既定は dry-run、--apply で実際に並べ替える。
 """
 import argparse
 import os
@@ -13,18 +13,15 @@ def is_date_tab(title):
 
 
 def new_date_tab_index(titles):
-    """新しい日付タブを入れる位置。最初の日付タブの位置(=左端に並ぶ日付以外のタブの右隣)。日付タブが無ければ末尾"""
-    for i, t in enumerate(titles):
-        if is_date_tab(t):
-            return i
-    return len(titles)
+    """新しい日付タブを入れる位置。左端にまとめた日付以外のタブの直後(=日付タブの一番左)"""
+    return sum(1 for t in titles if not is_date_tab(t))
 
 
 def planned_order(titles):
-    """日付タブの占める位置はそのままに、そこへ新しい日付順で入れ直した並びを返す"""
+    """日付以外のタブを今の相対順のまま左端にまとめ、その右に日付タブを新しい順で並べる"""
+    others = [t for t in titles if not is_date_tab(t)]
     dates = sorted((t for t in titles if is_date_tab(t)), reverse=True)
-    it = iter(dates)
-    return [next(it) if is_date_tab(t) else t for t in titles]
+    return others + dates
 
 
 def main(argv=None):
@@ -42,6 +39,7 @@ def main(argv=None):
     order = planned_order(titles)
     print("現在:", titles)
     print("並べ替え後:", order)
+    print("動くタブ数:", sum(1 for a, b in zip(titles, order) if a != b))
     if order == titles:
         print("すでに新しい日付が左です。変更なし")
         return

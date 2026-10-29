@@ -1208,7 +1208,7 @@ def write_to_spreadsheet(today, top_tickers, ticker_name_map, valuations=None, c
             ws = sh.worksheet(sheet_name)
             is_new_sheet = False
         except gspread.exceptions.WorksheetNotFound:
-            # 最新の日付タブを日付タブの一番左に入れる(追跡などが左端にあればその右隣)
+            # 最新の日付タブを日付タブの一番左(左端にまとめた日付以外のタブの直後)に入れる
             _idx = reorder_tabs.new_date_tab_index([w.title for w in sh.worksheets()])
             ws = sh.add_worksheet(title=sheet_name, rows=500, cols=10, index=_idx)
             is_new_sheet = True

@@ -19,15 +19,15 @@ class TestReorder(unittest.TestCase):
         for t in ("追跡", "サマリー", "2026/10/29", "2026-10-2"):
             self.assertFalse(rt.is_date_tab(t))
 
-    def test_new_index_after_leading_non_date(self):
-        self.assertEqual(rt.new_date_tab_index(["追跡", "2026-10-28", "2026-10-27"]), 1)
+    def test_new_index_after_all_non_date(self):
+        self.assertEqual(rt.new_date_tab_index(["追跡", "2026-10-28", "サマリー", "2026-10-27"]), 2)
         self.assertEqual(rt.new_date_tab_index(["2026-10-28"]), 0)
         self.assertEqual(rt.new_date_tab_index(["追跡", "サマリー"]), 2)
 
-    def test_planned_order_keeps_non_date_in_place(self):
+    def test_planned_order_groups_non_date_left(self):
         titles = ["追跡", "2026-10-27", "サマリー", "2026-10-29", "2026-10-28", "監視銘柄"]
         self.assertEqual(rt.planned_order(titles),
-                         ["追跡", "2026-10-29", "サマリー", "2026-10-28", "2026-10-27", "監視銘柄"])
+                         ["追跡", "サマリー", "監視銘柄", "2026-10-29", "2026-10-28", "2026-10-27"])
 
     def test_already_sorted_unchanged(self):
         t = ["追跡", "2026-10-29", "2026-10-28"]
