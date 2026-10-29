@@ -14,6 +14,7 @@ from datetime import date
 
 import radikabu_usage_logger
 import sizing
+import reorder_tabs
 
 try:  # ローカル実行時は .env を読む(GitHub Actionsでは環境変数/Secretsがそのまま入る)
     from dotenv import load_dotenv
@@ -1207,7 +1208,9 @@ def write_to_spreadsheet(today, top_tickers, ticker_name_map, valuations=None, c
             ws = sh.worksheet(sheet_name)
             is_new_sheet = False
         except gspread.exceptions.WorksheetNotFound:
-            ws = sh.add_worksheet(title=sheet_name, rows=500, cols=10)
+            # 最新の日付タブを日付タブの一番左(左端にまとめた日付以外のタブの直後)に入れる
+            _idx = reorder_tabs.new_date_tab_index([w.title for w in sh.worksheets()])
+            ws = sh.add_worksheet(title=sheet_name, rows=500, cols=10, index=_idx)
             is_new_sheet = True
 
         SHEET_HEADERS = ["日付", "銘柄名", "市場", "本日のテクニカル", "Evy式適正価格", "Evy式割安率%",
@@ -1877,6 +1880,10 @@ TOP_FUNDAMENTAL_ROWS = 30  # メインシートに掲載する、ファンダメ
 # ============================================================
 # import時(テスト・他プロジェクトからの関数利用)に取得・通知・シート書き込みが走らないようにする
 if __name__ == "__main__":
+    # リダイレクト時(cp932)に絵文字で落ちないよう、出力できない文字は置き換える
+    import sys as _sys
+    _sys.stdout.reconfigure(errors="replace")
+    _sys.stderr.reconfigure(errors="replace")
     START = "2023-01-01"
     END   = (date.today() + pd.Timedelta(days=1)).strftime("%Y-%m-%d")
     BENCH = "^GSPC" if MARKET == "US" else "1306.T"

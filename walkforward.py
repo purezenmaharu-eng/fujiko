@@ -1239,4 +1239,8 @@ def main():
 
 
 if __name__ == "__main__":
+    # リダイレクト時(cp932)に絵文字で落ちないよう、出力できない文字は置き換える
+    import sys as _sys
+    _sys.stdout.reconfigure(errors="replace")
+    _sys.stderr.reconfigure(errors="replace")
     main()
