@@ -1449,6 +1449,105 @@ def _tracking_get_records(ws):
         raise RuntimeError(f"「追跡」シートの見出し行に必要な列がありません: {missing}(見出し行: {header_row})")
     return _sheets_call_with_retry(ws.get_all_records, expected_headers=TRACKING_REQUIRED_HEADERS)
 
+# ---- 追跡用の価格取得(シグナル判定用の combined_df とは別。判定の終値の取得だけに使う) ----
+TRACKING_PRICE_CHUNK_SIZE = 50
+TRACKING_PRICE_CHUNK_WAIT_SEC = 1.0
+# 10営業日は最短でも暦14日。これより新しい点灯日の行は判定対象にならないので価格を取らない
+TRACKING_MIN_CALENDAR_DAYS = 14
+
+def _tracking_market_of(ticker):
+    return "JP" if str(ticker).endswith(".T") else "US"
+
+def _tracking_pending_tickers(records, market, known=(), today=None):
+    """価格を追加で取る必要がある「追跡中」のティッカーと、その最古の点灯日を返す({ticker: Timestamp})。
+    known(combined_dfに既にある銘柄)・別市場・10営業日が未経過になり得る点灯日は除く"""
+    today = pd.Timestamp.today().normalize() if today is None else pd.Timestamp(today)
+    cutoff = today - pd.Timedelta(days=TRACKING_MIN_CALENDAR_DAYS)
+    earliest = {}
+    for rec in records:
+        if rec.get("ステータス") != "追跡中":
+            continue
+        ticker = rec.get("ティッカー")
+        if not ticker or ticker in known or _tracking_market_of(ticker) != market:
+            continue
+        try:
+            lit_date = pd.to_datetime(rec.get("点灯日"), format="%Y/%m/%d")
+        except (TypeError, ValueError):
+            continue
+        if pd.isna(lit_date) or lit_date > cutoff:
+            continue
+        earliest[ticker] = min(earliest.get(ticker, lit_date), lit_date)
+    return earliest
+
+def _tracking_close_series(df, ticker):
+    """yf.download の戻り値から終値の列を取り出す(重複日付は最後を残し、欠損は除く)。取れなければ None"""
+    if df is None or len(df) == 0:
+        return None
+    sub = df
+    if isinstance(df.columns, pd.MultiIndex):
+        if ticker in df.columns.get_level_values(0):
+            sub = df[ticker]
+        else:
+            sub = df.copy()
+            sub.columns = df.columns.get_level_values(0)
+    if "Close" not in sub.columns:
+        return None
+    close = sub["Close"]
+    if isinstance(close, pd.DataFrame):
+        close = close.iloc[:, 0]
+    close = close[~close.index.duplicated(keep="last")].sort_index().dropna()
+    return close if len(close) else None
+
+def fetch_tracking_prices(tickers, start, end=None, chunk_size=None, downloader=None, sleep=None):
+    """追跡の判定に使う終値だけを取得する。戻り値: ({ticker: 終値のSeries}, 取れなかったtickerのlist)。
+    chunk_size 銘柄ずつ yf.download でまとめ取得し、チャンクが失敗したら(または一部が空なら)1銘柄ずつ取り直す。
+    それでも取れない銘柄は警告を出して飛ばす(例外は投げない)"""
+    chunk_size = chunk_size or TRACKING_PRICE_CHUNK_SIZE
+    downloader = downloader or yf.download
+    sleep = sleep or time.sleep
+    prices, failed = {}, []
+    tickers = list(tickers)
+    for i in range(0, len(tickers), chunk_size):
+        chunk = tickers[i:i + chunk_size]
+        if i:
+            sleep(TRACKING_PRICE_CHUNK_WAIT_SEC)
+        try:
+            df = downloader(chunk, start=start, end=end, auto_adjust=True, progress=False,
+                            group_by="ticker", threads=True)
+        except Exception as e:
+            print(f"⚠️ 追跡用の価格まとめ取得に失敗({type(e).__name__}) → {len(chunk)}銘柄を1銘柄ずつ取り直します")
+            df = None
+        for t in chunk:
+            close = _tracking_close_series(df, t) if df is not None else None
+            if close is None:
+                try:
+                    close = _tracking_close_series(
+                        downloader(t, start=start, end=end, auto_adjust=True, progress=False), t)
+                except Exception:
+                    close = None
+            if close is None:
+                failed.append(t)
+            else:
+                prices[t] = close
+    if failed:
+        print(f"⚠️ 追跡用の価格を取得できなかった銘柄 {len(failed)}件(判定を見送ります): {failed[:10]}{'...' if len(failed) > 10 else ''}")
+    return prices, failed
+
+def _tracking_fetch_missing_prices(records, known_tickers, market, today=None, fetcher=None):
+    """combined_df に無い「追跡中」の銘柄の価格を追加で取る。失敗しても空dictを返す(他の判定は続ける)"""
+    try:
+        earliest = _tracking_pending_tickers(records, market, known=known_tickers, today=today)
+        if not earliest:
+            return {}
+        start = (min(earliest.values()) - pd.Timedelta(days=7)).strftime("%Y-%m-%d")
+        end = ((pd.Timestamp.today() if today is None else pd.Timestamp(today)) + pd.Timedelta(days=1)).strftime("%Y-%m-%d")
+        prices, failed = (fetcher or fetch_tracking_prices)(sorted(earliest), start, end)
+        print(f"📈 追跡用の価格を追加取得: {len(prices)}銘柄(取得失敗{len(failed)}件)")
+        return prices
+    except Exception as e:
+        print(f"⚠️ 追跡用の価格の追加取得に失敗(監視銘柄分の判定は続けます): {type(e).__name__}: {e}")
+        return {}
+
 def _tracking_register_new_signals(ws, combined_df, ticker_name_map, existing_keys, valuations=None):
     """直近 TRACKING_LOOKBACK_DAYS 行の点灯シグナルを「追跡」シートに新規登録する(古い順)。
     戻り値: (新規登録件数, うち過去日分の件数)。過去日の行には登録時点のバリュエーションを付けない"""
@@ -1501,8 +1600,16 @@ def _tracking_register_new_signals(ws, combined_df, ticker_name_map, existing_ke
         _sheets_call_with_retry(ws.append_rows, new_rows, value_input_option="RAW")
     return len(new_rows), past_count
 
-def _tracking_resolve_pending_signals(ws, combined_df, records):
-    """10営業日経過した「追跡中」行の的中判定を確定する"""
+def _tracking_resolve_pending_signals(ws, combined_df, records, extra_prices=None, dry_run=False, stats=None):
+    """10営業日経過した「追跡中」行の的中判定を確定する。
+    終値は extra_prices({ticker: 終値のSeries})にあればそれを、無ければ combined_df を使う。
+    dry_run=True ならシートに書かない。stats(dict)を渡すと、読み飛ばした理由ごとの件数を数える"""
+    extra_prices = extra_prices or {}
+    stats = {} if stats is None else stats
+
+    def _skip(reason):
+        stats[reason] = stats.get(reason, 0) + 1
+
     cells_to_update = []
     resolved_count = 0
     hit_count = 0
@@ -1514,32 +1621,42 @@ def _tracking_resolve_pending_signals(ws, combined_df, records):
         lit_date_str = rec.get("点灯日")
         lit_close = rec.get("点灯日終値")
         if not ticker or not lit_date_str or lit_close in ("", None):
+            _skip("行の値が不足")
             continue
         try:
             lit_close = float(lit_close)
         except (TypeError, ValueError):
+            _skip("行の値が不足")
             continue
 
-        ticker_df = combined_df[combined_df["Ticker"] == ticker].sort_index()
-        if ticker_df.empty:
+        if ticker in extra_prices:
+            closes = extra_prices[ticker]
+        else:
+            ticker_df = combined_df[combined_df["Ticker"] == ticker].sort_index()
+            closes = None if ticker_df.empty else ticker_df["Close"]
+        if closes is None or len(closes) == 0:
+            _skip("価格データなし")
             continue
         try:
             lit_date = pd.to_datetime(lit_date_str, format="%Y/%m/%d")
-            pos = ticker_df.index.get_loc(lit_date)
+            pos = closes.index.get_loc(lit_date)
         except KeyError:
+            _skip("点灯日が価格データにない")
             continue
         if isinstance(pos, (slice, np.ndarray)):
+            _skip("重複日付")
             continue  # 重複日付など異常系はスキップ
 
         target_pos = pos + TRACKING_HOLD_DAYS
-        if target_pos >= len(ticker_df):
+        if target_pos >= len(closes):
+            _skip("10営業日が未経過")
             continue  # まだ規定営業日数を経過していない
 
-        judge_row = ticker_df.iloc[target_pos]
-        judge_close = judge_row["Close"]
+        judge_close = closes.iloc[target_pos]
         if pd.isna(judge_close):
+            _skip("判定日の終値が欠損")
             continue
-        judge_date_str = ticker_df.index[target_pos].strftime("%Y/%m/%d")
+        judge_date_str = closes.index[target_pos].strftime("%Y/%m/%d")
         pct_change = (judge_close - lit_close) / lit_close * 100
         is_hit = pct_change >= TRACKING_HIT_THRESHOLD_PCT
 
@@ -1552,7 +1669,7 @@ def _tracking_resolve_pending_signals(ws, combined_df, records):
         for col_offset, value in enumerate(values):
             cells_to_update.append(gspread.Cell(row=row_num, col=9 + col_offset, value=value))
 
-    if cells_to_update:
+    if cells_to_update and not dry_run:
         _sheets_call_with_retry(ws.update_cells, cells_to_update, value_input_option="RAW")
     return resolved_count, hit_count
 
@@ -1603,7 +1720,8 @@ def run_signal_tracking(combined_df, ticker_name_map, valuations=None):
         new_count, past_count = _tracking_register_new_signals(ws, combined_df, ticker_name_map, existing_keys, valuations)
 
         records = _tracking_get_records(ws) if new_count else existing_records
-        resolved_count, hit_count = _tracking_resolve_pending_signals(ws, combined_df, records)
+        extra_prices = _tracking_fetch_missing_prices(records, set(combined_df["Ticker"].unique()), MARKET)
+        resolved_count, hit_count = _tracking_resolve_pending_signals(ws, combined_df, records, extra_prices=extra_prices)
 
         print(f"✅ シグナル的中率トラッキング: 新規登録{new_count}件 / 判定確定{resolved_count}件 / 的中{hit_count}件(うち過去日{past_count}件)")
         return new_count, resolved_count, hit_count
@@ -1612,6 +1730,34 @@ def run_signal_tracking(combined_df, ticker_name_map, valuations=None):
         global _tracking_failed
         _tracking_failed = True
         return None
+
+def run_tracking_dryrun(market=None):
+    """TRACKING_DRYRUN=1 用。読み取り専用でシートを読み、追跡用の価格を取得して、
+    判定される予定の件数・的中数・読み飛ばしの内訳だけを表示する(シートには一切書かない)"""
+    market = market or MARKET
+    creds_json = os.environ.get("GOOGLE_SHEETS_CREDENTIALS", "")
+    spreadsheet_id = os.environ.get("SPREADSHEET_ID", "")
+    if not creds_json or not spreadsheet_id:
+        print("⚠️ スプレッドシート設定未完了 → dry-runを中止します")
+        return None
+    creds = _load_sheets_credentials(creds_json, scopes=["https://www.googleapis.com/auth/spreadsheets.readonly"])
+    sh = gspread.authorize(creds).open_by_key(spreadsheet_id)
+    records = _tracking_get_records(sh.worksheet("追跡"))
+    watch = {f"{str(r.get('銘柄コード', '')).strip()}.T" for r in sh.worksheet("監視銘柄").get_all_records()
+             if str(r.get("銘柄コード", "")).strip()}
+    pending = [r for r in records if r.get("ステータス") == "追跡中"]
+    mine = [r for r in pending if _tracking_market_of(r.get("ティッカー", "")) == market]
+    print(f"🧪 [TRACKING_DRYRUN] 追跡中{len(pending)}行(うち{market}市場{len(mine)}行)")
+    earliest = _tracking_pending_tickers(records, market)
+    prices = _tracking_fetch_missing_prices(records, set(), market)
+    empty = pd.DataFrame({"Ticker": [], "Close": []})
+    for label, px in (("新方式(追跡中の全銘柄の価格を取得)", prices),
+                      ("現行方式(監視銘柄の価格だけ)", {t: s for t, s in prices.items() if t in watch})):
+        stats = {}
+        resolved, hit = _tracking_resolve_pending_signals(None, empty, mine, extra_prices=px, dry_run=True, stats=stats)
+        print(f"🧪 {label}: 判定される予定 {resolved}件 / 的中 {hit}件 / 読み飛ばし {stats}")
+    print(f"🧪 価格を取る銘柄 {len(earliest)}件 / 取得できた銘柄 {len(prices)}件 / シートへの書き込みは行っていません")
+    return prices
 
 # ============================================================
 # J-Quants APIで全上場銘柄コードを取得
@@ -1877,6 +2023,9 @@ TOP_FUNDAMENTAL_ROWS = 30  # メインシートに掲載する、ファンダメ
 # ============================================================
 # import時(テスト・他プロジェクトからの関数利用)に取得・通知・シート書き込みが走らないようにする
 if __name__ == "__main__":
+    if os.environ.get("TRACKING_DRYRUN", "").strip().lower() in ("1", "true", "yes"):
+        run_tracking_dryrun()
+        sys.exit(0)
     START = "2023-01-01"
     END   = (date.today() + pd.Timedelta(days=1)).strftime("%Y-%m-%d")
     BENCH = "^GSPC" if MARKET == "US" else "1306.T"
