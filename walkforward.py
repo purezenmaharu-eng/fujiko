@@ -841,7 +841,7 @@ def run(args):
         ak = ["Ace_Start", "King_Start"]
         base_exit = dict(EXIT_RULES)
         scen = [  # (名前, 説明, 監視銘柄, 出口ルール, 地合い, 対象シグナル)。1つずつだけ変える(組み合わせない)
-            ("baseline", "今のルール", NO_GATE, base_exit, None, ak),
+            ("baseline", "今のルール", NO_GATE, base_exit, None, ak + ["Ace_with_BEP_Start"]),
             ("A", f"地合いフィルタ: 1306の終値が{REGIME_MA_DAYS}日線より下の日はシグナルを見送る", NO_GATE, base_exit, regime, ak),
             ("B", f"Kingに{gate_name}の関門(Aceは対象外)", gate_name, base_exit, None, ["King_Start"]),
             ("C1", "損切り2×ATR・利確6×ATR", NO_GATE, {**base_exit, "atr_stop_mult": 2.0, "atr_profit_mult": 6.0}, None, ak),
@@ -1012,7 +1012,7 @@ def render(capital, dates, spans, stage_by_date, results, bench_eq, bench_days, 
                      f"<tbody>{''.join(rows)}</tbody></table></div>")
     gate = f_label(6) if f_label(6) in results else list(results)[-1]
     curves = ""
-    for col, label in SIGNALS[:2]:
+    for col, label in [SIGNALS[0], SIGNALS[1], SIGNALS[3]]:   # Ace・King・Ace×BEP
         series = {f"{label} {NO_GATE}": results[NO_GATE]["sims"][col]["equity"],
                   f"{label} {gate}": results[gate]["sims"][col]["equity"], "1306買い持ち": bench_eq}
         curves += f"<h2>資産推移: {label}</h2>" + report_html._svg_equity(series, capital)
@@ -1083,7 +1083,7 @@ def oos_table(oos_results, bench_eq, n225_eq, capital):
         return {k: sizing.period_metrics(eq, y0, y1) for k, y0, y1 in OOS_PERIODS}
     bench_m, n225_m = metrics(bench_eq), metrics(n225_eq)
     table = {}
-    for col, label in SIGNALS[:2]:   # Ace・King
+    for col, label in [SIGNALS[0], SIGNALS[1], SIGNALS[3]]:   # Ace・King・Ace×BEP(Ace×BEPは baseline のみ)
         rows = [{"name": "1306買い持ち", "desc": "", "m": bench_m, "cand": None},
                 {"name": "日経平均(^N225)買い持ち", "desc": "", "m": n225_m, "cand": None}]
         base = None

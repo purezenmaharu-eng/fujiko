@@ -68,7 +68,7 @@ def render(today, capital, signal_labels, portfolio_results, rankings, signal_in
                 cells = ("<td colspan='2'>取引なし</td>" if m is None else
                          f"<td>{m['final_return_pct']:+.2f}%</td><td>{m['sharpe']:.2f}</td>")
                 yr.append(f"<tr><td>{html.escape(signal_labels[col])}</td><td>{html.escape(name)}</td>{cells}</tr>")
-        yearly_html = ("<h2>年ごとの成績(Ace・King)</h2><div class='wrap'><table><thead><tr><th>シグナル</th><th>期間</th>"
+        yearly_html = ("<h2>年ごとの成績(Ace・King・Ace×BEP)</h2><div class='wrap'><table><thead><tr><th>シグナル</th><th>期間</th>"
                        "<th>最終リターン</th><th>シャープレシオ(年率)</th></tr></thead><tbody>" + "".join(yr) +
                        "</tbody></table></div><p class='muted'>各年の初日直前の資産を基準にした年内の値。</p>")
     curve = _svg_equity({signal_labels[c]: portfolio_results[c]["equity"] for c in signal_labels}, capital)
