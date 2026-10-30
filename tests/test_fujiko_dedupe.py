@@ -9,7 +9,7 @@ import unittest
 from contextlib import redirect_stdout
 
 FUJIKO_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "fujiko.py")
-WANTED_FUNCS = {"_drop_existing_rows", "_summary_row_exists", "_append_daily_rows"}
+WANTED_FUNCS = {"_drop_existing_rows", "_summary_row_exists", "_append_daily_rows", "_append_summary_row"}
 
 
 def _load_namespace():
@@ -92,6 +92,34 @@ class DailyRowsTest(unittest.TestCase):
         self.assertEqual(n, 1)
         self.assertEqual(ws.rows[-1][:2], [DAY, "J1"])
 
+    def test_read_failure_appends_all_and_logs(self):
+        ws = FakeWs([["日付", "銘柄名"]] + _rows("J", 60))
+        def boom(rng): raise RuntimeError("API down " + "x" * 200)
+        ws.get_values = boom
+        n, out = _run(ws, _rows("J", 60))
+        self.assertEqual((n, ws.append_calls), (60, [60]))
+        self.assertIn("既存行を読めなかったため全行追記します: RuntimeError: API down", out)
+        self.assertLess(len(out.splitlines()[0]), 120)
+
+    def test_append_failure_propagates_to_outer_except(self):
+        ws = FakeWs([["日付", "銘柄名"]])
+        def boom(rows, value_input_option=None): raise RuntimeError("append failed")
+        ws.append_rows = boom
+        with self.assertRaises(RuntimeError):
+            _run(ws, _rows("J", 3))
+
+    def test_outer_except_in_write_to_spreadsheet_reports_failure(self):
+        """write_to_spreadsheet の _append_daily_rows 呼び出しが、「書き込み失敗」を出して例外を外へ出さない except の内側にある"""
+        with open(FUJIKO_PATH, encoding="utf-8") as f:
+            fn = next(n for n in ast.parse(f.read()).body if isinstance(n, ast.FunctionDef) and n.name == "write_to_spreadsheet")
+        tries = [n for n in ast.walk(fn) if isinstance(n, ast.Try)
+                 and any(isinstance(c, ast.Call) and getattr(c.func, "id", "") == "_append_daily_rows"
+                         for b in n.body for c in ast.walk(b))]
+        self.assertTrue(tries)
+        h = tries[-1].handlers[0]
+        self.assertIn("書き込み失敗", ast.unparse(h))
+        self.assertFalse(any(isinstance(x, ast.Raise) for x in ast.walk(h)))
+
 
 class SummaryTest(unittest.TestCase):
     def test_same_date_and_market_exists(self):
@@ -101,6 +129,35 @@ class SummaryTest(unittest.TestCase):
         self.assertFalse(f(ex, DAY, "US"))
         self.assertFalse(f(ex, "2026/10/30", "JP"))
         self.assertFalse(f([[DAY, "3", "1"]], DAY, "JP"))
+
+
+    def _summary_ws(self, existing, fail_read=False):
+        class W:
+            appended = []
+            def get_values(self, rng):
+                if fail_read: raise RuntimeError("API down")
+                return existing
+            def append_row(self, row): self.appended.append(row)
+        w = W(); w.appended = []
+        return w
+
+    def test_summary_appends_when_absent_and_skips_when_present(self):
+        row = [DAY, 3, 1, 2, 0, "JP"]
+        w = self._summary_ws([[DAY, "3", "1", "2", "0", "JP"]])
+        buf = io.StringIO()
+        with redirect_stdout(buf): NS["_append_summary_row"](w, row)
+        self.assertEqual(w.appended, []); self.assertIn("サマリー重複スキップ", buf.getvalue())
+        w = self._summary_ws([[DAY, "3", "1", "2", "0", "US"]])
+        with redirect_stdout(io.StringIO()): NS["_append_summary_row"](w, row)
+        self.assertEqual(w.appended, [row])
+
+    def test_summary_read_failure_appends_and_logs(self):
+        row = [DAY, 3, 1, 2, 0, "JP"]
+        w = self._summary_ws([], fail_read=True)
+        buf = io.StringIO()
+        with redirect_stdout(buf): NS["_append_summary_row"](w, row)
+        self.assertEqual(w.appended, [row])
+        self.assertIn("サマリーの既存行を読めなかったため追記します: RuntimeError", buf.getvalue())
 
 
 if __name__ == "__main__":

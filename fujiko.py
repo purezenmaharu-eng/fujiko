@@ -1217,12 +1217,31 @@ def _append_daily_rows(ws, rows, is_new_sheet):
     """日次タブに rows を追記する。既存のタブでは、すでにある (日付, 銘柄名) の行は追記しない(再実行しても重複しない)。
     全行が重複なら append_rows を呼ばない。追記した行数を返す"""
     if rows and not is_new_sheet:
-        rows, dup_n = _drop_existing_rows(rows, _sheets_call_with_retry(ws.get_values, "A:B"))
-        if dup_n:
-            print(f"重複スキップ: {dup_n}行")
+        try:
+            existing = _sheets_call_with_retry(ws.get_values, "A:B")
+        except Exception as e:
+            print(f"⚠️ 既存行を読めなかったため全行追記します: {type(e).__name__}: {str(e)[:80]}")
+        else:
+            rows, dup_n = _drop_existing_rows(rows, existing)
+            if dup_n:
+                print(f"重複スキップ: {dup_n}行")
     if rows:
         _sheets_call_with_retry(ws.append_rows, rows, value_input_option="USER_ENTERED")
     return len(rows)
+
+
+def _append_summary_row(ws_summary, row):
+    """サマリーに row([日付, Ace, King, ポリグラフ, Ace×BEP, 市場])を追記する。同じ (日付, 市場) の行があれば追記しない。
+    既存行を読めなかったときは、ログに出して追記する"""
+    try:
+        exists = _summary_row_exists(_sheets_call_with_retry(ws_summary.get_values, "A:F"), row[0], row[5])
+    except Exception as e:
+        print(f"⚠️ サマリーの既存行を読めなかったため追記します: {type(e).__name__}")
+        exists = False
+    if exists:
+        print("サマリー重複スキップ")
+    else:
+        _sheets_call_with_retry(ws_summary.append_row, row)
 
 
 def write_to_spreadsheet(today, top_tickers, ticker_name_map, valuations=None, commentaries=None, signal_sets=None, signal_infos=None):
@@ -1460,11 +1479,7 @@ def write_to_spreadsheet(today, top_tickers, ticker_name_map, valuations=None, c
         _king_n = len(signal_sets.get("King", set()))
         _poly_n = len(signal_sets.get("ポリグラフ", set()))
         _bep_n = len(signal_sets.get("Ace×BEP", set()))
-        _summary_row = [today, _ace_n, _king_n, _poly_n, _bep_n, MARKET]
-        if _summary_row_exists(_sheets_call_with_retry(ws_summary.get_values, "A:F"), today, MARKET):
-            print("サマリー重複スキップ")
-        else:
-            _sheets_call_with_retry(ws_summary.append_row, _summary_row)
+        _append_summary_row(ws_summary, [today, _ace_n, _king_n, _poly_n, _bep_n, MARKET])
 
         print(f"✅ スプレッドシート書き込み完了({len(rows_to_write)}銘柄)")
     except Exception as e:
