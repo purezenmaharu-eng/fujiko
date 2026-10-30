@@ -1200,6 +1200,31 @@ def sizing_cells(infos):
     return [shares, loss, reason + f"【出どころ】{infos[0]['source']}"]
 
 
+def _drop_existing_rows(rows, existing_values):
+    """rows のうち、タブにすでにある (日付, 銘柄名)(A列・B列、前後の空白は除く)と同じ組の行を除く。(残す行, 除いた行数) を返す"""
+    seen = {(str(r[0]).strip(), str(r[1]).strip()) for r in existing_values if len(r) >= 2}
+    kept = [r for r in rows if (str(r[0]).strip(), str(r[1]).strip()) not in seen]
+    return kept, len(rows) - len(kept)
+
+
+def _summary_row_exists(existing_values, today, market):
+    """サマリーに同じ (日付=A列, 市場=F列) の行がすでにあるか(書き込む行は [日付, Ace, King, ポリグラフ, Ace×BEP, 市場])"""
+    return any(len(r) >= 6 and r[0].strip() == str(today).strip() and r[5].strip() == str(market).strip()
+               for r in existing_values)
+
+
+def _append_daily_rows(ws, rows, is_new_sheet):
+    """日次タブに rows を追記する。既存のタブでは、すでにある (日付, 銘柄名) の行は追記しない(再実行しても重複しない)。
+    全行が重複なら append_rows を呼ばない。追記した行数を返す"""
+    if rows and not is_new_sheet:
+        rows, dup_n = _drop_existing_rows(rows, _sheets_call_with_retry(ws.get_values, "A:B"))
+        if dup_n:
+            print(f"重複スキップ: {dup_n}行")
+    if rows:
+        _sheets_call_with_retry(ws.append_rows, rows, value_input_option="USER_ENTERED")
+    return len(rows)
+
+
 def write_to_spreadsheet(today, top_tickers, ticker_name_map, valuations=None, commentaries=None, signal_sets=None, signal_infos=None):
     """監視銘柄の中からファンダメンタルズ評価が高い順に選んだ上位銘柄(通常30件)を、
     日付ごとのシートに書き込む。
@@ -1424,8 +1449,7 @@ def write_to_spreadsheet(today, top_tickers, ticker_name_map, valuations=None, c
                 + _sizing_cells(ticker)
                 + radi_record_cells(valuations, ticker)
             )
-        if rows_to_write:
-            _sheets_call_with_retry(ws.append_rows, rows_to_write, value_input_option="USER_ENTERED")
+        _append_daily_rows(ws, rows_to_write, is_new_sheet)
 
         try:
             ws_summary = sh.worksheet("サマリー")
@@ -1436,7 +1460,11 @@ def write_to_spreadsheet(today, top_tickers, ticker_name_map, valuations=None, c
         _king_n = len(signal_sets.get("King", set()))
         _poly_n = len(signal_sets.get("ポリグラフ", set()))
         _bep_n = len(signal_sets.get("Ace×BEP", set()))
-        _sheets_call_with_retry(ws_summary.append_row, [today, _ace_n, _king_n, _poly_n, _bep_n, MARKET])
+        _summary_row = [today, _ace_n, _king_n, _poly_n, _bep_n, MARKET]
+        if _summary_row_exists(_sheets_call_with_retry(ws_summary.get_values, "A:F"), today, MARKET):
+            print("サマリー重複スキップ")
+        else:
+            _sheets_call_with_retry(ws_summary.append_row, _summary_row)
 
         print(f"✅ スプレッドシート書き込み完了({len(rows_to_write)}銘柄)")
     except Exception as e:
