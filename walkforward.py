@@ -65,7 +65,9 @@ RAW_CACHE_DIR = os.path.join(HERE, ".cache_wf_raw")   # 調整なしの始値・
 PRICE_START = "2018-12-01"       # 3年前比較(週足156本)と200日線・52週の助走のため、最初の選定日より3年以上前から
 BENCH_TICKER = "1306.T"
 SIGNALS = [("Ace_Start", "Ace"), ("King_Start", "King"),
-           ("Polygraph_Start", "ポリグラフ"), ("Ace_with_BEP_Start", "Ace×BEP")]
+           ("Polygraph_Start", "ポリグラフ"), ("Ace_with_BEP_Start", "Ace×BEP"),
+           ("Pivot_Start", "ピボット")]   # 末尾に足す(既存の添字 SIGNALS[0]〜[3] を動かさない)
+PIVOT_N = 5                      # ピボット高値: 左右5本(その足のHighが前後5本で最大)
 MIN_BARS = 250                   # 本番(fujiko.py)と同じ: 250営業日未満の銘柄は対象外
 STALE_DAYS = 10                  # 選定日の直前10日以内に株価が無い銘柄(上場廃止・売買停止)は除く
 FS_STALE_DAYS = 550              # 直近の本決算がこれより古い銘柄はFスコアを付けない(データ不足扱い)
@@ -298,6 +300,15 @@ def regime_ok_series(bench_close, window=REGIME_MA_DAYS):
     window日分の履歴が無い日は False(見送り)"""
     ma = bench_close.rolling(window).mean()
     return (bench_close > ma).fillna(False)
+
+
+def pivot_breakout(high, close, n=PIVOT_N):
+    """ピボット高値の上抜けサイン(真偽値)。先読みなし: 各日の値はその日までのデータだけで決まる。
+    ピボット高値 = その足のHighが前後n本で最大。確定は右n本が揃った日(足の n 本後)。
+    シグナル = 前日までに確定済みの直近ピボット高値を、当日の終値が初めて上抜けた日(前日の終値は高値以下)"""
+    conf = high.shift(n) >= high.rolling(2 * n + 1).max()   # 窓は [t-2n, t] だけ。中心の足は t-n
+    level = high.shift(n).where(conf).ffill().shift(1)      # 前日までに確定済みの直近ピボット高値
+    return ((close > level) & (close.shift(1) <= level)).fillna(False)
 
 
 def judge_candidate(base, m):
@@ -912,6 +923,7 @@ def run(args):
         df = prices[t].astype(float)
         ind = fujiko.calculate_base_indicators(df)
         ind["Ticker"] = t
+        ind["Pivot_Start"] = pivot_breakout(df["High"], df["Close"])
         indicators[t] = ind
     closes_all = {t: d["Close"] for t, d in indicators.items()}
 
@@ -977,7 +989,7 @@ def run(args):
         ak = ["Ace_Start", "King_Start"]
         base_exit = dict(EXIT_RULES)
         scen = [  # (名前, 説明, 監視銘柄, 出口ルール, 地合い, 対象シグナル)。1つずつだけ変える(組み合わせない)
-            ("baseline", "今のルール", NO_GATE, base_exit, None, ak + ["Ace_with_BEP_Start"]),
+            ("baseline", "今のルール", NO_GATE, base_exit, None, ak + ["Ace_with_BEP_Start", "Pivot_Start"]),
             ("A", f"地合いフィルタ: 1306の終値が{REGIME_MA_DAYS}日線より下の日はシグナルを見送る", NO_GATE, base_exit, regime, ak),
             ("B", f"Kingに{gate_name}の関門(Aceは対象外)", gate_name, base_exit, None, ["King_Start"]),
             ("C1", "損切り2×ATR・利確6×ATR", NO_GATE, {**base_exit, "atr_stop_mult": 2.0, "atr_profit_mult": 6.0}, None, ak),
@@ -1188,7 +1200,7 @@ def render(capital, dates, spans, stage_by_date, results, bench_eq, bench_days, 
                      f"<tbody>{''.join(rows)}</tbody></table></div>")
     gate = f_label(6) if f_label(6) in results else list(results)[-1]
     curves = ""
-    for col, label in [SIGNALS[0], SIGNALS[1], SIGNALS[3]]:   # Ace・King・Ace×BEP
+    for col, label in [SIGNALS[0], SIGNALS[1], SIGNALS[3], SIGNALS[4]]:   # Ace・King・Ace×BEP・ピボット
         series = {f"{label} {NO_GATE}": results[NO_GATE]["sims"][col]["equity"],
                   f"{label} {gate}": results[gate]["sims"][col]["equity"], "1306買い持ち": bench_eq}
         curves += f"<h2>資産推移: {label}</h2>" + report_html._svg_equity(series, capital)
@@ -1259,7 +1271,7 @@ def oos_table(oos_results, bench_eq, n225_eq, capital, extra_bench=None):
         return {k: sizing.period_metrics(eq, y0, y1) for k, y0, y1 in OOS_PERIODS}
     bench_m, n225_m = metrics(bench_eq), metrics(n225_eq)
     table = {}
-    for col, label in [SIGNALS[0], SIGNALS[1], SIGNALS[3]]:   # Ace・King・Ace×BEP(Ace×BEPは baseline のみ)
+    for col, label in [SIGNALS[0], SIGNALS[1], SIGNALS[3], SIGNALS[4]]:   # Ace・King・Ace×BEP・ピボット(Ace×BEP・ピボットは baseline のみ)
         rows = [{"name": "1306買い持ち", "desc": "", "m": bench_m, "cand": None},
                 {"name": "日経平均(^N225)買い持ち", "desc": "", "m": n225_m, "cand": None}]
         rows += [{"name": name, "desc": "", "m": metrics(eq), "cand": None} for name, eq in extra_bench or []]
