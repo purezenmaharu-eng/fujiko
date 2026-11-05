@@ -43,10 +43,14 @@ jobs:
         id: bizday
         run: |
           result=$(python - <<'EOF'
-          import datetime
+          import datetime, os
           from zoneinfo import ZoneInfo
           import jpholiday
-          today = datetime.datetime.now(ZoneInfo("Asia/Tokyo")).date()
+          # 定期実行は予定日(UTC 07:00 = JST 16:00)で判定する。起動が遅れて日本時間の0時を過ぎても予定日のまま
+          if os.environ.get("GITHUB_EVENT_NAME") == "schedule":
+              today = datetime.datetime.now(datetime.timezone.utc).date()
+          else:
+              today = datetime.datetime.now(ZoneInfo("Asia/Tokyo")).date()
           is_weekend = today.weekday() >= 5
           is_holiday = jpholiday.is_holiday(today)
           skip = is_weekend or is_holiday
