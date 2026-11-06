@@ -428,6 +428,24 @@ def daily_return_correlation(eq_a, eq_b):
     return out
 
 
+
+def recent_vs_history(eq, window):
+    """資産推移 eq(日付index・資産額)の「直近window営業日の騰落率」を、全期間の同じ長さの
+    ローリング騰落率と比べる。純粋な計算(ネットワークなし)。
+    戻り値: dict(latest=直近の騰落率, median=全期間ローリングの中央値, pct_rank=直近が全期間の
+                下から何%の位置か(0〜100), n=ローリング窓の数)。窓が足りなければ値はNone"""
+    e = pd.Series(eq, dtype=float).dropna()
+    out = {"latest": None, "median": None, "pct_rank": None, "n": 0}
+    if len(e) <= window + 1:
+        return out
+    roll = (e / e.shift(window) - 1).dropna()
+    out["n"] = int(len(roll))
+    out["latest"] = float(roll.iloc[-1])
+    out["median"] = float(roll.median())
+    out["pct_rank"] = float((roll < roll.iloc[-1]).mean() * 100)
+    return out
+
+
 def align_equity(eq, days, capital):
     """資産推移を共通の営業日 days に揃える(取引前は資金のまま、決済後は最後の値を維持)"""
     if eq is None or len(eq) == 0:
@@ -910,6 +928,21 @@ def run(args):
                   f"(共通{c['days']}日・動いた日{c['active_days']}日)")
         return
 
+    if args.recent:  # 確認用: 直近成績が過去と比べて落ちていないか(HTMLは書かない)
+        sims = results[NO_GATE]["sims"]
+        series = [("Ace", sims["Ace_Start"]["equity"]), ("King", sims["King_Start"]["equity"]),
+                  ("1306買い持ち", bench_eq)]
+        print(f"📈 直近成績 vs 全期間(関門なし・{bench_eq.index[-1]:%Y-%m-%d}まで)。位置=直近が全期間の下から何%か(低いほど過去より悪い)")
+        for label, eq in series:
+            for nm, w in (("3か月", 63), ("6か月", 126), ("12か月", 252)):
+                r = recent_vs_history(eq, w)
+                if r["latest"] is None:
+                    print(f"  {label} 直近{nm}: 算出不可(期間不足)")
+                    continue
+                print(f"  {label} 直近{nm}: {r['latest']*100:+.1f}% / 全期間の中央値 {r['median']*100:+.1f}%"
+                      f" / 位置 {r['pct_rank']:.0f}%(窓{r['n']}本)")
+        return
+
     # 3) 出力
     cmp = compare_rows(results, spans, bench_eq, capital)
     out = args.out or os.path.join("docs", "walkforward.html")
@@ -1267,6 +1300,8 @@ def build_parser():
     ap.add_argument("--max-hold", type=positive_int, default=60, help="最大保有営業日(既定 60)")
     ap.add_argument("--corr", action="store_true",
                     help="確認用: AceとKingの日次損益の相関を出して終了(HTML・シートは書かない)")
+    ap.add_argument("--recent", action="store_true",
+                    help="確認用: Ace・King・1306の直近成績を全期間と比べて出して終了(HTML・シートは書かない)")
     ap.add_argument("--oos", action="store_true",
                     help="日経平均との比較と期間分割(選ぶ期間2022-2024/試す期間2025-)で、改善案A・B・C1・C2をbaselineと比べる。"
                          "出力は既定で docs/walkforward_oos.html(walkforward.html には書かない)。日経平均はyfinanceだけ使う")
