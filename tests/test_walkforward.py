@@ -313,3 +313,16 @@ def test_daily_return_correlation_identical_and_independent():
     assert abs(ind["rho"]) < 0.4 and ind["n_eff"] > 1.4    # 無関係なら実質2本に近い
     flat = pd.Series(1_000_000.0, index=idx)               # 一定(取引なし)なら算出不可
     assert wf.daily_return_correlation(a, flat)["rho"] is None
+
+
+def test_recent_vs_history_rank():
+    import pandas as pd
+    import walkforward as wf
+    idx = pd.date_range("2024-01-01", periods=300, freq="B")
+    up = pd.Series([100.0 + i for i in range(300)], index=idx)          # 一貫して上昇: 直近は上位
+    r = wf.recent_vs_history(up, 63)
+    assert r["latest"] > 0 and r["n"] == 300 - 63
+    down_end = pd.Series([100.0 + i for i in range(250)] + [350.0 - 8 * i for i in range(50)], index=idx)
+    r2 = wf.recent_vs_history(down_end, 63)                              # 最後に急落: 直近は下位
+    assert r2["latest"] < 0 and r2["pct_rank"] < 10
+    assert wf.recent_vs_history(up.iloc[:50], 63)["latest"] is None      # 期間不足
