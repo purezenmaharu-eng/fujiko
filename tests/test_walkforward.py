@@ -295,3 +295,21 @@ class JudgeCandidate(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def test_daily_return_correlation_identical_and_independent():
+    import numpy as np
+    import pandas as pd
+    import walkforward as wf
+    idx = pd.date_range("2024-01-01", periods=60, freq="B")
+    rng = np.random.default_rng(0)
+    r = rng.normal(0.001, 0.01, 60)
+    a = pd.Series(1_000_000 * np.cumprod(1 + r), index=idx)
+    same = wf.daily_return_correlation(a, a * 2)           # 同じ動き(規模だけ違う)
+    assert abs(same["rho"] - 1.0) < 1e-9 and abs(same["n_eff"] - 1.0) < 1e-9
+    r2 = rng.normal(0.001, 0.01, 60)
+    b = pd.Series(1_000_000 * np.cumprod(1 + r2), index=idx)
+    ind = wf.daily_return_correlation(a, b)
+    assert abs(ind["rho"]) < 0.4 and ind["n_eff"] > 1.4    # 無関係なら実質2本に近い
+    flat = pd.Series(1_000_000.0, index=idx)               # 一定(取引なし)なら算出不可
+    assert wf.daily_return_correlation(a, flat)["rho"] is None
