@@ -1244,6 +1244,10 @@ def _append_summary_row(ws_summary, row):
         _sheets_call_with_retry(ws_summary.append_row, row)
 
 
+# 日次タブ・サマリーのシート書き込みが例外で失敗したら True。他の出力・追跡を終えたあと、最後の _exit_if_output_failed でエラー終了する
+_sheet_write_failed = False
+
+
 def write_to_spreadsheet(today, top_tickers, ticker_name_map, valuations=None, commentaries=None, signal_sets=None, signal_infos=None):
     """監視銘柄の中からファンダメンタルズ評価が高い順に選んだ上位銘柄(通常30件)を、
     日付ごとのシートに書き込む。
@@ -1484,6 +1488,8 @@ def write_to_spreadsheet(today, top_tickers, ticker_name_map, valuations=None, c
         print(f"✅ スプレッドシート書き込み完了({len(rows_to_write)}銘柄)")
     except Exception as e:
         print(f"❌ スプレッドシート書き込み失敗: {e}")
+        global _sheet_write_failed
+        _sheet_write_failed = True
 
 # ============================================================
 # シグナル的中率トラッキング(「追跡」シート)
@@ -1505,6 +1511,16 @@ TRACKING_HOLD_DAYS = 10
 TRACKING_LOOKBACK_DAYS = 5
 # 追跡処理が例外で失敗したら True。日次の他の出力を終えたあと __main__ の最後で見て、エラー終了する
 _tracking_failed = False
+
+def _exit_if_output_failed():
+    """追跡・日次タブ/サマリーの書き込みのどちらかが失敗していたら、::error:: に原因を書いて終了コード1で終わる(成功なら何もしない)"""
+    if _tracking_failed:
+        print("::error::シグナル的中率トラッキングが失敗しました")
+    if _sheet_write_failed:
+        print("::error::スプレッドシート書き込み(日次タブ・サマリー)が失敗しました")
+    if _tracking_failed or _sheet_write_failed:
+        sys.exit(1)
+
 TRACKING_HIT_THRESHOLD_PCT = 2.0
 # 追跡処理がレコードから読む列名(_tracking_resolve_pending_signals と existing_keys で使うもの)。
 # 見出し行に空欄の列があっても get_all_records が止まらないよう、これだけを expected_headers に渡す
@@ -2321,6 +2337,4 @@ if __name__ == "__main__":
         print(f"✅ HTML出力: {_html_path}")
 
     # --- 追跡が失敗していたら、他の出力をすべて終えたあとでエラー終了する(日次がsuccessのまま見落とされるのを防ぐ) ---
-    if _tracking_failed:
-        print("::error::シグナル的中率トラッキングが失敗しました")
-        sys.exit(1)
+    _exit_if_output_failed()
