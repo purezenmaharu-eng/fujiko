@@ -401,6 +401,33 @@ def select_watchlist(asof, prices, bw, fscore_fn=None, min_points=None):
     return survivors, final, stage
 
 
+
+def daily_return_correlation(eq_a, eq_b):
+    """2本の資産推移(日付index・資産額)の日次損益率の相関を返す。純粋な計算(ネットワークなし)。
+    戻り値: dict(days=共通日数, rho=全日の相関, active_days=どちらかが動いた日数,
+                rho_active=どちらかが動いた日だけの相関, n_eff=等金額2本の実質本数 2/(1+rho))
+    相関が計算できないとき(日数不足・片方が一定)は rho 系を None にする"""
+    a = pd.Series(eq_a, dtype=float)
+    b = pd.Series(eq_b, dtype=float)
+    idx = a.index.intersection(b.index)
+    ra = a.loc[idx].pct_change().dropna()
+    rb = b.loc[idx].pct_change().dropna()
+    out = {"days": int(len(ra)), "rho": None, "active_days": 0, "rho_active": None, "n_eff": None}
+    if len(ra) < 3:
+        return out
+    rho = ra.corr(rb)
+    if pd.notna(rho):
+        out["rho"] = float(rho)
+        out["n_eff"] = float(2 / (1 + rho))
+    active = (ra != 0) | (rb != 0)
+    out["active_days"] = int(active.sum())
+    if out["active_days"] >= 3:
+        rho_a = ra[active].corr(rb[active])
+        if pd.notna(rho_a):
+            out["rho_active"] = float(rho_a)
+    return out
+
+
 def align_equity(eq, days, capital):
     """資産推移を共通の営業日 days に揃える(取引前は資金のまま、決済後は最後の値を維持)"""
     if eq is None or len(eq) == 0:
@@ -872,6 +899,17 @@ def run(args):
         print(f"  [{vname}] 監視銘柄 平均{np.mean([sizes.get(t0, 0) for t0, _ in spans]):.1f}件/四半期 / "
               + " ".join(f"{label}:発生{len(trades[col])}件" for col, label in SIGNALS))
 
+    if args.corr:  # 確認用: AceとKingの日次損益の相関だけを出して終了(HTMLは書かない)
+        for vname in results:
+            sims = results[vname]["sims"]
+            c = daily_return_correlation(sims["Ace_Start"]["equity"], sims["King_Start"]["equity"])
+            fmt = lambda v: "算出不可" if v is None else f"{v:.3f}"
+            print(f"📊 Ace×King 日次損益の相関 [{vname}]: 全日 {fmt(c['rho'])}"
+                  f" / どちらかが動いた日のみ {fmt(c['rho_active'])}"
+                  f" / 実質 {('算出不可' if c['n_eff'] is None else format(c['n_eff'], '.2f'))}本分"
+                  f"(共通{c['days']}日・動いた日{c['active_days']}日)")
+        return
+
     # 3) 出力
     cmp = compare_rows(results, spans, bench_eq, capital)
     out = args.out or os.path.join("docs", "walkforward.html")
@@ -1227,6 +1265,8 @@ def build_parser():
     ap.add_argument("--stop-mult", type=positive_float, default=2.0, help="損切りのATR倍率(既定 2.0)")
     ap.add_argument("--profit-mult", type=positive_float, default=4.0, help="利確のATR倍率(既定 4.0)")
     ap.add_argument("--max-hold", type=positive_int, default=60, help="最大保有営業日(既定 60)")
+    ap.add_argument("--corr", action="store_true",
+                    help="確認用: AceとKingの日次損益の相関を出して終了(HTML・シートは書かない)")
     ap.add_argument("--oos", action="store_true",
                     help="日経平均との比較と期間分割(選ぶ期間2022-2024/試す期間2025-)で、改善案A・B・C1・C2をbaselineと比べる。"
                          "出力は既定で docs/walkforward_oos.html(walkforward.html には書かない)。日経平均はyfinanceだけ使う")
