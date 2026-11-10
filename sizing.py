@@ -55,10 +55,35 @@ def position_text(pos):
     return f"{pos['shares']:,}株 / 損切り損失-{pos['loss']:,.0f}円{cap}"
 
 
+def split_factor_after(splits, date):
+    """date より後(当日は含まない)に起きた株式分割の比率の累積。分割が無ければ1.0。
+    splits: 日付index・分割比(1→5なら5.0)のSeries、または {日付: 比率}。0以下・NaNは無視"""
+    if splits is None or len(splits) == 0:
+        return 1.0
+    s = pd.Series(splits, dtype=float)
+    s.index = pd.DatetimeIndex(s.index).tz_localize(None)
+    s = s[(s > 0) & s.notna()]
+    return float(np.prod(s[s.index > pd.Timestamp(date).tz_localize(None)].values)) if len(s) else 1.0
+
+
+def restore_actual_price(raw_price, splits, date):
+    """当時の実株価 = 生の価格 × 「その日より後の分割比の累積」。
+    yfinanceの auto_adjust=False の価格は分割調整済み(配当は未調整)なので、この復元が必要。
+    raw_price が欠損・0以下なら None"""
+    try:
+        p = float(raw_price)
+    except (TypeError, ValueError):
+        return None
+    if not (p > 0) or np.isnan(p):
+        return None
+    return p * split_factor_after(splits, date)
+
+
 def simulate_portfolio(trades, closes, capital, lot=LOT_SIZE):
     """トレード一覧を1%リスク・20%上限のルールで資金を動かして再現する。
     trades: dict(ticker, entry_date, exit_date, entry_price, stop_price, pnl_pct) のリスト
             (pnl_pct は取引コスト込みの%、entry/exit_date は Timestamp)
+            任意キー actual_entry_price: 当時の実株価(分割調整前)。あれば購入可能額の判定と取得額だけにこの価格を使う
     closes: {ticker: 終値Series(日付index)}。保有中の評価損益(時価評価)に使う
     資金は実現損益で増減(複利)。同一銘柄の重複保有・現金不足・100株未満は見送り。
     戻り値: dict(equity: 日次資産Series, final_return_pct, max_drawdown_pct, sharpe,
@@ -102,14 +127,19 @@ def simulate_portfolio(trades, closes, capital, lot=LOT_SIZE):
                 n_skipped += 1
                 continue
             realized = cash + sum(p["cost"] for p in open_pos)
-            pos = calc_position(t["entry_price"], t["stop_price"], realized, lot)
+            # 購入可能額(100株が20%上限内か・現金で買えるか)は当時の実株価で判定する。
+            # actual_entry_price が無い取引は従来どおり entry_price(調整済み)で判定。損益率・時価評価は調整済みのまま
+            ref = t.get("actual_entry_price")
+            ref = float(ref) if ref is not None and ref == ref and ref > 0 else t["entry_price"]
+            scale = ref / t["entry_price"]
+            pos = calc_position(ref, t["stop_price"] * scale, realized, lot)
             shares = pos["shares"]
-            if shares and shares * t["entry_price"] > cash:   # 現金不足なら買える分まで
-                shares = int(cash // t["entry_price"] // lot) * lot
+            if shares and shares * ref > cash:   # 現金不足なら買える分まで
+                shares = int(cash // ref // lot) * lot
             if shares < lot:
                 n_skipped += 1
                 continue
-            cost = shares * t["entry_price"]
+            cost = shares * ref
             cash -= cost
             open_pos.append({"ticker": t["ticker"], "shares": shares, "entry_price": t["entry_price"],
                              "exit_date": t["exit_date"], "pnl_pct": t["pnl_pct"], "cost": cost})

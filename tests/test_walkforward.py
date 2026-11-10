@@ -293,6 +293,30 @@ class JudgeCandidate(unittest.TestCase):
         self.assertFalse(wf.judge_candidate(None, self.m(80.0, 1.5, -10.0)))
         self.assertFalse(wf.judge_candidate(self.base, None))
 
+
+class AttachActualEntryPrices(unittest.TestCase):
+    def raw(self):
+        idx = pd.to_datetime(["2024-01-04", "2024-01-05", "2024-01-09"])
+        return pd.DataFrame({"Open": [100.0, 110.0, 120.0], "Stock Splits": [0.0, 0.0, 0.0]}, index=idx)
+
+    def test_restores_with_later_splits(self):
+        raw = self.raw()
+        raw.loc["2024-01-09", "Stock Splits"] = 3.0      # 1/9に1→3分割。生の始値は分割調整済み(120は分割後の価格)
+        trades = [{"ticker": "A", "entry_date": pd.Timestamp("2024-01-05")},    # 分割前 → 110×3
+                  {"ticker": "A", "entry_date": pd.Timestamp("2024-01-09")}]    # 分割当日 → 120×1
+        n = wf.attach_actual_entry_prices(trades, {"A": raw})
+        self.assertEqual(n, 2)
+        self.assertAlmostEqual(trades[0]["actual_entry_price"], 330.0)
+        self.assertAlmostEqual(trades[1]["actual_entry_price"], 120.0)
+
+    def test_missing_raw_leaves_trade_untouched(self):
+        trades = [{"ticker": "B", "entry_date": pd.Timestamp("2024-01-05")},       # 生データ無し
+                  {"ticker": "A", "entry_date": pd.Timestamp("2024-02-01")}]       # その日の生データ無し
+        self.assertEqual(wf.attach_actual_entry_prices(trades, {"A": self.raw()}), 0)
+        self.assertNotIn("actual_entry_price", trades[0])
+        self.assertNotIn("actual_entry_price", trades[1])
+
+
 if __name__ == "__main__":
     unittest.main()
 
