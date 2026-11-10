@@ -973,10 +973,21 @@ def compare_rows(results, spans, bench_eq, capital):
                 "win": st["win_rate"] if st else None, "avg_pnl": st["avg_pnl"] if st else None,
                 "avg_hold": st["avg_hold"] if st else None,
                 "ret": m["final_return_pct"] if m else None, "mdd": m["max_drawdown_pct"] if m else None,
-                "sharpe": m["sharpe"] if m else None})
+                "sharpe": m["sharpe"] if m else None,
+                "unreal_end": sim.get("unrealized_pnl_end"), "max_unreal_loss": sim.get("max_unrealized_loss"),
+                "max_expo": sim.get("max_exposure"), "max_expo_pct": sim.get("max_exposure_pct"),
+                "max_pos_drop": sim.get("max_position_drop_pct")})
         cmp[label] = rows
     cmp[BENCH_LABEL] = year_table(bench_eq, capital)["通期"]
     return cmp
+
+
+def _yen(v):
+    return "－" if v is None else format(v, "+,.0f") + "円"
+
+
+def _expo(r):
+    return "－" if r["max_expo"] is None else f"{r['max_expo']:,.0f}円({r['max_expo_pct']:.1f}%)"
 
 
 def _dw(s):
@@ -985,7 +996,8 @@ def _dw(s):
 
 
 def print_compare(cmp):
-    cols = ["Fスコア関門", "監視(平均)", "発生", "約定", "勝率", "平均損益", "保有日", "通期騰落", "最大DD", "シャープ"]
+    cols = ["Fスコア関門", "監視(平均)", "発生", "約定", "勝率", "平均損益", "保有日", "通期騰落", "最大DD", "シャープ",
+            "期末未実現損益", "最大含み損", "最大建玉額(資金比)", "最大下落率"]
     b = cmp[BENCH_LABEL]
     for label, rows in cmp.items():
         if label == BENCH_LABEL:
@@ -994,10 +1006,12 @@ def print_compare(cmp):
         for r in rows:
             table.append([r["variant"], f"{r['watch']:.1f}", str(r["n_raw"]), str(r["n_exec"]),
                           _f(r["win"], ".1f", "%"), _f(r["avg_pnl"], "+.2f", "%"), _f(r["avg_hold"], ".1f"),
-                          _f(r["ret"], "+.1f", "%"), _f(r["mdd"], ".1f", "%"), _f(r["sharpe"], ".2f")])
+                          _f(r["ret"], "+.1f", "%"), _f(r["mdd"], ".1f", "%"), _f(r["sharpe"], ".2f"),
+                          _yen(r["unreal_end"]), _yen(r["max_unreal_loss"]), _expo(r),
+                          _f(r["max_pos_drop"], ".1f", "%")])
         table.append([BENCH_LABEL, "－", "－", "－", "－", "－", "－",
                       _f(b and b["final_return_pct"], "+.1f", "%"), _f(b and b["max_drawdown_pct"], ".1f", "%"),
-                      _f(b and b["sharpe"], ".2f")])
+                      _f(b and b["sharpe"], ".2f"), "－", "－", "－", "－"])
         widths = [max(_dw(row[i]) for row in table) for i in range(len(cols))]
         print(f"\n--- {label}(通期) ---")
         for row in table:
@@ -1006,7 +1020,8 @@ def print_compare(cmp):
 
 def _cmp_html(cmp):
     head = ("<tr><th>Fスコア関門</th><th>監視銘柄<br><small>四半期平均</small></th><th>シグナル<br>発生</th><th>約定</th>"
-            "<th>勝率</th><th>平均損益</th><th>平均保有<br><small>営業日</small></th><th>通期騰落</th><th>最大DD</th><th>シャープ</th></tr>")
+            "<th>勝率</th><th>平均損益</th><th>平均保有<br><small>営業日</small></th><th>通期騰落</th><th>最大DD</th><th>シャープ</th>"
+            "<th>期末<br>未実現損益</th><th>最大含み損</th><th>最大建玉額<br><small>(資金比)</small></th><th>最大下落率<br><small>(1銘柄)</small></th></tr>")
     b = cmp[BENCH_LABEL]
     parts = []
     for label, rows in cmp.items():
@@ -1015,11 +1030,13 @@ def _cmp_html(cmp):
         body = "".join(
             f"<tr><td>{html.escape(r['variant'])}</td><td>{r['watch']:.1f}</td><td>{r['n_raw']}</td><td>{r['n_exec']}</td>"
             f"<td>{_f(r['win'], '.1f', '%')}</td><td>{_f(r['avg_pnl'], '+.2f', '%')}</td><td>{_f(r['avg_hold'], '.1f')}</td>"
-            f"<td>{_f(r['ret'], '+.1f', '%')}</td><td>{_f(r['mdd'], '.1f', '%')}</td><td>{_f(r['sharpe'], '.2f')}</td></tr>"
+            f"<td>{_f(r['ret'], '+.1f', '%')}</td><td>{_f(r['mdd'], '.1f', '%')}</td><td>{_f(r['sharpe'], '.2f')}</td>"
+            f"<td>{_yen(r['unreal_end'])}</td><td>{_yen(r['max_unreal_loss'])}</td><td>{_expo(r)}</td>"
+            f"<td>{_f(r['max_pos_drop'], '.1f', '%')}</td></tr>"
             for r in rows)
         body += (f"<tr><td>{BENCH_LABEL}</td><td>－</td><td>－</td><td>－</td><td>－</td><td>－</td><td>－</td>"
                  f"<td>{_f(b and b['final_return_pct'], '+.1f', '%')}</td><td>{_f(b and b['max_drawdown_pct'], '.1f', '%')}</td>"
-                 f"<td>{_f(b and b['sharpe'], '.2f')}</td></tr>")
+                 f"<td>{_f(b and b['sharpe'], '.2f')}</td><td>－</td><td>－</td><td>－</td><td>－</td></tr>")
         parts.append(f"<h2>Fスコア閾値の比較: {html.escape(label)}(通期)</h2><div class='wrap'><table><thead>{head}</thead>"
                      f"<tbody>{body}</tbody></table></div>")
     parts.append("<p class='muted'>発生=バックテストが出した全シグナル(勝率・平均損益・平均保有日数はこの全件の取引ごとの値。往復コスト0.2%控除後)。"

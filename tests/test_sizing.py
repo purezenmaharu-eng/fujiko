@@ -108,6 +108,25 @@ class SimulatePortfolioTest(unittest.TestCase):
         self.assertEqual(r["max_concurrent"], 5)
         self.assertEqual(r["n_skipped"], 1)
 
+    def test_unrealized_exposure_metrics(self):
+        # 手計算: 資金100万。A(1000円・損切950)=200株=取得20万、B(500円・損切450)=200株=取得10万
+        idx = pd.bdate_range("2024-01-01", periods=5)
+        a = pd.Series([1000, 900, 800, 950, 1100], index=idx)
+        b = pd.Series([500, 500, 450, 480, 520], index=idx)
+        trades = [
+            {"ticker": "A", "entry_date": idx[0], "exit_date": idx[0] + pd.Timedelta(days=30),  # 期間内に決済されない(期末も保有中)
+             "entry_price": 1000, "stop_price": 950, "pnl_pct": 0.0},
+            {"ticker": "B", "entry_date": idx[1], "exit_date": idx[3],
+             "entry_price": 500, "stop_price": 450, "pnl_pct": 0.0},
+        ]
+        r = sizing.simulate_portfolio(trades, {"A": a, "B": b}, 1_000_000)
+        # 含み損益の合計: 0 / -2万 / -5万(A-4万,B-1万) / (B決済後)A-1万 / A+2万
+        self.assertAlmostEqual(r["unrealized_pnl_end"], 20_000)
+        self.assertAlmostEqual(r["max_unrealized_loss"], -50_000)
+        self.assertAlmostEqual(r["max_position_drop_pct"], -20.0)   # Aが取得1000→800
+        self.assertAlmostEqual(r["max_exposure"], 300_000)           # A20万+B10万(idx1〜2日)
+        self.assertAlmostEqual(r["max_exposure_pct"], 30.0)          # 資金100万に対して
+
     def test_no_trades(self):
         r = sizing.simulate_portfolio([], {}, 1_000_000)
         self.assertEqual(r["n_trades"], 0)

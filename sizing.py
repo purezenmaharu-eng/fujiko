@@ -62,9 +62,16 @@ def simulate_portfolio(trades, closes, capital, lot=LOT_SIZE):
     closes: {ticker: 終値Series(日付index)}。保有中の評価損益(時価評価)に使う
     資金は実現損益で増減(複利)。同一銘柄の重複保有・現金不足・100株未満は見送り。
     戻り値: dict(equity: 日次資産Series, final_return_pct, max_drawdown_pct, sharpe,
-                 max_concurrent, n_trades, n_skipped)"""
+                 max_concurrent, n_trades, n_skipped,
+                 unrealized_pnl_end: 最終日に保有中の(時価-取得額)合計(円),
+                 max_unrealized_loss: 保有中の含み損益合計の最悪値(円。負の値、含み損が無ければ0),
+                 max_position_drop_pct: 1銘柄の取得価格からの下落率の最悪値(%。負の値、下落が無ければ0),
+                 max_exposure: 同時保有の取得額合計の最大値(円),
+                 max_exposure_pct: その日の資金(現金+保有の取得額合計)に対する割合(%))"""
     empty = {"equity": pd.Series(dtype=float), "final_return_pct": 0.0, "max_drawdown_pct": 0.0,
-             "sharpe": 0.0, "max_concurrent": 0, "n_trades": 0, "n_skipped": 0}
+             "sharpe": 0.0, "max_concurrent": 0, "n_trades": 0, "n_skipped": 0,
+             "unrealized_pnl_end": 0.0, "max_unrealized_loss": 0.0, "max_position_drop_pct": 0.0,
+             "max_exposure": 0.0, "max_exposure_pct": 0.0}
     if not trades:
         return empty
     trades = sorted(trades, key=lambda t: (t["entry_date"], t["ticker"]))
@@ -77,6 +84,8 @@ def simulate_portfolio(trades, closes, capital, lot=LOT_SIZE):
     open_pos = []        # dict(ticker, shares, entry_price, exit_date, pnl_pct, cost)
     pending = list(trades)
     equity, max_conc, n_taken, n_skipped = [], 0, 0, 0
+    max_exposure, max_exposure_pct = 0.0, 0.0
+    max_unrealized_loss, max_position_drop, unrealized_now = 0.0, 0.0, 0.0
     for day in days:
         # 1) 当日決済(実現損益を現金へ)
         still = []
@@ -106,8 +115,12 @@ def simulate_portfolio(trades, closes, capital, lot=LOT_SIZE):
                              "exit_date": t["exit_date"], "pnl_pct": t["pnl_pct"], "cost": cost})
             n_taken += 1
         max_conc = max(max_conc, len(open_pos))
+        exposure = sum(p["cost"] for p in open_pos)
+        if exposure > max_exposure:
+            max_exposure, max_exposure_pct = exposure, exposure / (cash + exposure) * 100
         # 3) 時価評価(終値ベース。終値が無い日は直近値)
         value = cash
+        unrealized_now = 0.0
         for p in open_pos:
             s = closes[p["ticker"]]
             if not s.index.is_unique or not s.index.is_monotonic_increasing:
@@ -115,6 +128,9 @@ def simulate_portfolio(trades, closes, capital, lot=LOT_SIZE):
                 closes[p["ticker"]] = s
             c = s.loc[:day].iloc[-1] if day >= s.index[0] else p["entry_price"]
             value += p["cost"] * (float(c) / p["entry_price"])
+            unrealized_now += p["cost"] * (float(c) / p["entry_price"] - 1)
+            max_position_drop = min(max_position_drop, (float(c) / p["entry_price"] - 1) * 100)
+        max_unrealized_loss = min(max_unrealized_loss, unrealized_now)
         equity.append(value)
 
     eq = pd.Series(equity, index=days)
@@ -123,7 +139,10 @@ def simulate_portfolio(trades, closes, capital, lot=LOT_SIZE):
     mdd = float(((eq / eq.cummax()) - 1).min() * 100)
     return {"equity": eq, "final_return_pct": float((eq.iloc[-1] / capital - 1) * 100),
             "max_drawdown_pct": mdd, "sharpe": sharpe, "max_concurrent": max_conc,
-            "n_trades": n_taken, "n_skipped": n_skipped}
+            "n_trades": n_taken, "n_skipped": n_skipped,
+            "unrealized_pnl_end": float(unrealized_now), "max_unrealized_loss": float(max_unrealized_loss),
+            "max_position_drop_pct": float(max_position_drop),
+            "max_exposure": float(max_exposure), "max_exposure_pct": float(max_exposure_pct)}
 
 
 # ---- 根拠(なぜ点灯したか)と出どころ ----
