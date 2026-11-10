@@ -35,7 +35,7 @@ EDINET DBの呼び出し上限(無料枠: 1日100回・月2,800回)への対応:
 残るバイアス(解消できない):
   - 銘柄一覧は「今」のJ-Quants上場銘柄。過去に上場廃止になった銘柄は入っていない(生き残りバイアス。成績は良めに出る)
   - 市場区分(プライム/スタンダード/グロース)の絞り込みも今の区分
-  - 株価はyfinance(分割・配当調整済み)
+  - 株価はyfinance(分割・配当調整済み)。ただし購入可能額の判定だけは、調整なしの始値×分割比の累積で復元した当時の実株価(.cache_wf_raw)
 
 使い方(データ取得に時間がかかる。初回は株価約3,900銘柄+決算の取得):
   python walkforward.py                  # 本番相当(2022年から)
@@ -61,6 +61,7 @@ import pandas as pd
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 CACHE_DIR = os.path.join(HERE, ".cache_wf")
+RAW_CACHE_DIR = os.path.join(HERE, ".cache_wf_raw")   # 調整なしの始値・分割(購入可能額の判定用。.cache_wf とは別)
 PRICE_START = "2018-12-01"       # 3年前比較(週足156本)と200日線・52週の助走のため、最初の選定日より3年以上前から
 BENCH_TICKER = "1306.T"
 SIGNALS = [("Ace_Start", "Ace"), ("King_Start", "King"),
@@ -533,6 +534,71 @@ def download_prices(tickers, end, refresh=False, chunk=100, offline=False):
     return {t: d for t, d in cache.items() if d is not None and t in wanted}
 
 
+def download_raw_opens(tickers, end, chunk=100, offline=False):
+    """購入可能額の判定用に、調整なし(auto_adjust=False)の始値と株式分割をyfinanceで取得する。
+    既存の株価キャッシュ(.cache_wf)とは別の .cache_wf_raw に保存する。{ticker: DataFrame(Open, Stock Splits)}。
+    yfinanceの生の始値は分割調整済みなので、当時の実株価への復元は sizing.restore_actual_price で行う。
+    取れなかった銘柄は含めない(その銘柄の取引は従来どおり調整済みの始値で判定)"""
+    path = os.path.join(RAW_CACHE_DIR, f"rawopen_{end}.pkl")
+    cache = _load_pickle(path, {})
+    todo = [t for t in tickers if t not in cache]
+    if offline and todo:
+        sys.exit(f"⏹️ 生の始値キャッシュ {os.path.relpath(path, HERE)} に未取得の銘柄が{len(todo)}件あるため終了します"
+                 "(--cache-only は取りに行きません。通常実行を1回走らせてください): " + ", ".join(todo[:20]))
+    if todo:
+        import yfinance as yf
+    print(f"📥 生の始値(購入可能額の判定用): キャッシュ{len(tickers) - len(todo)}件 / 新規取得{len(todo)}件")
+    for i in range(0, len(todo), chunk):
+        part = todo[i:i + chunk]
+        raw = None
+        for attempt in range(2):
+            try:
+                raw = yf.download(part, start=PRICE_START, end=end, auto_adjust=False, actions=True,
+                                  group_by="ticker", threads=True, progress=False)
+                break
+            except Exception as e:
+                print(f"⚠️ yfinance失敗({e}) → 再試行")
+                time.sleep(5)
+        for t in part:
+            df = None
+            try:
+                sub = raw[t] if isinstance(raw.columns, pd.MultiIndex) else raw
+                sub = sub[["Open", "Stock Splits"]].dropna(subset=["Open"])
+                sub = sub[~sub.index.duplicated(keep="last")].sort_index()
+                if len(sub):
+                    df = sub.astype("float64")
+            except Exception:
+                pass
+            cache[t] = df
+        _save_pickle(path, cache)
+        print(f"  {min(i + chunk, len(todo))}/{len(todo)}")
+    wanted = set(tickers)
+    return {t: d for t, d in cache.items() if d is not None and t in wanted}
+
+
+def attach_actual_entry_prices(trades, raw_opens):
+    """取引ごとに、エントリー日の当時の実株価(生の始値×その日より後の分割比の累積)を actual_entry_price に入れる。
+    生の始値が取れない取引には入れない(従来どおり調整済みの始値で判定される)。戻り値: 入れた件数"""
+    import sizing
+    n = 0
+    for tr in trades:
+        raw = raw_opens.get(tr["ticker"])
+        if raw is None:
+            continue
+        d = pd.Timestamp(tr["entry_date"]).tz_localize(None)
+        idx = raw.index.tz_localize(None) if raw.index.tz is not None else raw.index
+        if d not in idx:
+            continue
+        sp = raw["Stock Splits"]
+        sp = pd.Series(sp.values, index=idx)
+        sp = sp[sp > 0]
+        p = sizing.restore_actual_price(raw["Open"].iloc[idx.get_loc(d)], sp, d)
+        if p is not None:
+            tr["actual_entry_price"] = p
+            n += 1
+    return n
+
+
 def _edb_path(name):
     return os.path.join(EDB_DIR, f"{name}.json")
 
@@ -785,6 +851,7 @@ def run(args):
         print(f"📋 対象ユニバース({'--tickers-file の銘柄' if file_tickers is not None else '今のJ-Quants'}): {len(tickers)}銘柄")
 
     prices = download_prices(tickers + [BENCH_TICKER], end, refresh=args.refresh, offline=offline)
+    raw_opens = download_raw_opens([t for t in prices if t != BENCH_TICKER], end, offline=offline)
     bench = prices.pop(BENCH_TICKER, None)
     if bench is None:
         sys.exit("1306.Tの株価を取得できませんでした")
@@ -894,8 +961,10 @@ def run(args):
             for col, _label in use:
                 slim = comb[["Ticker", "Open", "Close", "ATR14"]].copy()
                 slim[col] = comb[col] & in_span
+                n_before = len(trades[col])
                 with contextlib.redirect_stdout(io.StringIO()):
                     fujiko.backtest(slim, col, name_map, trades_out=trades[col], **exit_rules)
+                attach_actual_entry_prices(trades[col][n_before:], raw_opens)   # 購入可能額の判定だけ実株価で行う
         sims = {}
         for col, label in use:
             r = sizing.simulate_portfolio(trades[col], dict(closes_all), capital)

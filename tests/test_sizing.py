@@ -155,5 +155,63 @@ class BenchmarkTest(unittest.TestCase):
         self.assertIsNone(sizing.period_metrics(eq, 2025))
 
 
+class ActualPriceTest(unittest.TestCase):
+    """当時の実株価の復元(生の始値×その日より後の分割比の累積)と、購入可能額の判定への反映"""
+
+    def test_factor_after_excludes_split_day_and_before(self):
+        sp = pd.Series([3.0, 2.0], index=pd.to_datetime(["2023-06-01", "2024-06-01"]))
+        self.assertEqual(sizing.split_factor_after(sp, "2023-01-04"), 6.0)    # 両方の分割より前
+        self.assertEqual(sizing.split_factor_after(sp, "2023-06-01"), 2.0)    # 分割当日は分割後の価格 → 含めない
+        self.assertEqual(sizing.split_factor_after(sp, "2023-06-02"), 2.0)
+        self.assertEqual(sizing.split_factor_after(sp, "2024-06-01"), 1.0)    # 最後の分割以降
+        self.assertEqual(sizing.split_factor_after(None, "2023-01-04"), 1.0)
+        self.assertEqual(sizing.split_factor_after(pd.Series(dtype=float), "2023-01-04"), 1.0)
+
+    def test_factor_ignores_zero_and_reverse_split(self):
+        sp = pd.Series([0.0, 0.5], index=pd.to_datetime(["2023-06-01", "2023-09-01"]))
+        self.assertEqual(sizing.split_factor_after(sp, "2023-01-04"), 0.5)    # 併合(10→5株)は0.5倍
+
+    def test_restore_actual_price(self):
+        sp = pd.Series([5.0], index=pd.to_datetime(["2025-12-29"]))
+        self.assertAlmostEqual(sizing.restore_actual_price(400.0, sp, "2025-01-06"), 2000.0)
+        self.assertAlmostEqual(sizing.restore_actual_price(400.0, sp, "2026-01-05"), 400.0)
+        self.assertIsNone(sizing.restore_actual_price(float("nan"), sp, "2025-01-06"))
+        self.assertIsNone(sizing.restore_actual_price(0, sp, "2025-01-06"))
+
+    def test_actual_price_blocks_unaffordable_trade(self):
+        # 調整済み400円なら資金100万の20%(20万)以内で買えるが、当時の実株価が2500円なら100株=25万円で買えない
+        idx = pd.bdate_range("2024-01-01", periods=3)
+        closes = {"A": pd.Series([400.0] * 3, index=idx)}
+        base = {"ticker": "A", "entry_date": idx[0], "exit_date": idx[2], "entry_price": 400.0,
+                "stop_price": 380.0, "pnl_pct": 0.0}
+        adj = sizing.simulate_portfolio([dict(base)], dict(closes), 1_000_000)
+        self.assertEqual(adj["n_trades"], 1)                       # 従来: 調整済み400円で買えたことになる
+        act = sizing.simulate_portfolio([dict(base, actual_entry_price=2500.0)], dict(closes), 1_000_000)
+        self.assertEqual(act["n_trades"], 0)                       # 実株価2500円: 100株=25万円 > 20万円 → 見送り
+        self.assertEqual(act["n_skipped"], 1)
+
+    def test_actual_price_keeps_return_and_sizes_by_actual(self):
+        # 実株価が上限内なら買える。損益率は調整済み系列の値(pnl_pct)のまま、取得額だけ実株価×株数
+        idx = pd.bdate_range("2024-01-01", periods=3)
+        closes = {"A": pd.Series([400.0] * 3, index=idx)}
+        t = {"ticker": "A", "entry_date": idx[0], "exit_date": idx[2], "entry_price": 400.0,
+             "stop_price": 380.0, "pnl_pct": 10.0, "actual_entry_price": 1000.0}
+        r = sizing.simulate_portfolio([t], closes, 1_000_000)
+        # 実株価1000円・損切り幅=20×(1000/400)=50円 → 1万円/50円=200株=20万円(上限ちょうど)。10%益 → +2万円
+        self.assertEqual(r["n_trades"], 1)
+        self.assertAlmostEqual(r["final_return_pct"], 2.0)
+
+    def test_without_actual_price_unchanged(self):
+        idx = pd.bdate_range("2024-01-01", periods=3)
+        closes = {"A": pd.Series([1000.0] * 3, index=idx)}
+        t = {"ticker": "A", "entry_date": idx[0], "exit_date": idx[2], "entry_price": 1000.0,
+             "stop_price": 950.0, "pnl_pct": 10.0}
+        a = sizing.simulate_portfolio([dict(t)], dict(closes), 1_000_000)
+        b = sizing.simulate_portfolio([dict(t, actual_entry_price=None)], dict(closes), 1_000_000)
+        c = sizing.simulate_portfolio([dict(t, actual_entry_price=float("nan"))], dict(closes), 1_000_000)
+        self.assertEqual(a["final_return_pct"], b["final_return_pct"])
+        self.assertEqual(a["final_return_pct"], c["final_return_pct"])
+
+
 if __name__ == "__main__":
     unittest.main()
