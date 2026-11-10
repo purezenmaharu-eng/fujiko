@@ -45,7 +45,7 @@ def _svg_equity(series_by_label, capital, width=760, height=300):
 
 
 def render(today, capital, signal_labels, portfolio_results, rankings, signal_infos, name_map,
-           bench_result=None, bench_label='1306.T', yearly_results=None):
+           bench_result=None, bench_label='1306.T', yearly_results=None, universe_count=None):
     rows = []
     for col, label in signal_labels.items():
         r = portfolio_results[col]
@@ -85,6 +85,11 @@ def render(today, capital, signal_labels, portfolio_results, rankings, signal_in
                 f"<td class='reason'>{html.escape(i['reason'])}</td></tr>")
     sig_table = ("<table><thead><tr><th>銘柄</th><th>シグナル</th><th>推奨株数</th><th>損切り損失額</th><th>根拠</th></tr></thead><tbody>"
                  + "".join(sig_rows) + "</tbody></table>") if sig_rows else "<p class='muted'>直近3日以内の点灯なし。</p>"
+    universe_html = ""
+    if universe_count:
+        universe_html = (f"<p class='muted'>対象: 監視銘柄 {universe_count}銘柄(「監視銘柄」タブの現在の内容)。"
+                         "この銘柄は現在の長期上昇トレンド・Fスコアで選ばれているため、過去の期間では実際より成績が良く出やすい"
+                         "(先読みバイアス)。1306との比較は目安として見てください。</p>")
     source = html.escape(next((i["source"] for v in signal_infos.values() for i in v), ""))
 
     return f"""<!doctype html>
@@ -104,6 +109,7 @@ th:first-child,td:first-child,td.reason,th:last-child{{text-align:left}}.muted,s
 <h2>資産推移</h2>
 {curve}
 <h2>成績(同じルールで資金を動かした場合)</h2>
+{universe_html}
 <div class="wrap"><table><thead><tr><th>シグナル</th><th>取引数</th><th>見送り</th><th>最終リターン</th><th>最大ドローダウン</th><th>シャープレシオ(年率)</th><th>同時保有最大</th></tr></thead><tbody>
 {''.join(rows)}
 </tbody></table></div>
