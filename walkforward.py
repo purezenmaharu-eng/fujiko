@@ -328,6 +328,38 @@ def ensure_n225(end):
     return close
 
 
+def ensure_close(ticker, end):
+    """ETFなど1銘柄の調整後終値(auto_adjust=True。配当込み)をyfinanceから取り .cache_wf/etf_<ticker>_<end>.pkl に保存して返す。
+    比較表示だけに使う。--cache-only で外部通信を遮断する前に呼ぶこと。取れなければ None"""
+    path = os.path.join(CACHE_DIR, f"etf_{ticker}_{end}.pkl")
+    cached = _load_pickle(path, None)
+    if cached is not None and len(cached):
+        return cached
+    import yfinance as yf
+    raw = yf.download(ticker, start=PRICE_START, end=end, auto_adjust=True, progress=False)
+    if raw is None or len(raw) == 0 or "Close" not in raw:
+        return None
+    close = raw["Close"]
+    if isinstance(close, pd.DataFrame):
+        close = close.iloc[:, 0]
+    close = close.dropna().astype(float)
+    close = close[~close.index.duplicated(keep="last")].sort_index()
+    if len(close) < 2:
+        return None
+    _save_pickle(path, close)
+    return close
+
+
+def parse_etfs(text):
+    """--etfs の値(カンマ区切り)を銘柄コードのリストにする。空・重複は除く"""
+    out = []
+    for t in (text or "").split(","):
+        t = t.strip()
+        if t and t not in out:
+            out.append(t)
+    return out
+
+
 def trade_stats(trades, days):
     """取引ごとの成績。trades は fujiko.backtest が出す取引リスト(資金管理で見送る前の全シグナル分)。
     pnl_pct は往復取引コスト0.2%を引いた後の値。保有日数は営業日(エントリー日を1日目と数え、決済日を含む。days=1306の営業日)"""
@@ -653,6 +685,18 @@ def run(args):
     if oos:   # 日経平均はyfinanceだけ(キャッシュが無い時だけ通信。EDINET DB・ラジ株ナビは呼ばない)。--cache-only の遮断より前に取る
         n225_end = args.end or (pd.Timestamp.today() + pd.Timedelta(days=1)).strftime("%Y-%m-%d")
         n225_close = ensure_n225(n225_end)
+    etf_list = parse_etfs(getattr(args, "etfs", ""))
+    etf_closes = {}
+    if etf_list:   # --etfs 指定時だけ。日経平均とETFをyfinanceから取る(キャッシュがあれば通信しない)
+        etf_end = args.end or (pd.Timestamp.today() + pd.Timedelta(days=1)).strftime("%Y-%m-%d")
+        if n225_close is None:
+            n225_close = ensure_n225(etf_end)
+        for t in etf_list:
+            c = ensure_close(t, etf_end)
+            if c is None:
+                print(f"⚠️ {t} の株価を取得できませんでした: 比較表から外します")
+            else:
+                etf_closes[t] = c
     # EDINET DBのキーはここで読み(値は表示しない)、本体(build_watchlist/fujiko)には渡さない。
     # ラジ株ナビ等のキーは空にしてから本体を読み込む(呼ばない)。--cache-only では外部通信そのものを遮断する
     from dotenv import load_dotenv
@@ -860,6 +904,18 @@ def run(args):
         stats = {col: trade_stats(trades[col], bench_close.index) for col, _ in use}
         return {"sims": sims, "sizes": sizes, "trades": trades, "stats": stats}
 
+    def buyhold_eq(close):
+        eq = sizing.bench_equity(close, capital, dates[0], bench_close.index[-1])
+        return align_equity(eq, bench_eq.index, capital) if len(eq) else eq
+
+    extra_bench = []   # --etfs 指定時だけ: [(行名, 資産Series)]。日経平均 → 指定ETFの順
+    if etf_list:
+        extra_bench.append((N225_LABEL, buyhold_eq(n225_close)))
+        for t, c in etf_closes.items():
+            extra_bench.append((f"{t[:-2] if t.endswith('.T') else t}買い持ち", buyhold_eq(c)))
+        for name, eq in extra_bench:
+            print(f"  [{name}] " + ("データなし" if not len(eq) else f"{eq.index[0]:%Y-%m-%d}〜{eq.index[-1]:%Y-%m-%d}"))
+
     if oos:
         n225_eq = sizing.bench_equity(n225_close, capital, dates[0], bench_close.index[-1])
         n225_eq = align_equity(n225_eq, bench_eq.index, capital) if len(n225_eq) else n225_eq
@@ -883,7 +939,7 @@ def run(args):
         out = out if os.path.isabs(out) else os.path.join(HERE, out)
         if os.path.basename(out) == "walkforward.html":
             sys.exit("--oos の出力先を既存の walkforward.html にはできません(上書き防止)")
-        table = oos_table(oos_results, bench_eq, n225_eq, capital)
+        table = oos_table(oos_results, bench_eq, n225_eq, capital, extra_bench=[x for x in extra_bench if x[0] != N225_LABEL])
         html_text = render_oos(table, capital, dates, bench_eq.index[-1], pd.Timestamp.today(), len(prices))
         os.makedirs(os.path.dirname(out), exist_ok=True)
         with open(out, "w", encoding="utf-8") as f:
@@ -911,7 +967,7 @@ def run(args):
         return
 
     # 3) 出力
-    cmp = compare_rows(results, spans, bench_eq, capital)
+    cmp = compare_rows(results, spans, bench_eq, capital, extra_bench=extra_bench)
     out = args.out or os.path.join("docs", "walkforward.html")
     out = out if os.path.isabs(out) else os.path.join(HERE, out)
     html_text = render(capital=capital, dates=dates, spans=spans, stage_by_date=stage_by_date,
@@ -950,13 +1006,15 @@ def print_summary(results, bench_eq, capital):
 
 
 BENCH_LABEL = "1306買い持ち"
+N225_LABEL = "日経平均(^N225)買い持ち"
+EXTRA_KEY = "__extra_bench__"   # cmp の中の、--etfs で足す買い持ち行([(行名, 通期metrics)])
 
 
 def _f(v, fmt, suffix=""):
     return "－" if v is None else format(v, fmt) + suffix
 
 
-def compare_rows(results, spans, bench_eq, capital):
+def compare_rows(results, spans, bench_eq, capital, extra_bench=None):
     """Fスコア閾値ごとの比較表のデータ。{シグナル名: [行...], "1306買い持ち": 通期metrics}。
     勝率・平均損益・平均保有日数は取引ごと(資金管理で見送る前の全シグナル)、
     通期騰落・最大DD・シャープは資金管理後(1%リスク・20%上限)の日次資産から"""
@@ -979,6 +1037,8 @@ def compare_rows(results, spans, bench_eq, capital):
                 "max_pos_drop": sim.get("max_position_drop_pct")})
         cmp[label] = rows
     cmp[BENCH_LABEL] = year_table(bench_eq, capital)["通期"]
+    if extra_bench:
+        cmp[EXTRA_KEY] = [(name, year_table(eq, capital)["通期"] if len(eq) >= 2 else None) for name, eq in extra_bench]
     return cmp
 
 
@@ -1000,7 +1060,7 @@ def print_compare(cmp):
             "期末未実現損益", "最大含み損", "最大建玉額(資金比)", "最大下落率"]
     b = cmp[BENCH_LABEL]
     for label, rows in cmp.items():
-        if label == BENCH_LABEL:
+        if label in (BENCH_LABEL, EXTRA_KEY):
             continue
         table = [cols]
         for r in rows:
@@ -1012,6 +1072,10 @@ def print_compare(cmp):
         table.append([BENCH_LABEL, "－", "－", "－", "－", "－", "－",
                       _f(b and b["final_return_pct"], "+.1f", "%"), _f(b and b["max_drawdown_pct"], ".1f", "%"),
                       _f(b and b["sharpe"], ".2f"), "－", "－", "－", "－"])
+        for name, m in cmp.get(EXTRA_KEY, []):
+            table.append([name, "－", "－", "－", "－", "－", "－",
+                          _f(m and m["final_return_pct"], "+.1f", "%"), _f(m and m["max_drawdown_pct"], ".1f", "%"),
+                          _f(m and m["sharpe"], ".2f"), "－", "－", "－", "－"])
         widths = [max(_dw(row[i]) for row in table) for i in range(len(cols))]
         print(f"\n--- {label}(通期) ---")
         for row in table:
@@ -1025,7 +1089,7 @@ def _cmp_html(cmp):
     b = cmp[BENCH_LABEL]
     parts = []
     for label, rows in cmp.items():
-        if label == BENCH_LABEL:
+        if label in (BENCH_LABEL, EXTRA_KEY):
             continue
         body = "".join(
             f"<tr><td>{html.escape(r['variant'])}</td><td>{r['watch']:.1f}</td><td>{r['n_raw']}</td><td>{r['n_exec']}</td>"
@@ -1037,6 +1101,10 @@ def _cmp_html(cmp):
         body += (f"<tr><td>{BENCH_LABEL}</td><td>－</td><td>－</td><td>－</td><td>－</td><td>－</td><td>－</td>"
                  f"<td>{_f(b and b['final_return_pct'], '+.1f', '%')}</td><td>{_f(b and b['max_drawdown_pct'], '.1f', '%')}</td>"
                  f"<td>{_f(b and b['sharpe'], '.2f')}</td><td>－</td><td>－</td><td>－</td><td>－</td></tr>")
+        for name, m in cmp.get(EXTRA_KEY, []):
+            body += (f"<tr><td>{html.escape(name)}</td><td>－</td><td>－</td><td>－</td><td>－</td><td>－</td><td>－</td>"
+                     f"<td>{_f(m and m['final_return_pct'], '+.1f', '%')}</td><td>{_f(m and m['max_drawdown_pct'], '.1f', '%')}</td>"
+                     f"<td>{_f(m and m['sharpe'], '.2f')}</td><td>－</td><td>－</td><td>－</td><td>－</td></tr>")
         parts.append(f"<h2>Fスコア閾値の比較: {html.escape(label)}(通期)</h2><div class='wrap'><table><thead>{head}</thead>"
                      f"<tbody>{body}</tbody></table></div>")
     parts.append("<p class='muted'>発生=バックテストが出した全シグナル(勝率・平均損益・平均保有日数はこの全件の取引ごとの値。往復コスト0.2%控除後)。"
@@ -1128,7 +1196,7 @@ OOS_PERIODS = [("全体(2022-01〜)", 0, 9999), ("選ぶ期間(2022-01〜2024-12
 OOS_TEST_KEY = OOS_PERIODS[2][0]
 
 
-def oos_table(oos_results, bench_eq, n225_eq, capital):
+def oos_table(oos_results, bench_eq, n225_eq, capital, extra_bench=None):
     """{シグナル名: [行...]}。行={name, desc, m: {期間名: metrics|None}, cand: True/False/None}。
     cand: 試す期間で baseline と比べた採用候補の判定(baseline・買い持ち・対象外の行は None)"""
     import sizing
@@ -1141,6 +1209,7 @@ def oos_table(oos_results, bench_eq, n225_eq, capital):
     for col, label in [SIGNALS[0], SIGNALS[1], SIGNALS[3]]:   # Ace・King・Ace×BEP(Ace×BEPは baseline のみ)
         rows = [{"name": "1306買い持ち", "desc": "", "m": bench_m, "cand": None},
                 {"name": "日経平均(^N225)買い持ち", "desc": "", "m": n225_m, "cand": None}]
+        rows += [{"name": name, "desc": "", "m": metrics(eq), "cand": None} for name, eq in extra_bench or []]
         base = None
         for name, info in oos_results.items():
             if col not in info["cols"]:
@@ -1287,6 +1356,8 @@ def build_parser():
     ap.add_argument("--oos", action="store_true",
                     help="日経平均との比較と期間分割(選ぶ期間2022-2024/試す期間2025-)で、改善案A・B・C1・C2をbaselineと比べる。"
                          "出力は既定で docs/walkforward_oos.html(walkforward.html には書かない)。日経平均はyfinanceだけ使う")
+    ap.add_argument("--etfs", default="",
+                    help="買い持ちを比較表に足すETFの銘柄コード(カンマ区切り。例: 1321.T,1475.T)。指定すると日経平均も足す。未指定なら今までと同じ")
     ap.add_argument("--out", default=None, help="出力HTML(既定: docs/walkforward.html、--oos では docs/walkforward_oos.html)")
     return ap
 
