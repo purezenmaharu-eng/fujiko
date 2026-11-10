@@ -44,7 +44,7 @@ def _load_sheets_credentials(raw_value, scopes):
 RADIKABUNAVI_MCP_URL = "https://radikabunavi.com/mcp"
 RADIKABUNAVI_API_KEY = os.environ.get("RADIKABUNAVI_API_KEY", "")
 
-# --- ファンダメンタルズ事前フィルタ(screen_stocks=窓口B、150リクエスト制限を消費しない)---
+# --- ファンダメンタルズ事前フィルタ(screen_stocks=窓口B、100リクエスト制限を消費しない)---
 # scoreTotalはラジ株ナビの6軸(割安度/稼ぐ力/成長性/安全性/還元力/事業独占力)合成スコア(0-100)。
 # 60はscreen_by_frameworkのvalue/growth "ok"tier(ROE>=5〜8%程度)よりやや厳しく、
 # "good"tier(ROE>=10〜15%)より緩い中庸の初期値。ここでは技術シグナル側のタイミング判定に
@@ -958,7 +958,7 @@ def kabuojisan_health_score(fin_data, score_data):
 
 def screen_fundamentally_sound_stocks(min_score_total=FUNDAMENTAL_MIN_SCORE_TOTAL,
                                        acceptable_verdicts=FUNDAMENTAL_ACCEPTABLE_VERDICTS):
-    """screen_stocks(窓口B、edinet-summary.jsonを検索するのみで150リクエスト制限を消費しない)で
+    """screen_stocks(窓口B、edinet-summary.jsonを検索するのみで100リクエスト制限を消費しない)で
     全上場企業のROE/PER/PBR/scoreTotal/verdictを一括取得し、ファンダメンタルズが良好な
     銘柄コード(4桁、.T無し)→指標dictのマップを返す。
     API未設定・呼び出し失敗時はNoneを返す(呼び出し側でフィルタなし運用を判断できるように)"""
@@ -2333,7 +2333,7 @@ if __name__ == "__main__":
             today=today, capital=FUJIKO_CAPITAL, signal_labels=signal_labels,
             portfolio_results=portfolio_results, bench_result=bench_result, bench_label=BENCH,
             yearly_results=yearly_results, rankings=rankings, signal_infos=signal_infos,
-            name_map=TICKER_NAME_MAP)
+            name_map=TICKER_NAME_MAP, universe_count=len(all_results))
         print(f"✅ HTML出力: {_html_path}")
 
     # --- 追跡が失敗していたら、他の出力をすべて終えたあとでエラー終了する(日次がsuccessのまま見落とされるのを防ぐ) ---
