@@ -1036,9 +1036,10 @@ def generate_gemini_commentary(name, ticker, fin_data, score_data):
             f"財務データ(JSON): {json.dumps(fin_data, ensure_ascii=False)[:2000]}\n"
             f"{score_summary}"
         )
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}"
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
         resp = _post_with_429_retry(
             url, "Gemini",
+            headers={"x-goog-api-key": GEMINI_API_KEY},
             json={"contents": [{"parts": [{"text": prompt}]}]}, timeout=30,
         )
         if resp.status_code == 429:
