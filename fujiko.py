@@ -13,6 +13,7 @@ from google.oauth2.service_account import Credentials
 from datetime import date
 
 import radikabu_usage_logger
+import gemini_pricing
 import sizing
 import reorder_tabs
 
@@ -63,6 +64,9 @@ _radikabunavi_call_count = 0  # 実際にAPIへ送信したtools/call回数
 # Gemini設定 (ファンダメンタルズ解説コメント生成)
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 GEMINI_MODEL = "gemini-3.1-flash-lite"
+# 月額の費用上限(円、JSTの暦月)。超えた月は以降のGemini解説生成を止める(解説は無くても日次は動く)。
+# 単価・円換算は gemini_pricing.py(investor-agentの universe_scan と同じ値)。
+GEMINI_MONTHLY_CAP_YEN = 100
 
 # EDINET DB設定(スクリーニング補助。ラジ株ナビとは別サービス・別APIキー)
 EDINETDB_API_KEY = os.environ.get("EDINETDB_API_KEY", "")
@@ -1006,12 +1010,116 @@ def screen_fundamentally_sound_stocks(min_score_total=FUNDAMENTAL_MIN_SCORE_TOTA
 
 _gemini_disabled = False  # 429が解消しない場合、以降のGemini呼び出しをスキップ
 
+# --- Gemini月額上限(Google Sheetsの専用タブに保存。実行をまたいで今月の使用量を持ち越す) ---
+# Sheetsが読めない・書けないときは例外を出さず従来どおり動かす(上限の仕組みが本番を止めてはならない)。
+GEMINI_USAGE_SHEET = "Gemini使用量"
+GEMINI_USAGE_HEADERS = ["月(JST)", "呼び出し回数", "入力トークン", "出力トークン", "費用(円)", "最終更新"]
+_gemini_usage_state = None  # {"month","calls","prompt","output","cost_yen","dirty"}。実行内で1回だけSheetsから読む
+
+def _gemini_usage_now_jst():
+    from datetime import datetime, timedelta, timezone
+    return datetime.now(timezone(timedelta(hours=9)))
+
+def _gemini_usage_fresh_state(month):
+    return {"month": month, "calls": 0, "prompt": 0, "output": 0, "cost_yen": 0.0, "dirty": False}
+
+def _gemini_usage_get_ws(create=False):
+    """使用量タブを返す。設定なし・失敗・(create=Falseでタブなし)はNone。例外は出さない。"""
+    try:
+        creds_json = os.environ.get("GOOGLE_SHEETS_CREDENTIALS", "")
+        spreadsheet_id = os.environ.get("SPREADSHEET_ID", "")
+        if not creds_json or not spreadsheet_id:
+            return None
+        creds = _load_sheets_credentials(creds_json, scopes=["https://www.googleapis.com/auth/spreadsheets"])
+        sh = gspread.authorize(creds).open_by_key(spreadsheet_id)
+        try:
+            return sh.worksheet(GEMINI_USAGE_SHEET)
+        except gspread.exceptions.WorksheetNotFound:
+            if not create:
+                return None
+            ws = sh.add_worksheet(title=GEMINI_USAGE_SHEET, rows=5, cols=len(GEMINI_USAGE_HEADERS))
+            ws.append_row(GEMINI_USAGE_HEADERS)
+            return ws
+    except Exception as e:
+        print(f"⚠️ Gemini使用量: シートを開けませんでした(従来どおり動作します): {e}")
+        return None
+
+def _gemini_usage_load():
+    """今月の使用量を返す(実行内キャッシュ)。読めない・月が変わったときは0から。"""
+    global _gemini_usage_state
+    month = _gemini_usage_now_jst().strftime("%Y-%m")
+    if _gemini_usage_state is not None and _gemini_usage_state["month"] == month:
+        return _gemini_usage_state
+    state = _gemini_usage_fresh_state(month)
+    ws = _gemini_usage_get_ws(create=False)
+    if ws is not None:
+        try:
+            row = ws.row_values(2)
+            if len(row) >= 5 and str(row[0]).strip() == month:
+                state.update(
+                    calls=int(str(row[1]).strip() or 0),
+                    prompt=int(str(row[2]).strip() or 0),
+                    output=int(str(row[3]).strip() or 0),
+                    cost_yen=float(str(row[4]).strip() or 0),
+                )
+        except Exception as e:
+            print(f"⚠️ Gemini使用量: 読み取り失敗(従来どおり動作します): {e}")
+    _gemini_usage_state = state
+    return state
+
+def _gemini_budget_exceeded():
+    """今月の費用が上限以上ならTrue。何があっても例外は出さない。"""
+    try:
+        return _gemini_usage_load()["cost_yen"] >= GEMINI_MONTHLY_CAP_YEN
+    except Exception:
+        return False
+
+def _gemini_usage_add(usage_metadata):
+    """1回分の使用量(レスポンスのusageMetadata)を今月分に足す。書き込みは _gemini_usage_flush でまとめて1回。"""
+    try:
+        um = usage_metadata or {}
+        prompt = int(um.get("promptTokenCount") or 0)
+        output = int(um.get("candidatesTokenCount") or 0) + int(um.get("thoughtsTokenCount") or 0)
+        state = _gemini_usage_load()
+        state["calls"] += 1
+        state["prompt"] += prompt
+        state["output"] += output
+        state["cost_yen"] += gemini_pricing.cost_yen(prompt, output, 0)
+        state["dirty"] = True
+    except Exception as e:
+        print(f"⚠️ Gemini使用量: 集計失敗(従来どおり動作します): {e}")
+
+def _gemini_usage_flush():
+    """今実行分の増加をSheetsへ1回書く。失敗しても例外は出さない。"""
+    try:
+        state = _gemini_usage_load()
+        if not state["dirty"]:
+            return
+        print(f"Gemini使用量: 今月 calls={state['calls']} cost_yen={state['cost_yen']:.2f} cap_yen={GEMINI_MONTHLY_CAP_YEN}")
+        if DRY_RUN:
+            print("🧪 [DRY_RUN] Gemini使用量の書き込みスキップ")
+            return
+        ws = _gemini_usage_get_ws(create=True)
+        if ws is None:
+            return
+        ws.batch_update([{"range": "A2:F2", "values": [[
+            state["month"], state["calls"], state["prompt"], state["output"],
+            round(state["cost_yen"], 4), _gemini_usage_now_jst().strftime("%Y-%m-%d %H:%M:%S"),
+        ]]}], value_input_option="RAW")
+        state["dirty"] = False
+    except Exception as e:
+        print(f"⚠️ Gemini使用量: 書き込み失敗(従来どおり動作します): {e}")
+
 def generate_gemini_commentary(name, ticker, fin_data, score_data):
     """決算・業績データと6軸スコアをもとに、Geminiで短い解説コメントを生成する"""
     global _gemini_disabled
     if SKIP_FUNDAMENTALS or not GEMINI_API_KEY or _gemini_disabled:
         return ""
     if not fin_data and not score_data:
+        return ""
+    if _gemini_budget_exceeded():
+        print(f"🛑 Gemini: 今月の費用が上限({GEMINI_MONTHLY_CAP_YEN}円)に達したため、以降の解説生成をスキップします")
+        _gemini_disabled = True
         return ""
     try:
         # スコアデータから割安度判定・6軸を抽出(プロンプト用)
@@ -1048,6 +1156,7 @@ def generate_gemini_commentary(name, ticker, fin_data, score_data):
             return ""
         resp.raise_for_status()
         data = resp.json()
+        _gemini_usage_add(data.get("usageMetadata"))
         text = data["candidates"][0]["content"]["parts"][0]["text"].strip()
         return text.replace("\n", " ")
     except Exception as e:
@@ -1122,6 +1231,7 @@ def build_fundamental_commentaries(tickers, ticker_name_map):
                 commentaries[ticker] = comment
 
         time.sleep(0.5)  # yfinance連続呼び出しの負荷軽減(ラジ株ナビのクォータ待機は不要になった)
+    _gemini_usage_flush()
     print(f"✅ 解説生成完了({len(commentaries)}/{len(tickers)}銘柄)、バリュエーション取得({len(valuations)}銘柄)")
     return commentaries, valuations
 # ============================================================
