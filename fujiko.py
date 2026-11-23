@@ -960,6 +960,67 @@ def kabuojisan_health_score(fin_data, score_data):
         print(f"⚠️ 株おじさん式健全性スコア算出失敗: {e}")
         return None
 
+
+def indicator_trap_check(fin_data, score_data):
+    """指標の罠チェック: ROE DuPont 3分解(レバレッジ警告)と低PBR資産毀損チェック。
+    戻り値: {"warnings": [str, ...], "dupont": {margin, turnover, leverage} or None}
+    警告がなければ warnings は空リスト。"""
+    warnings = []
+    dupont = None
+    try:
+        if not fin_data:
+            return {"warnings": warnings, "dupont": dupont}
+        fiscal_years = (fin_data.get("fiscalYears") or {})
+        latest = fiscal_years.get("latest") or (
+            fiscal_years.get(max(fiscal_years.keys())) if fiscal_years else None
+        )
+        if not latest:
+            return {"warnings": warnings, "dupont": dupont}
+
+        # --- ROE DuPont 3分解 ---
+        net_income = latest.get("netIncome")
+        net_sales = latest.get("netSales")
+        equity = latest.get("equity")
+        equity_ratio = latest.get("equityRatio")
+
+        # 総資産を逆算(自己資本比率から)
+        total_assets = None
+        if equity and equity_ratio and float(equity_ratio) > 0:
+            total_assets = float(equity) / (float(equity_ratio) / 100)
+
+        if net_income and net_sales and total_assets and equity:
+            net_income_f = float(net_income)
+            net_sales_f = float(net_sales)
+            total_assets_f = float(total_assets)
+            equity_f = float(equity)
+            if net_sales_f > 0 and total_assets_f > 0 and equity_f > 0:
+                margin = net_income_f / net_sales_f       # 純利益率
+                turnover = net_sales_f / total_assets_f   # 総資産回転率
+                leverage = total_assets_f / equity_f      # 財務レバレッジ
+                dupont = {
+                    "margin": round(margin * 100, 2),
+                    "turnover": round(turnover, 2),
+                    "leverage": round(leverage, 2),
+                }
+                if leverage >= 5.0:
+                    warnings.append(f"⚠高レバレッジ({leverage:.1f}x): 高ROEはレバレッジ起因の可能性")
+
+        # --- 低PBR(資産毀損)チェック ---
+        pseudo_price = None
+        bps = latest.get("bps")
+        if score_data:
+            ip = score_data.get("idealPrice") or {}
+            pseudo_price = ip.get("pseudoPrice")
+        if pseudo_price and bps and float(bps) > 0:
+            pbr = float(pseudo_price) / float(bps)
+            if pbr < 0.5:
+                warnings.append(f"⚠低PBR({pbr:.2f}倍): 資産毀損・含み損の可能性")
+
+    except Exception as e:
+        print(f"⚠️ 指標の罠チェック失敗: {e}")
+    return {"warnings": warnings, "dupont": dupont}
+
+
 def screen_fundamentally_sound_stocks(min_score_total=FUNDAMENTAL_MIN_SCORE_TOTAL,
                                        acceptable_verdicts=FUNDAMENTAL_ACCEPTABLE_VERDICTS):
     """screen_stocks(窓口B、edinet-summary.jsonを検索するのみで100リクエスト制限を消費しない)で
@@ -1221,6 +1282,9 @@ def build_fundamental_commentaries(tickers, ticker_name_map):
         kabu_health = kabuojisan_health_score(fin, score)
         if kabu_health:
             val_info["kabuHealth"] = kabu_health
+        trap_check = indicator_trap_check(fin, score)
+        if trap_check and trap_check.get("warnings"):
+            val_info["traps"] = trap_check
         if val_info:
             valuations[ticker] = val_info
 
@@ -1404,7 +1468,8 @@ def write_to_spreadsheet(today, top_tickers, ticker_name_map, valuations=None, c
             is_new_sheet = True
 
         SHEET_HEADERS = ["日付", "銘柄名", "市場", "本日のテクニカル", "Evy式適正価格", "Evy式割安率%",
-                         "株おじさん式理論株価", "株おじさん式割安率%", "株おじさん健全性", "解説", "チャート", "Yahoo!ファイナンス",
+                         "株おじさん式理論株価", "株おじさん式割安率%", "株おじさん健全性", "指標の罠",
+                         "解説", "チャート", "Yahoo!ファイナンス",
                          "推奨株数", "損切り損失額", "根拠・出どころ", "6軸スコア", "理想株価判定"]
         if is_new_sheet or ws.row_count == 0 or ws.cell(1, 1).value != "日付":
             _sheets_call_with_retry(ws.append_row, SHEET_HEADERS)
@@ -1418,10 +1483,10 @@ def write_to_spreadsheet(today, top_tickers, ticker_name_map, valuations=None, c
             try:
                 sheet_id = ws.id
                 # 列インデックス(0始まり): 日付0 銘柄名1 市場2 本日のテクニカル3 Evy適正価格4 Evy割安率5
-                #                          株おじさん理論株価6 株おじさん割安率7 株おじさん健全性8 解説9 チャート10 Yahoo!ファイナンス11
+                #                          株おじさん理論株価6 株おじさん割安率7 株おじさん健全性8 指標の罠9 解説10 チャート11 Yahoo!ファイナンス12
                 (COL_DATE, COL_NAME, COL_MARKET, COL_TECH, COL_EVY_PRICE, COL_EVY_PCT,
-                 COL_KABU_PRICE, COL_KABU_PCT, COL_KABU_HEALTH, COL_COMMENT, COL_CHART, COL_YAHOO,
-                 COL_SHARES, COL_LOSS, COL_REASON, COL_AXES, COL_IDEAL) = range(17)
+                 COL_KABU_PRICE, COL_KABU_PCT, COL_KABU_HEALTH, COL_TRAPS, COL_COMMENT, COL_CHART, COL_YAHOO,
+                 COL_SHARES, COL_LOSS, COL_REASON, COL_AXES, COL_IDEAL) = range(18)
                 requests = []
 
                 # --- 列幅の個別指定(自動リサイズだと解説列が広がりすぎるため固定) ---
@@ -1429,6 +1494,7 @@ def write_to_spreadsheet(today, top_tickers, ticker_name_map, valuations=None, c
                     COL_DATE: 95, COL_NAME: 160, COL_MARKET: 90, COL_TECH: 130,
                     COL_EVY_PRICE: 110, COL_EVY_PCT: 110,
                     COL_KABU_PRICE: 130, COL_KABU_PCT: 130, COL_KABU_HEALTH: 130,
+                    COL_TRAPS: 250,
                     COL_COMMENT: 340, COL_CHART: 110, COL_YAHOO: 110,
                     COL_SHARES: 110, COL_LOSS: 110, COL_REASON: 420,
                     COL_AXES: 330, COL_IDEAL: 130,
@@ -1546,11 +1612,11 @@ def write_to_spreadsheet(today, top_tickers, ticker_name_map, valuations=None, c
 
         def _valuation_cells(ticker):
             """バリュエーション列の値を返す: [Evy式適正価格, Evy式割安率%,
-            株おじさん式理論株価, 株おじさん式割安率%, 株おじさん健全性]
+            株おじさん式理論株価, 株おじさん式割安率%, 株おじさん健全性, 指標の罠]
             データが無い項目は空文字ではなく「－」で埋め、シート上の見た目を統一する"""
             v = valuations.get(ticker)
             if not v:
-                return ["－", "－", "－", "－", "－"]
+                return ["－", "－", "－", "－", "－", "－"]
             evy = v.get("evy") or {}
             kabuojisan = v.get("kabuojisan") or {}
             kabu_health = v.get("kabuHealth") or {}
@@ -1561,7 +1627,11 @@ def write_to_spreadsheet(today, top_tickers, ticker_name_map, valuations=None, c
             kabu_health_label = "－"
             if kabu_health.get("label") is not None:
                 kabu_health_label = f"{kabu_health['label']}({kabu_health['passed']}/{kabu_health['total']})"
-            return [evy_price, evy_discount, kabu_price, kabu_discount, kabu_health_label]
+            # 指標の罠チェック
+            trap_info = v.get("traps") or {}
+            trap_warnings = trap_info.get("warnings") or []
+            trap_cell = " / ".join(trap_warnings) if trap_warnings else "－"
+            return [evy_price, evy_discount, kabu_price, kabu_discount, kabu_health_label, trap_cell]
 
         def _comment_cell(ticker):
             return commentaries.get(ticker) or "－"
