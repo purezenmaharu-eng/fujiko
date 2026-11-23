@@ -580,23 +580,7 @@ def attach_actual_entry_prices(trades, raw_opens):
     """取引ごとに、エントリー日の当時の実株価(生の始値×その日より後の分割比の累積)を actual_entry_price に入れる。
     生の始値が取れない取引には入れない(従来どおり調整済みの始値で判定される)。戻り値: 入れた件数"""
     import sizing
-    n = 0
-    for tr in trades:
-        raw = raw_opens.get(tr["ticker"])
-        if raw is None:
-            continue
-        d = pd.Timestamp(tr["entry_date"]).tz_localize(None)
-        idx = raw.index.tz_localize(None) if raw.index.tz is not None else raw.index
-        if d not in idx:
-            continue
-        sp = raw["Stock Splits"]
-        sp = pd.Series(sp.values, index=idx)
-        sp = sp[sp > 0]
-        p = sizing.restore_actual_price(raw["Open"].iloc[idx.get_loc(d)], sp, d)
-        if p is not None:
-            tr["actual_entry_price"] = p
-            n += 1
-    return n
+    return sizing.attach_actual_entry_prices(trades, raw_opens)   # fujiko.py の資金管理バックテストと共通の実装
 
 
 def _edb_path(name):
