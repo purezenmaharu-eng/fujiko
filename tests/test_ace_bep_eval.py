@@ -80,7 +80,7 @@ class OosTableAceBep(unittest.TestCase):
         oos = {"baseline": res(ak + ["Ace_with_BEP_Start"]), "A": res(ak), "B": res(["King_Start"]),
                "C1": res(ak), "C2": res(ak)}
         table = wf.oos_table(oos, eq, eq, 1_000_000)
-        self.assertEqual(list(table), ["Ace", "King", "Ace×BEP"])
+        self.assertEqual(list(table), ["Ace", "King", "Ace×BEP", "ピボット"])
         self.assertEqual([r["name"] for r in table["Ace×BEP"]],
                          ["1306買い持ち", "日経平均(^N225)買い持ち", "baseline"])
         self.assertEqual([r["name"] for r in table["Ace"]][2:], ["baseline", "A", "C1", "C2"])   # 案A・C1・C2はAce・Kingのまま
