@@ -2064,6 +2064,31 @@ def backtest(combined_df, signal_col, ticker_name_map,
         print(f"  [{signal_col}] シグナル発生なし")
     return pd.DataFrame.from_dict(ticker_stats, orient="index")
 
+def fetch_raw_opens(tickers, start, end, chunk=100):
+    """資金管理バックテストの購入可否判定用に、調整なし(auto_adjust=False)の始値と株式分割をyfinanceで取る。
+    {ticker: DataFrame(Open, Stock Splits)}。取れなかった銘柄は含めない(その銘柄の取引は調整済みの始値で判定のまま)。
+    yfinanceの生の始値は分割調整済みなので、当時の実株価への復元は sizing.attach_actual_entry_prices で行う"""
+    out = {}
+    tickers = list(tickers)
+    for i in range(0, len(tickers), chunk):
+        part = tickers[i:i + chunk]
+        try:
+            raw = yf.download(part, start=start, end=end, auto_adjust=False, actions=True,
+                              group_by="ticker", threads=True, progress=False)
+        except Exception as e:
+            print(f"⚠️ 生の始値の取得に失敗({e}) → {len(part)}銘柄は調整済み株価で判定")
+            continue
+        for t in part:
+            try:
+                sub = raw[t] if isinstance(raw.columns, pd.MultiIndex) else raw
+                sub = sub[["Open", "Stock Splits"]].dropna(subset=["Open"])
+                sub = sub[~sub.index.duplicated(keep="last")].sort_index()
+                if len(sub):
+                    out[t] = sub.astype("float64")
+            except Exception:
+                pass
+    return out
+
 # ファンダメンタルズ評価の件数上限(説明はメイン実行内の「ファンダメンタルズ評価」の節を参照)
 FUJIKO_RADIKABUNAVI_DAILY_BUDGET = 5  # フジコの1日あたり深掘り件数(他プロジェクトとの共用に配慮)
 TOP_FUNDAMENTAL_ROWS = 30  # メインシートに掲載する、ファンダメンタルズ評価上位の件数
@@ -2170,6 +2195,13 @@ if __name__ == "__main__":
     print(f"💴 資金管理バックテスト(資金{FUJIKO_CAPITAL:,.0f}円、1回の損失=資金の{sizing.RISK_PCT*100:.0f}%、1銘柄上限{sizing.MAX_POSITION_PCT*100:.0f}%)")
     print("="*60)
     _closes = {t: d["Close"] for t, d in combined_df.groupby("Ticker")}
+    # 購入可否(100株が資金20%上限内か・現金で買えるか)は、調整済み株価でなく当時の実株価(生の始値×分割比の累積)で判定する
+    # (walkforward.py と同じ。生の始値が取れない銘柄は調整済み株価で判定のまま)
+    _bt_tickers = sorted({tr["ticker"] for trs in bt_trades.values() for tr in trs})
+    _raw_opens = fetch_raw_opens(_bt_tickers, START, END)
+    _n_actual = sum(sizing.attach_actual_entry_prices(trs, _raw_opens) for trs in bt_trades.values())
+    _n_all = sum(len(trs) for trs in bt_trades.values())
+    print(f"  購入可否の判定: 実株価{_n_actual}件 / 調整済み株価{_n_all - _n_actual}件")
     portfolio_results = {}
     for col, label in signal_labels.items():
         r = sizing.simulate_portfolio(bt_trades[col], _closes, FUJIKO_CAPITAL)
