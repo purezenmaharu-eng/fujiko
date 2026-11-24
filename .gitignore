@@ -24,3 +24,7 @@ venv/
 # ウォークフォワード検証の株価・決算キャッシュ
 .cache_wf/
 .cache_wf_raw/
+
+# 手元の出力物(コード一覧・ウォークフォワードの結果HTML)
+codes.txt
+docs/walkforward_main_*.html
